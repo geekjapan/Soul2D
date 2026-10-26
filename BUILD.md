@@ -7,7 +7,7 @@ that `soul2d-core`, `njc` and `soul2d-editor` exist in `out/rust/debug/` or
 checks its executable, `Info.plist` and icon.
 
 These commands build development source. They do not create a supported
-distribution. `rust-core.yml` checks compilation and the editor launch on Linux;
+distribution. `rust-core.yml` builds all targets, runs Rust tests and checks the editor launch on Linux;
 `packaging.yml` builds the Flatpak and the MSI (see below). Windows and macOS runtime
 support remains experimental.
 
@@ -59,20 +59,30 @@ To compile every target, including the test targets, without running tests:
 ./tools/build-rust-core.sh --locked --all-targets --features gui
 ```
 
-## Run optional checks locally
+## Run CI checks locally
 
-These checks are for development. They are not executed by the build-only CI:
+`rust-core.yml` runs these checks on pull requests and pushes to `main`, and through
+`workflow_dispatch`. It uses stable Rust, the committed lockfile and cached Cargo dependencies.
+After building all targets with the `gui` feature, run:
 
 ```sh
 cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui
 python3 tools/verify-rust-core.py
 ./tools/verify-command-manifest.sh
+git diff --exit-code -- doc/commands.manifest.json
+python3 tools/verify-mcp-initialize.py ./out/rust/debug/soul2d-core --mcp
+python3 tools/verify-doc-twins.py
+python3 tools/verify-version.py
+python3 tools/check-project-artifacts.py
 ```
 
 `tools/verify-rust-core.py` loads `out/rust/debug/libsoul2d_core.*` through
 ctypes, so build first. `./tools/verify-command-manifest.sh` rewrites
 `doc/commands.manifest.json` and fails if a second export differs.
 The other `tools/verify-*.py` scripts drive the Rust binaries and fixtures.
+On Linux, CI also runs `./tools/verify-linux-launch.sh` with Xvfb, Weston and Mesa
+installed. It retains launch logs and screenshots for three days, including on failure.
+The job has a 45-minute timeout, and a newer run on the same ref cancels the previous run.
 File-format checks that use external models require separately acquired
 inputs and their licenses. Keep those inputs under the ignored `build/` directory.
 

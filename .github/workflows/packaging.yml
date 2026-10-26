@@ -105,7 +105,7 @@ jobs:
           # manifest copies the whole repository root into the build.
           flatpak-builder --user --install-deps-from=flathub --force-clean --disable-rofiles-fuse \
             --default-branch=nightly --state-dir=out/flatpak-state --repo=out/flatpak-repo \
-            out/flatpak-build build-aux/linux/flatpak/nightly/${APP_ID}.yml
+            out/flatpak-build "build-aux/linux/flatpak/nightly/${APP_ID}.yml"
       - name: Export the bundle
         shell: bash
         run: |
