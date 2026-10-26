@@ -1,0 +1,305 @@
+package	version	declared_license	repository	platforms
+ab_glyph	0.2.32	Apache-2.0	https://github.com/alexheretic/ab-glyph	linux,macos,windows
+ab_glyph_rasterizer	0.1.10	Apache-2.0	https://github.com/alexheretic/ab-glyph	linux,macos,windows
+accesskit	0.21.1	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	linux,macos,windows
+accesskit_atspi_common	0.14.2	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	linux
+accesskit_consumer	0.31.0	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	linux,macos,windows
+accesskit_macos	0.22.2	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	macos
+accesskit_unix	0.17.2	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	linux
+accesskit_windows	0.29.2	MIT OR Apache-2.0	https://github.com/AccessKit/accesskit	windows
+accesskit_winit	0.29.2	Apache-2.0	https://github.com/AccessKit/accesskit	linux,macos,windows
+adler2	2.0.1	0BSD OR MIT OR Apache-2.0	https://github.com/oyvindln/adler2	linux,macos,windows
+ahash	0.8.12	MIT OR Apache-2.0	https://github.com/tkaitchuck/ahash	linux,macos,windows
+arboard	3.6.1	MIT OR Apache-2.0	https://github.com/1Password/arboard	linux,macos,windows
+arrayvec	0.7.8	MIT OR Apache-2.0	https://github.com/bluss/arrayvec	linux,macos,windows
+as-raw-xcb-connection	1.0.1	MIT OR Apache-2.0	https://github.com/psychon/as-raw-xcb-connection	linux
+async-broadcast	0.7.2	MIT OR Apache-2.0	https://github.com/smol-rs/async-broadcast	linux
+async-channel	2.5.0	Apache-2.0 OR MIT	https://github.com/smol-rs/async-channel	linux
+async-executor	1.14.0	Apache-2.0 OR MIT	https://github.com/smol-rs/async-executor	linux
+async-io	2.6.0	Apache-2.0 OR MIT	https://github.com/smol-rs/async-io	linux
+async-lock	3.4.2	Apache-2.0 OR MIT	https://github.com/smol-rs/async-lock	linux
+async-process	2.5.0	Apache-2.0 OR MIT	https://github.com/smol-rs/async-process	linux
+async-recursion	1.2.0	MIT OR Apache-2.0	https://github.com/dcchut/async-recursion	linux
+async-signal	0.2.14	Apache-2.0 OR MIT	https://github.com/smol-rs/async-signal	linux
+async-task	4.7.1	Apache-2.0 OR MIT	https://github.com/smol-rs/async-task	linux
+async-trait	0.1.92	MIT OR Apache-2.0	https://github.com/dtolnay/async-trait	linux
+atomic-waker	1.1.2	Apache-2.0 OR MIT	https://github.com/smol-rs/atomic-waker	linux
+atspi	0.25.0	Apache-2.0 OR MIT	https://github.com/odilia-app/atspi	linux
+atspi-common	0.9.0	Apache-2.0 OR MIT	https://github.com/odilia-app/atspi	linux
+atspi-connection	0.9.0	Apache-2.0 OR MIT	https://github.com/odilia-app/atspi/	linux
+atspi-proxies	0.9.0	Apache-2.0 OR MIT	https://github.com/odilia-app/atspi	linux
+autocfg	1.5.1	Apache-2.0 OR MIT	https://github.com/cuviper/autocfg	linux,macos,windows
+base64	0.22.1	MIT OR Apache-2.0	https://github.com/marshallpierce/rust-base64	linux,macos,windows
+bit-set	0.8.0	Apache-2.0 OR MIT	https://github.com/contain-rs/bit-set	linux,macos,windows
+bit-vec	0.8.0	Apache-2.0 OR MIT	https://github.com/contain-rs/bit-vec	linux,macos,windows
+bitflags	1.3.2	MIT/Apache-2.0	https://github.com/bitflags/bitflags	macos
+bitflags	2.13.2	MIT OR Apache-2.0	https://github.com/bitflags/bitflags	linux,macos,windows
+block2	0.5.1	MIT	https://github.com/madsmtm/objc2	macos
+block2	0.6.2	MIT	https://github.com/madsmtm/objc2	macos
+blocking	1.7.0	Apache-2.0 OR MIT	https://github.com/smol-rs/blocking	linux
+bytemuck	1.25.2	Zlib OR Apache-2.0 OR MIT	https://github.com/Lokathor/bytemuck	linux,macos,windows
+bytemuck_derive	1.12.1	Zlib OR Apache-2.0 OR MIT	https://github.com/Lokathor/bytemuck	linux,macos,windows
+byteorder-lite	0.1.0	Unlicense OR MIT	https://github.com/image-rs/byteorder-lite	linux,macos,windows
+calloop	0.13.0	MIT	https://github.com/Smithay/calloop	linux
+calloop	0.14.5	MIT	https://github.com/Smithay/calloop	linux
+calloop-wayland-source	0.3.0	MIT	https://github.com/smithay/calloop-wayland-source	linux
+calloop-wayland-source	0.4.1	MIT	https://github.com/smithay/calloop-wayland-source	linux
+cc	1.6.0	MIT OR Apache-2.0	https://github.com/rust-lang/cc-rs	linux
+cfg-if	1.0.5	MIT OR Apache-2.0	https://github.com/rust-lang/cfg-if	linux,macos,windows
+cfg_aliases	0.2.2	MIT	https://github.com/katharostech/cfg_aliases	linux,macos,windows
+cgl	0.3.2	MIT / Apache-2.0	https://github.com/servo/cgl-rs	macos
+clipboard-win	5.4.1	BSL-1.0	https://github.com/DoumanAsh/clipboard-win	windows
+codespan-reporting	0.12.0	Apache-2.0	https://github.com/brendanzab/codespan	linux,macos,windows
+concurrent-queue	2.5.0	Apache-2.0 OR MIT	https://github.com/smol-rs/concurrent-queue	linux
+core-foundation	0.9.4	MIT OR Apache-2.0	https://github.com/servo/core-foundation-rs	macos
+core-foundation-sys	0.8.7	MIT OR Apache-2.0	https://github.com/servo/core-foundation-rs	macos
+core-graphics	0.23.2	MIT OR Apache-2.0	https://github.com/servo/core-foundation-rs	macos
+core-graphics-types	0.1.3	MIT OR Apache-2.0	https://github.com/servo/core-foundation-rs	macos
+crc32fast	1.5.2	MIT OR Apache-2.0	https://github.com/srijs/rust-crc32fast	linux,macos,windows
+crossbeam-utils	0.8.23	MIT OR Apache-2.0	https://github.com/crossbeam-rs/crossbeam	linux
+cursor-icon	1.2.0	MIT OR Apache-2.0 OR Zlib	https://github.com/rust-windowing/cursor-icon	linux,macos,windows
+dispatch	0.2.0	MIT	http://github.com/SSheldon/rust-dispatch	macos
+dispatch2	0.3.1	Zlib OR Apache-2.0 OR MIT	https://github.com/madsmtm/objc2	macos
+displaydoc	0.2.7	MIT OR Apache-2.0	https://github.com/yaahc/displaydoc	linux,macos,windows
+dlib	0.5.3	MIT	https://github.com/elinorbgr/dlib	linux
+document-features	0.2.12	MIT OR Apache-2.0	https://github.com/slint-ui/document-features	linux,macos,windows
+downcast-rs	1.2.1	MIT/Apache-2.0	https://github.com/marcianx/downcast-rs	linux
+dpi	0.1.2	Apache-2.0 AND MIT	https://github.com/rust-windowing/winit	linux,macos,windows
+ecolor	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui	linux,macos,windows
+eframe	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/eframe	linux,macos,windows
+egui	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui	linux,macos,windows
+egui-wgpu	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/egui-wgpu	linux,macos,windows
+egui-winit	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/egui-winit	linux,macos,windows
+egui_glow	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/egui_glow	linux,macos,windows
+emath	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/emath	linux,macos,windows
+endi	1.1.1	MIT	https://github.com/zeenix/endi	linux
+enumflags2	0.7.12	MIT OR Apache-2.0	https://github.com/meithecatte/enumflags2	linux
+enumflags2_derive	0.7.12	MIT OR Apache-2.0	https://github.com/meithecatte/enumflags2	linux
+epaint	0.33.3	MIT OR Apache-2.0	https://github.com/emilk/egui/tree/main/crates/epaint	linux,macos,windows
+epaint_default_fonts	0.33.3	(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0	https://github.com/emilk/egui/tree/main/crates/epaint_default_fonts	linux,macos,windows
+equivalent	1.0.2	Apache-2.0 OR MIT	https://github.com/indexmap-rs/equivalent	linux,macos,windows
+errno	0.3.14	MIT OR Apache-2.0	https://github.com/lambda-fairy/rust-errno	linux
+error-code	3.4.0	BSL-1.0	https://github.com/DoumanAsh/error-code	windows
+event-listener	5.4.2	Apache-2.0 OR MIT	https://github.com/smol-rs/event-listener	linux
+event-listener-strategy	0.5.4	Apache-2.0 OR MIT	https://github.com/smol-rs/event-listener-strategy	linux
+fastrand	2.5.0	Apache-2.0 OR MIT	https://github.com/smol-rs/fastrand	linux
+fax	0.2.7	MIT	https://github.com/pdf-rs/fax	linux,macos,windows
+fdeflate	0.3.7	MIT OR Apache-2.0	https://github.com/image-rs/fdeflate	linux,macos,windows
+find-msvc-tools	0.1.14	MIT OR Apache-2.0	https://github.com/rust-lang/cc-rs	linux
+flate2	1.1.10	MIT OR Apache-2.0	https://github.com/rust-lang/flate2-rs	linux,macos,windows
+foldhash	0.1.5	Zlib	https://github.com/orlp/foldhash	linux,macos,windows
+foldhash	0.2.0	Zlib	https://github.com/orlp/foldhash	linux,macos,windows
+foreign-types	0.5.0	MIT/Apache-2.0	https://github.com/sfackler/foreign-types	macos
+foreign-types-macros	0.2.4	MIT/Apache-2.0	https://github.com/sfackler/foreign-types	macos
+foreign-types-shared	0.3.1	MIT/Apache-2.0	https://github.com/sfackler/foreign-types	macos
+form_urlencoded	1.2.2	MIT OR Apache-2.0	https://github.com/servo/rust-url	linux,macos,windows
+futures-core	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/futures-rs	linux
+futures-io	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/futures-rs	linux
+futures-lite	2.6.1	Apache-2.0 OR MIT	https://github.com/smol-rs/futures-lite	linux
+futures-macro	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/futures-rs	linux
+futures-task	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/futures-rs	linux
+futures-util	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/futures-rs	linux
+gethostname	1.1.0	Apache-2.0	https://codeberg.org/swsnr/gethostname.rs.git	linux
+getrandom	0.3.4	MIT OR Apache-2.0	https://github.com/rust-random/getrandom	linux,macos,windows
+gl_generator	0.14.0	Apache-2.0	https://github.com/brendanzab/gl-rs/	linux,windows
+glow	0.16.0	MIT OR Apache-2.0 OR Zlib	https://github.com/grovesNL/glow	linux,macos,windows
+glutin	0.32.3	Apache-2.0	https://github.com/rust-windowing/glutin	linux,macos,windows
+glutin-winit	0.5.0	MIT	https://github.com/rust-windowing/glutin	linux,macos,windows
+glutin_egl_sys	0.7.1	Apache-2.0	https://github.com/rust-windowing/glutin	linux,windows
+glutin_glx_sys	0.6.1	Apache-2.0	https://github.com/rust-windowing/glutin	linux
+glutin_wgl_sys	0.6.1	Apache-2.0	https://github.com/rust-windowing/glutin	windows
+half	2.7.1	MIT OR Apache-2.0	https://github.com/VoidStarKat/half-rs	linux,macos,windows
+hashbrown	0.15.5	MIT OR Apache-2.0	https://github.com/rust-lang/hashbrown	linux,macos,windows
+hashbrown	0.16.1	MIT OR Apache-2.0	https://github.com/rust-lang/hashbrown	linux,macos,windows
+hashbrown	0.17.1	MIT OR Apache-2.0	https://github.com/rust-lang/hashbrown	linux,macos,windows
+hex	0.4.3	MIT OR Apache-2.0	https://github.com/KokaKiwi/rust-hex	linux
+hexf-parse	0.2.1	CC0-1.0	https://github.com/lifthrasiir/hexf	linux,macos,windows
+icu_collections	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_locale_core	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_normalizer	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_normalizer_data	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_properties	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_properties_data	2.3.0	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+icu_provider	2.3.1	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+idna	1.1.0	MIT OR Apache-2.0	https://github.com/servo/rust-url/	linux,macos,windows
+idna_adapter	1.2.2	Apache-2.0 OR MIT	https://github.com/hsivonen/idna_adapter	linux,macos,windows
+image	0.25.10	MIT OR Apache-2.0	https://github.com/image-rs/image	linux,macos,windows
+indexmap	2.14.2	Apache-2.0 OR MIT	https://github.com/indexmap-rs/indexmap	linux,macos,windows
+itoa	1.0.18	MIT OR Apache-2.0	https://github.com/dtolnay/itoa	linux,macos,windows
+jobserver	0.1.35	MIT OR Apache-2.0	https://github.com/rust-lang/jobserver-rs	linux
+khronos_api	3.1.0	Apache-2.0	https://github.com/brendanzab/gl-rs/	linux,windows
+libc	0.2.190	MIT OR Apache-2.0	https://github.com/rust-lang/libc	linux,macos
+libloading	0.8.9	ISC	https://github.com/nagisa/rust_libloading/	linux,macos,windows
+libm	0.2.16	MIT	https://github.com/rust-lang/compiler-builtins	linux,macos,windows
+linux-raw-sys	0.12.1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	https://github.com/sunfishcode/linux-raw-sys	linux
+linux-raw-sys	0.4.15	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	https://github.com/sunfishcode/linux-raw-sys	linux
+litemap	0.8.3	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+litrs	1.0.0	MIT OR Apache-2.0	https://github.com/LukasKalbertodt/litrs	linux,macos,windows
+lock_api	0.4.14	MIT OR Apache-2.0	https://github.com/Amanieu/parking_lot	linux,macos,windows
+log	0.4.34	MIT OR Apache-2.0	https://github.com/rust-lang/log	linux,macos,windows
+memchr	2.8.3	Unlicense OR MIT	https://github.com/BurntSushi/memchr	linux,macos,windows
+memmap2	0.9.11	MIT OR Apache-2.0	https://github.com/RazrFalcon/memmap2-rs	linux
+memoffset	0.9.1	MIT	https://github.com/Gilnaa/memoffset	linux,macos,windows
+miniz_oxide	0.8.9	MIT OR Zlib OR Apache-2.0	https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide	linux,macos,windows
+miniz_oxide	0.9.1	MIT OR Zlib OR Apache-2.0	https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide	linux,macos,windows
+moxcms	0.8.1	BSD-3-Clause OR Apache-2.0	https://github.com/awxkee/moxcms.git	linux,macos,windows
+naga	27.0.3	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,macos,windows
+nohash-hasher	0.2.0	Apache-2.0 OR MIT	https://github.com/paritytech/nohash-hasher	linux,macos,windows
+num-traits	0.2.19	MIT OR Apache-2.0	https://github.com/rust-num/num-traits	linux,macos,windows
+objc-sys	0.3.5	MIT	https://github.com/madsmtm/objc2	macos
+objc2	0.5.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2	0.6.4	MIT	https://github.com/madsmtm/objc2	macos
+objc2-app-kit	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-app-kit	0.3.2	Zlib OR Apache-2.0 OR MIT	https://github.com/madsmtm/objc2	macos
+objc2-core-data	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-core-foundation	0.3.2	Zlib OR Apache-2.0 OR MIT	https://github.com/madsmtm/objc2	macos
+objc2-core-graphics	0.3.2	Zlib OR Apache-2.0 OR MIT	https://github.com/madsmtm/objc2	macos
+objc2-core-image	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-encode	4.1.0	MIT	https://github.com/madsmtm/objc2	macos
+objc2-foundation	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-foundation	0.3.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-io-surface	0.3.2	Zlib OR Apache-2.0 OR MIT	https://github.com/madsmtm/objc2	macos
+objc2-metal	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+objc2-quartz-core	0.2.2	MIT	https://github.com/madsmtm/objc2	macos
+once_cell	1.21.4	MIT OR Apache-2.0	https://github.com/matklad/once_cell	linux,macos,windows
+ordered-stream	0.2.0	MIT OR Apache-2.0	https://github.com/danieldg/ordered-stream	linux
+owned_ttf_parser	0.25.1	Apache-2.0	https://github.com/alexheretic/owned-ttf-parser	linux,macos,windows
+parking	2.2.1	Apache-2.0 OR MIT	https://github.com/smol-rs/parking	linux
+parking_lot	0.12.5	MIT OR Apache-2.0	https://github.com/Amanieu/parking_lot	linux,macos,windows
+parking_lot_core	0.9.12	MIT OR Apache-2.0	https://github.com/Amanieu/parking_lot	linux,macos,windows
+percent-encoding	2.3.2	MIT OR Apache-2.0	https://github.com/servo/rust-url/	linux,macos,windows
+pin-project-lite	0.2.17	Apache-2.0 OR MIT	https://github.com/taiki-e/pin-project-lite	linux,macos,windows
+piper	0.2.5	MIT OR Apache-2.0	https://github.com/smol-rs/piper	linux
+pkg-config	0.3.34	MIT OR Apache-2.0	https://github.com/rust-lang/pkg-config-rs	linux
+png	0.18.1	MIT OR Apache-2.0	https://github.com/image-rs/image-png	linux,macos,windows
+polling	3.11.0	Apache-2.0 OR MIT	https://github.com/smol-rs/polling	linux
+pollster	0.4.0	Apache-2.0/MIT	https://github.com/zesterer/pollster	linux
+potential_utf	0.1.6	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+proc-macro-crate	3.5.0	MIT OR Apache-2.0	https://github.com/bkchr/proc-macro-crate	linux
+proc-macro2	1.0.107	MIT OR Apache-2.0	https://github.com/dtolnay/proc-macro2	linux,macos,windows
+profiling	1.0.18	MIT OR Apache-2.0	https://github.com/aclysma/profiling	linux,macos,windows
+pxfm	0.1.30	BSD-3-Clause OR Apache-2.0	https://github.com/awxkee/pxfm	linux,macos,windows
+quick-error	2.0.1	MIT/Apache-2.0	http://github.com/tailhook/quick-error	linux,macos,windows
+quick-xml	0.41.0	MIT	https://github.com/tafia/quick-xml	linux
+quote	1.0.47	MIT OR Apache-2.0	https://github.com/dtolnay/quote	linux,macos,windows
+raw-window-handle	0.6.2	MIT OR Apache-2.0 OR Zlib	https://github.com/rust-windowing/raw-window-handle	linux,macos,windows
+renderdoc-sys	1.1.0	MIT OR Apache-2.0	https://github.com/ebkalderon/renderdoc-rs	linux,macos,windows
+rfd	0.17.2	MIT	https://github.com/PolyMeilex/rfd	linux,macos,windows
+roxmltree	0.21.1	MIT OR Apache-2.0	https://github.com/RazrFalcon/roxmltree	linux,macos,windows
+rustc-hash	1.1.0	Apache-2.0/MIT	https://github.com/rust-lang-nursery/rustc-hash	linux,macos,windows
+rustc-hash	2.1.3	Apache-2.0 OR MIT	https://github.com/rust-lang/rustc-hash	linux,macos,windows
+rustix	0.38.44	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	https://github.com/bytecodealliance/rustix	linux
+rustix	1.1.5	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	https://github.com/bytecodealliance/rustix	linux
+scoped-tls	1.0.1	MIT/Apache-2.0	https://github.com/alexcrichton/scoped-tls	linux
+scopeguard	1.2.0	MIT OR Apache-2.0	https://github.com/bluss/scopeguard	linux,macos,windows
+serde	1.0.228	MIT OR Apache-2.0	https://github.com/serde-rs/serde	linux,macos,windows
+serde_core	1.0.228	MIT OR Apache-2.0	https://github.com/serde-rs/serde	linux,macos,windows
+serde_derive	1.0.228	MIT OR Apache-2.0	https://github.com/serde-rs/serde	linux,macos,windows
+serde_json	1.0.150	MIT OR Apache-2.0	https://github.com/serde-rs/json	linux,macos,windows
+serde_repr	0.1.21	MIT OR Apache-2.0	https://github.com/dtolnay/serde-repr	linux
+shlex	2.0.1	MIT OR Apache-2.0	https://github.com/comex/rust-shlex	linux
+signal-hook-registry	1.4.8	MIT OR Apache-2.0	https://github.com/vorner/signal-hook	linux
+simd-adler32	0.3.10	MIT	https://github.com/mcountryman/simd-adler32	linux,macos,windows
+slab	0.4.12	MIT	https://github.com/tokio-rs/slab	linux
+smallvec	1.16.2	MIT OR Apache-2.0	https://github.com/servo/rust-smallvec	linux,macos,windows
+smithay-client-toolkit	0.19.2	MIT	https://github.com/smithay/client-toolkit	linux
+smithay-client-toolkit	0.20.0	MIT	https://github.com/smithay/client-toolkit	linux
+smithay-clipboard	0.7.3	MIT	https://github.com/smithay/smithay-clipboard	linux
+smol_str	0.2.2	MIT OR Apache-2.0	https://github.com/rust-analyzer/smol_str	linux,macos,windows
+stable_deref_trait	1.2.1	MIT OR Apache-2.0	https://github.com/storyyeller/stable_deref_trait	linux,macos,windows
+static_assertions	1.1.0	MIT OR Apache-2.0	https://github.com/nvzqz/static-assertions-rs	linux,macos,windows
+syn	2.0.119	MIT OR Apache-2.0	https://github.com/dtolnay/syn	linux,macos,windows
+syn	3.0.6	MIT OR Apache-2.0	https://github.com/dtolnay/syn	linux,macos,windows
+synstructure	0.14.0	MIT	https://github.com/mystor/synstructure	linux,macos,windows
+thiserror	1.0.69	MIT OR Apache-2.0	https://github.com/dtolnay/thiserror	linux
+thiserror	2.0.21	MIT OR Apache-2.0	https://github.com/dtolnay/thiserror	linux,macos,windows
+thiserror-impl	1.0.69	MIT OR Apache-2.0	https://github.com/dtolnay/thiserror	linux
+thiserror-impl	2.0.21	MIT OR Apache-2.0	https://github.com/dtolnay/thiserror	linux,macos,windows
+tiff	0.11.3	MIT	https://github.com/image-rs/image-tiff	linux,macos,windows
+tinystr	0.8.4	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+toml_datetime	1.1.1+spec-1.1.0	MIT OR Apache-2.0	https://github.com/toml-rs/toml	linux
+toml_edit	0.25.15+spec-1.1.0	MIT OR Apache-2.0	https://github.com/toml-rs/toml	linux
+toml_parser	1.1.3+spec-1.1.0	MIT OR Apache-2.0	https://github.com/toml-rs/toml	linux
+tracing	0.1.44	MIT	https://github.com/tokio-rs/tracing	linux,macos,windows
+tracing-attributes	0.1.31	MIT	https://github.com/tokio-rs/tracing	linux,macos,windows
+tracing-core	0.1.36	MIT	https://github.com/tokio-rs/tracing	linux,macos,windows
+ttf-parser	0.25.1	MIT OR Apache-2.0	https://github.com/harfbuzz/ttf-parser	linux,macos,windows
+type-map	0.5.1	MIT/Apache-2.0	https://github.com/kardeiz/type-map	linux,macos,windows
+unicode-ident	1.0.26	(MIT OR Apache-2.0) AND Unicode-3.0	https://github.com/dtolnay/unicode-ident	linux,macos,windows
+unicode-segmentation	1.13.3	MIT OR Apache-2.0	https://github.com/unicode-rs/unicode-segmentation	linux,macos,windows
+unicode-width	0.2.2	MIT OR Apache-2.0	https://github.com/unicode-rs/unicode-width	linux,macos,windows
+url	2.5.8	MIT OR Apache-2.0	https://github.com/servo/rust-url	linux,macos,windows
+utf8_iter	1.0.4	Apache-2.0 OR MIT	https://github.com/hsivonen/utf8_iter	linux,macos,windows
+uuid	1.27.0	Apache-2.0 OR MIT	https://github.com/uuid-rs/uuid	linux
+version_check	0.9.5	MIT/Apache-2.0	https://github.com/SergioBenitez/version_check	linux,macos,windows
+wayland-backend	0.3.17	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-client	0.31.15	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-csd-frame	0.3.0	MIT	https://github.com/rust-windowing/wayland-csd-frame	linux
+wayland-cursor	0.31.14	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-protocols	0.32.13	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-protocols-experimental	20250721.0.1	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-protocols-misc	0.3.12	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-protocols-plasma	0.3.12	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-protocols-wlr	0.3.12	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-scanner	0.31.11	MIT	https://github.com/smithay/wayland-rs	linux
+wayland-sys	0.31.11	MIT	https://github.com/smithay/wayland-rs	linux
+web-time	1.1.0	MIT OR Apache-2.0	https://github.com/daxpedda/web-time	linux,macos,windows
+webbrowser	1.2.4	MIT OR Apache-2.0	https://github.com/amodm/webbrowser-rs	linux,macos,windows
+weezl	0.1.12	MIT OR Apache-2.0	https://github.com/image-rs/weezl	linux,macos,windows
+wgpu	27.0.1	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,macos,windows
+wgpu-core	27.0.3	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,macos,windows
+wgpu-core-deps-windows-linux-android	27.0.0	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,windows
+wgpu-hal	27.0.4	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,macos,windows
+wgpu-types	27.0.1	MIT OR Apache-2.0	https://github.com/gfx-rs/wgpu	linux,macos,windows
+windows	0.61.3	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-collections	0.2.0	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-core	0.61.2	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-future	0.2.1	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-implement	0.60.2	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-interface	0.59.3	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-link	0.1.3	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-link	0.2.1	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-numerics	0.2.0	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-result	0.3.4	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-strings	0.4.2	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-sys	0.52.0	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-sys	0.60.2	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-sys	0.61.2	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-targets	0.52.6	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-targets	0.53.5	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows-threading	0.1.0	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows_x86_64_msvc	0.52.6	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+windows_x86_64_msvc	0.53.1	MIT OR Apache-2.0	https://github.com/microsoft/windows-rs	windows
+winit	0.30.13	Apache-2.0	https://github.com/rust-windowing/winit	linux,macos,windows
+winnow	1.0.4	MIT	https://github.com/winnow-rs/winnow	linux
+writeable	0.6.4	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+x11-dl	2.21.0	MIT	https://github.com/AltF02/x11-rs.git	linux
+x11rb	0.13.2	MIT OR Apache-2.0	https://github.com/psychon/x11rb	linux
+x11rb-protocol	0.13.2	MIT OR Apache-2.0	https://github.com/psychon/x11rb	linux
+xcursor	0.3.11	MIT	https://github.com/esposm03/xcursor-rs	linux
+xkbcommon-dl	0.4.2	MIT	https://github.com/rust-windowing/xkbcommon-dl	linux
+xkeysym	0.2.1	MIT OR Apache-2.0 OR Zlib	https://github.com/notgull/xkeysym	linux
+xml-rs	0.8.29	MIT	https://github.com/kornelski/xml-rs	linux,windows
+yoke	0.8.3	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+yoke-derive	0.8.4	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zbus	5.19.0	MIT	https://github.com/z-galaxy/zbus/	linux
+zbus-lockstep	0.5.2	MIT	https://github.com/luukvanderduim/zbus-lockstep	linux
+zbus-lockstep-macros	0.5.2	MIT	https://github.com/luukvanderduim/zbus-lockstep	linux
+zbus_macros	5.19.0	MIT	https://github.com/z-galaxy/zbus/	linux
+zbus_names	4.3.4	MIT	https://github.com/z-galaxy/zbus/	linux
+zbus_xml	5.2.1	MIT	https://github.com/z-galaxy/zbus/	linux
+zcheapstr	1.1.0	MIT	https://github.com/z-galaxy/zcheapstr/	linux
+zerocopy	0.8.59	BSD-2-Clause OR Apache-2.0 OR MIT	https://github.com/google/zerocopy	linux,macos,windows
+zerocopy-derive	0.8.59	BSD-2-Clause OR Apache-2.0 OR MIT	https://github.com/google/zerocopy	linux,macos,windows
+zerofrom	0.1.8	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zerofrom-derive	0.1.8	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zerotrie	0.2.5	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zerovec	0.11.8	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zerovec-derive	0.11.6	Unicode-3.0	https://github.com/unicode-org/icu4x	linux,macos,windows
+zlib-rs	0.6.8	Zlib	https://github.com/trifectatechfoundation/zlib-rs	linux,macos,windows
+zmij	1.0.23	MIT	https://github.com/dtolnay/zmij	linux,macos,windows
+zune-core	0.5.3	MIT OR Apache-2.0 OR Zlib	https://github.com/etemesi254/zune-image	linux,macos,windows
+zune-jpeg	0.5.15	MIT OR Apache-2.0 OR Zlib	https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg	linux,macos,windows
+zvariant	5.15.0	MIT	https://github.com/z-galaxy/zbus/	linux
+zvariant_derive	5.15.0	MIT	https://github.com/z-galaxy/zbus/	linux
+zvariant_utils	4.2.0	MIT	https://github.com/z-galaxy/zbus/	linux

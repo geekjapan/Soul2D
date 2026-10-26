@@ -1,0 +1,71 @@
+<root fileFormatVersion='401000004'>
+  <CModelSource>
+    <s xs.n='name'>Static rotation reparent fixture</s>
+    <CImageCanvas xs.n='canvas'><i xs.n='pixelWidth'>100</i><i xs.n='pixelHeight'>100</i></CImageCanvas>
+    <CParameterSourceSet xs.n='parameterSourceSet'><carray_list xs.n='_sources' count='0'/></CParameterSourceSet>
+    <CDrawableSourceSet xs.n='drawableSourceSet'><carray_list xs.n='_sources' count='1'><CArtMeshSource xs.ref='mesh'/></carray_list></CDrawableSourceSet>
+    <CDeformerSourceSet xs.n='deformerSourceSet'><carray_list xs.n='_sources' count='3'>
+      <CRotationDeformerSource xs.ref='old'/><CRotationDeformerSource xs.ref='new-root'/><CRotationDeformerSource xs.ref='new-child'/>
+    </carray_list></CDeformerSourceSet>
+    <CPartSourceSet xs.n='partSourceSet'><carray_list xs.n='_sources' count='3'><CPartSource xs.ref='part'/><CPartSource xs.ref='arm'/><CPartSource xs.ref='leg'/></carray_list></CPartSourceSet>
+    <CPartSource xs.n='rootPart' xs.ref='part'/>
+  </CModelSource>
+  <CArtMeshSource xs.id='mesh'>
+    <ACDrawableSource xs.n='super'>
+      <CArtMeshGuid xs.n='guid' uuid='mesh-guid'/><CArtMeshId xs.n='id' idstr='mesh'/><CPartGuid xs.n='parentGuid' uuid='part-guid'/>
+      <CDeformerGuid xs.n='targetDeformerGuid' xs.ref='old-guid-def'/>
+    </ACDrawableSource>
+    <float-array xs.n='positions' count='6'>0 0 1 0 1 1</float-array>
+    <float-array xs.n='uvs' count='6'>0 0 1 0 1 1</float-array><int-array xs.n='indices' count='3'>0 1 2</int-array>
+    <GTexture2D xs.n='texture' xs.ref='texture'/>
+    <carray_list xs.n='keyforms' count='1'><CArtMeshForm>
+      <ACDrawableForm xs.n='super'><ACForm xs.n='super'>
+        <CFormGuid xs.n='guid' uuid='form-guid'/><CArtMeshSource xs.n='_source' xs.ref='mesh'/>
+      </ACForm><CoordType xs.n='coordType'><s xs.n='coordName'>DeformerLocal</s></CoordType><f xs.n='opacity'>0.75</f></ACDrawableForm>
+      <float-array xs.n='positions' count='6'>1 2 3 4 5 6</float-array>
+    </CArtMeshForm></carray_list>
+  </CArtMeshSource>
+  <CDeformerGuid xs.id='old-guid-def' uuid='old-guid'/>
+  <CRotationDeformerGuid xs.id='new-root-guid-def' uuid='new-root-guid'/>
+  <CRotationDeformerGuid xs.id='new-child-guid-def' uuid='new-child-guid'/>
+  <CRotationDeformerSource xs.id='old'>
+    <ACDeformerSource xs.n='super'><CDeformerGuid xs.n='guid' xs.ref='old-guid-def'/><CDeformerId xs.n='id' idstr='Old'/>
+      <CPartGuid xs.n='parentGuid' uuid='part-guid'/><CDeformerGuid xs.n='targetDeformerGuid' uuid='71fae776-e218-4aee-873e-78e8ac0cb48a'/>
+    </ACDeformerSource><f xs.n='baseAngle'>30</f>
+    <carray_list xs.n='keyforms' count='1'><CRotationDeformerForm angle='60' originX='10' originY='20' scale='2' isReflectX='false' isReflectY='false'>
+      <ACDeformerForm xs.n='super'><ACForm xs.n='super'><CFormGuid xs.n='guid' uuid='old-form'/><CRotationDeformerSource xs.n='_source' xs.ref='old'/></ACForm>
+        <CoordType xs.n='coordType'><s xs.n='coordName'>Canvas</s></CoordType><f xs.n='opacity'>1</f>
+      </ACDeformerForm>
+    </CRotationDeformerForm></carray_list>
+  </CRotationDeformerSource>
+  <CRotationDeformerSource xs.id='new-root'>
+    <ACDeformerSource xs.n='super'><CRotationDeformerGuid xs.n='guid' xs.ref='new-root-guid-def'/><CDeformerId xs.n='id' idstr='NewRoot'/>
+      <CPartGuid xs.n='parentGuid' uuid='part-guid'/><CDeformerGuid xs.n='targetDeformerGuid' uuid='71fae776-e218-4aee-873e-78e8ac0cb48a'/>
+    </ACDeformerSource><f xs.n='baseAngle'>0</f>
+    <carray_list xs.n='keyforms' count='1'><CRotationDeformerForm angle='-90' originX='100' originY='-50' scale='0.5' isReflectX='false' isReflectY='false'>
+      <ACDeformerForm xs.n='super'><ACForm xs.n='super'><CFormGuid xs.n='guid' uuid='new-root-form'/><CRotationDeformerSource xs.n='_source' xs.ref='new-root'/></ACForm>
+        <CoordType xs.n='coordType'><s xs.n='coordName'>Canvas</s></CoordType><f xs.n='opacity'>1</f>
+      </ACDeformerForm>
+    </CRotationDeformerForm></carray_list>
+  </CRotationDeformerSource>
+  <CRotationDeformerSource xs.id='new-child'>
+    <ACDeformerSource xs.n='super'><CRotationDeformerGuid xs.n='guid' xs.ref='new-child-guid-def'/><CDeformerId xs.n='id' idstr='NewChild'/>
+      <CPartGuid xs.n='parentGuid' uuid='part-guid'/><CDeformerGuid xs.n='targetDeformerGuid' xs.ref='new-root-guid-def'/>
+    </ACDeformerSource><f xs.n='baseAngle'>0</f>
+    <carray_list xs.n='keyforms' count='1'><CRotationDeformerForm angle='90' originX='5' originY='-7' scale='4' isReflectX='false' isReflectY='false'>
+      <ACDeformerForm xs.n='super'><ACForm xs.n='super'><CFormGuid xs.n='guid' uuid='new-child-form'/><CRotationDeformerSource xs.n='_source' xs.ref='new-child'/></ACForm>
+        <CoordType xs.n='coordType'><s xs.n='coordName'>DeformerLocal</s></CoordType><f xs.n='opacity'>1</f>
+      </ACDeformerForm>
+    </CRotationDeformerForm></carray_list>
+  </CRotationDeformerSource>
+  <CPartSource xs.id='part'><CPartGuid xs.n='guid' uuid='part-guid'/><CPartId xs.n='id' idstr='root'/>
+    <carray_list xs.n='_childGuids' count='6'><CArtMeshGuid uuid='mesh-guid'/><CDeformerGuid uuid='old-guid'/><CRotationDeformerGuid uuid='new-root-guid'/><CRotationDeformerGuid uuid='new-child-guid'/><CPartGuid uuid='arm-guid'/><CPartGuid uuid='leg-guid'/></carray_list>
+    <carray_list xs.n='keyforms' count='0'/>
+  </CPartSource>
+  <CPartSource xs.id='arm'><CPartGuid xs.n='guid' uuid='arm-guid'/><CPartId xs.n='id' idstr='Arm'/><CPartGuid xs.n='parentGuid' uuid='part-guid'/><carray_list xs.n='_childGuids' count='0'/><carray_list xs.n='keyforms' count='0'/></CPartSource>
+  <CPartSource xs.id='leg'><CPartGuid xs.n='guid' uuid='leg-guid'/><CPartId xs.n='id' idstr='Leg'/><CPartGuid xs.n='parentGuid' uuid='part-guid'/><carray_list xs.n='_childGuids' count='0'/><carray_list xs.n='keyforms' count='0'/></CPartSource>
+  <GTexture2D xs.id='texture'><GTexture xs.n='super'><GTextureGuid xs.n='guid' uuid='texture-guid'/><FilterMode xs.n='filterMode'><MinFilter xs.n='minFilter' v='LINEAR'/><MagFilter xs.n='magFilter' v='LINEAR'/></FilterMode></GTexture>
+    <CImageResource xs.n='srcImageResource' width='2' height='3'><file xs.n='imageFileBuf' path='mesh.png'/></CImageResource><null xs.n='transformImageResource01toLogical01'/>
+  </GTexture2D>
+  <Opaque xs.id='future-data'>keep-this-xml</Opaque>
+</root>

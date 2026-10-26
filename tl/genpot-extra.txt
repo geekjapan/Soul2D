@@ -1,0 +1,33 @@
+# Strings that editor_windows.rs translates through a table, as env.t(label), so tools/genpot.py cannot
+# see them at the call site. One JSON string per line; each must also appear as a literal in rust/src
+# (genpot.py fails otherwise). Sites: COMMANDS labels, the Settings pane names, KEEP_LAYER_FOLDER,
+# LAYER_GROUP_REPLACEMENT and the File, Edit and Tools/Help menu tables. List them with
+#   python3 tools/genpot.py --dynamic
+"Show Command Palette."
+"Palette"
+"Animation"
+"Key All"
+"Unkey All"
+"File Handling"
+"Integration"
+"Preserve"
+"Don't preserve"
+"Node"
+"MeshGroup"
+"DynamicComposite"
+"Premultiply textures"
+"Bleed textures..."
+"Generate fake layer name info..."
+"Attempt full repair..."
+"Regenerate Node IDs"
+"Online Documentation"
+"Soul2DLive Documentation"
+"Outline"
+"Timeline"
+"Frame time"
+"Frames per second"
+"Document revision"
+"Parts"
+"Animations"
+# Read by Catalog::language_name in i18n.rs, not through tr or env.t.
+"LANG_NAME"

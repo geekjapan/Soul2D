@@ -1,0 +1,48 @@
+[package]
+name = "soul2d-core"
+version = "0.9.1"
+edition = "2021"
+description = "Experimental Soul2D editing core, CLI, and editor"
+license = "BSD-2-Clause"
+repository = "https://github.com/geekjapan/Soul2D"
+readme = "../README.md"
+
+[lib]
+name = "soul2d_core"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "soul2d-core"
+path = "src/main.rs"
+
+[[bin]]
+name = "njc"
+path = "src/njc_main.rs"
+
+[[bin]]
+name = "soul2d-editor"
+path = "src/editor_main.rs"
+required-features = ["gui"]
+
+[[example]]
+name = "acp-echo"
+test = true
+
+[features]
+gui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+base64 = "=0.22.1"
+eframe = { version = "=0.33.3", optional = true, default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+crc32fast = "=1.5.2"
+flate2 = "=1.1.10"
+getrandom = "=0.3.4"
+# The editor's native file dialog (#87); XDG portal on Linux, so it also works in the Flatpak sandbox.
+rfd = { version = "=0.17.2", optional = true }
+image = { version = "=0.25.10", default-features = false, features = ["png", "tga"] }
+roxmltree = "=0.21.1"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["arbitrary_precision"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"

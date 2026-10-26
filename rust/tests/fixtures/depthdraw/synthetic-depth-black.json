@@ -1,0 +1,125 @@
+{
+  "id": "synthetic-depth-black",
+  "generatedBy": "local-contract",
+  "tolerance": 1e-05,
+  "document": {
+    "width": 4,
+    "height": 4
+  },
+  "grid": {
+    "axisX": [
+      -1,
+      1
+    ],
+    "axisY": [
+      -1,
+      1
+    ],
+    "baseDepths": [
+      0.25,
+      0.25,
+      0.25,
+      0.25
+    ]
+  },
+  "layers": [
+    {
+      "id": "panel",
+      "width": 4,
+      "height": 4,
+      "bounds": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "backDepth": -1.0,
+      "frontDepth": 1.0,
+      "pixels": [
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255,
+        0,
+        0,
+        0,
+        255
+      ]
+    }
+  ],
+  "bindings": [
+    {
+      "layerId": "panel",
+      "order": 0,
+      "mergePolicy": "Replace"
+    }
+  ],
+  "expectedDepths": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0
+  ],
+  "expectedWinners": [
+    "panel",
+    "panel",
+    "panel",
+    "panel"
+  ]
+}

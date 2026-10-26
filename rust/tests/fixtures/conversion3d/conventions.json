@@ -1,0 +1,61 @@
+{
+  "rig": {"x": "screen right", "y": "down", "z": "toward the viewer", "handedness": "left"},
+  "conventions": [
+    {
+      "name": "gltf2",
+      "handedness": "right", "up": [0, 1, 0], "front": [0, 0, 1], "unit": "metre",
+      "toRig": [1, -1, 1],
+      "points": [{"source": [0.25, 1.5, 0.1], "rig": [0.25, -1.5, 0.1]}],
+      "triangles": [{"source": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "rigCrossZ": -1.0}],
+      "quaternions": [{"source": [0.5, 0.0, 0.0, 0.8660254037844386], "rig": [-0.5, 0.0, 0.0, 0.8660254037844386]},
+        {"source": [0.0, 0.5, 0.0, 0.8660254037844386], "rig": [0.0, 0.5, 0.0, 0.8660254037844386]},
+        {"source": [0.1, 0.5, 0.7, 0.5], "rig": [-0.1, 0.5, -0.7, 0.5]}]
+    },
+    {
+      "name": "vrm1",
+      "handedness": "right", "up": [0, 1, 0], "front": [0, 0, 1], "unit": "metre",
+      "toRig": [1, -1, 1],
+      "points": [{"source": [0.25, 1.5, 0.1], "rig": [0.25, -1.5, 0.1]}],
+      "triangles": [{"source": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "rigCrossZ": -1.0}],
+      "quaternions": [{"source": [0.0, 0.0, 0.5, 0.8660254037844386], "rig": [0.0, 0.0, -0.5, 0.8660254037844386]},
+        {"source": [0.1, 0.5, 0.7, 0.5], "rig": [-0.1, 0.5, -0.7, 0.5]}]
+    },
+    {
+      "name": "vrm0",
+      "handedness": "right", "up": [0, 1, 0], "front": [0, 0, -1], "unit": "metre",
+      "toRig": [-1, -1, -1],
+      "points": [{"source": [0.25, 1.5, 0.1], "rig": [-0.25, -1.5, -0.1]}],
+      "triangles": [{"source": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "rigCrossZ": 1.0}],
+      "quaternions": [{"source": [0.5, 0.0, 0.0, 0.8660254037844386], "rig": [0.5, 0.0, 0.0, 0.8660254037844386]},
+        {"source": [0.1, 0.5, 0.7, 0.5], "rig": [0.1, 0.5, 0.7, 0.5]}]
+    },
+    {
+      "name": "mmd",
+      "handedness": "left", "up": [0, 1, 0], "front": [0, 0, -1], "unit": "MMD unit",
+      "toRig": [1, -1, -1],
+      "points": [{"source": [1.0, 12.0, -0.5], "rig": [1.0, -12.0, 0.5]}],
+      "triangles": [{"source": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "rigCrossZ": -1.0}],
+      "quaternions": [{"source": [0.5, 0.0, 0.0, 0.8660254037844386], "rig": [0.5, 0.0, 0.0, 0.8660254037844386]},
+        {"source": [0.0, 0.5, 0.0, 0.8660254037844386], "rig": [0.0, -0.5, 0.0, 0.8660254037844386]},
+        {"source": [0.1, 0.5, 0.7, 0.5], "rig": [0.1, -0.5, -0.7, 0.5]}]
+    }
+  ],
+  "scale": {"convention": "gltf2", "rigSpan": 400.0, "sourceSpan": 0.5, "unitsPerSourceUnit": 800.0,
+    "source": [0.25, 1.5, 0.125], "rig": [200.0, -1200.0, 100.0]},
+  "humanoid": {
+    "vrm": {
+      "hips": "Pelvis", "spine": "Spine", "chest": "Chest", "neck": "Neck", "head": "Head",
+      "leftShoulder": "Clavicle.R", "leftUpperArm": "UpperArm.R", "leftLowerArm": "Forearm.R", "leftHand": "Hand.R",
+      "rightShoulder": "Clavicle.L", "rightUpperArm": "UpperArm.L", "rightLowerArm": "Forearm.L", "rightHand": "Hand.L",
+      "leftUpperLeg": "Thigh.R", "leftLowerLeg": "Shin.R", "leftFoot": "Foot.R",
+      "rightUpperLeg": "Thigh.L", "rightLowerLeg": "Shin.L", "rightFoot": "Foot.L"
+    },
+    "mixamo": {
+      "Hips": "Pelvis", "Spine": "Spine", "Spine2": "Chest", "Neck": "Neck", "Head": "Head",
+      "LeftShoulder": "Clavicle.R", "LeftArm": "UpperArm.R", "LeftForeArm": "Forearm.R", "LeftHand": "Hand.R",
+      "RightShoulder": "Clavicle.L", "RightArm": "UpperArm.L", "RightForeArm": "Forearm.L", "RightHand": "Hand.L",
+      "LeftUpLeg": "Thigh.R", "LeftLeg": "Shin.R", "LeftFoot": "Foot.R",
+      "RightUpLeg": "Thigh.L", "RightLeg": "Shin.L", "RightFoot": "Foot.L"
+    }
+  }
+}

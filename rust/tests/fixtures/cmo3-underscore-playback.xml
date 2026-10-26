@@ -1,0 +1,19 @@
+<root fileFormatVersion='401000004'><CModelSource>
+      <s xs.n='name'>Fixture</s><CImageCanvas xs.n='canvas'><i xs.n='pixelWidth'>100</i><i xs.n='pixelHeight'>100</i></CImageCanvas>
+      <CParameterSourceSet xs.n='parameterSourceSet'><carray_list xs.n='_sources' count='1'><CParameterSource><CParameterGuid xs.n='guid' uuid='parameter-guid'/><CParameterId xs.n='id' idstr='ParamTest'/><f xs.n='minValue'>-1</f><f xs.n='maxValue'>1</f><f xs.n='defaultValue'>0</f></CParameterSource></carray_list></CParameterSourceSet>
+      <CDrawableSourceSet xs.n='drawableSourceSet'><carray_list xs.n='_sources' count='1'><CArtMeshSource xs.ref='mesh'/></carray_list></CDrawableSourceSet>
+      <CDeformerSourceSet xs.n='deformerSourceSet'><carray_list xs.n='_sources' count='0'/></CDeformerSourceSet>
+      <CPartSourceSet xs.n='partSourceSet'><carray_list xs.n='_sources' count='1'><CPartSource xs.ref='part'/></carray_list></CPartSourceSet>
+      <CPartSource xs.n='rootPart' xs.ref='part'/>
+    </CModelSource>
+    <CArtMeshSource xs.id='mesh'><ACDrawableSource xs.n='super'><CArtMeshGuid xs.n='guid' uuid='mesh-guid'/><CArtMeshId xs.n='id' idstr='mesh'/><CPartGuid xs.n='parentGuid' uuid='part-guid-a'/></ACDrawableSource>
+      <KeyformGridSource xs.n='keyformGridSource'><array_list xs.n='keyformBindings' count='0'/><array_list xs.n='keyformsOnGrid' count='1'><KeyformOnGrid><KeyformGridAccessKey xs.n='accessKey'><array_list xs.n='_keyOnParameterList' count='0'/></KeyformGridAccessKey><CFormGuid xs.n='keyformGuid' uuid='form-guid'/></KeyformOnGrid></array_list></KeyformGridSource>
+      <float-array xs.n='positions' count='6'>0 0 1 0 1 1</float-array><float-array xs.n='uvs' count='6'>0 0 1 0 1 1</float-array><int-array xs.n='indices' count='3'>0 1 2</int-array>
+      <GTexture2D xs.n='texture' xs.ref='texture'/><carray_list xs.n='keyforms' count='1'><CArtMeshForm><ACDrawableForm xs.n='super'><ACForm xs.n='super'>
+        <CFormGuid xs.n='guid' uuid='form-guid'/><CArtMeshSource xs.n='_source' xs.ref='mesh'/>
+      </ACForm><CoordType xs.n='coordType'><s xs.n='coordName'>Canvas</s></CoordType><CFloatColor xs.n='multiplyColor' red='1' green='1' blue='1' alpha='1'/>
+      </ACDrawableForm><float-array xs.n='positions' count='6'>1 1 3 1 1 3</float-array></CArtMeshForm></carray_list>
+    </CArtMeshSource><CPartSource xs.id='part'><CPartGuid xs.n='guid' uuid='part-guid-a'/><CPartId xs.n='id' idstr='root'/><carray_list xs.n='keyforms' count='0'/></CPartSource>
+    <GTexture2D xs.id='texture'><GTexture xs.n='super'><GTextureGuid xs.n='guid' uuid='texture-guid'/><FilterMode xs.n='filterMode'><MinFilter xs.n='minFilter' v='LINEAR'/><MagFilter xs.n='magFilter' v='LINEAR'/></FilterMode></GTexture>
+      <CImageResource xs.n='srcImageResource' width='2' height='2'><file xs.n='imageFileBuf' path='mesh.png'/></CImageResource><null xs.n='transformImageResource01toLogical01'/>
+    </GTexture2D><Opaque xs.id='future-data'>keep-this-xml</Opaque></root>

@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+	<Product Id="5b6f6a6d-1759-4a73-9b49-54997bf758c9" Name="Soul2D" Language="1033" Version="0.9.1" Manufacturer="Soul2D contributors" UpgradeCode="545ff6a4-c555-46c2-9d67-f77896b5de9b">
+		<Package Description="Soul2D Installer" InstallerVersion="200" Compressed="yes" Platform="x64" InstallScope="perMachine" />
+
+		<MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+		<MediaTemplate EmbedCab="yes" />
+
+		<Feature Id="soul2dFeatureGroup" Title="soul2d" Description="soul2d" Level="1">
+			
+			<Feature Id="soul2dFeature" Title="Main Files" Description="The core soul2d files" Level="1" AllowAdvertise="no" Absent="disallow">
+				<ComponentGroupRef Id="ApplicationFiles" Primary="yes" />
+				<ComponentRef Id='ProgramMenuDir' />
+			</Feature>
+
+			<Feature Id="soul2dAssocFeature" Title="File Association" Description="Associate .inx files with soul2d" Level="1">
+				<ComponentRef Id="FileAssoc" />
+			</Feature>
+
+			<Feature Id="soul2dTranslationFeature" Title="Translations" Description="Translations for soul2d" Level="1">
+				<ComponentGroupRef Id="Translations" />
+			</Feature>
+
+			<Feature Id="soul2dDesktopiconFeature" Title="Desktop Icon" Description="Create Desktop Icon" Level="1">
+				<ComponentRef Id='DesktopIcon' />
+			</Feature>
+			
+		</Feature>
+
+		<!--<Feature Id="ExampleModelFeature" Title="Example Models" Description="Example models" Level="1">
+			<ComponentGroupRef Id="ExampleModels" />
+		</Feature>-->
+
+		<UIRef Id="WixUI_FeatureTree" />
+		<UIRef Id="WixUI_ErrorProgressText" />
+
+
+		<WixVariable Id="WixUILicenseRtf" Value="res\LICENSE.rtf" />
+		<WixVariable Id="WixUIBannerBmp" Value="res\banner.bmp" />
+		<WixVariable Id="WixUIDialogBmp" Value="res\dialog.bmp" />
+	</Product>
+
+	<Fragment>
+		<Directory Id="TARGETDIR" Name="SourceDir">
+			<Directory Id="ProgramFiles64Folder">
+				<Directory Id="INSTALLFOLDER" Name="Soul2D">
+					<Directory Id="i18n" Name="i18n" />
+				</Directory>
+			</Directory>
+
+
+			<Directory Id="ProgramMenuFolder" Name="Programs">
+				<Directory Id="ProgramMenuDir" Name="Soul2D">
+					<Component Id="ProgramMenuDir" Guid="1a6ac99b-9a71-4d1e-9d60-2df7c8ab5701">
+						<RemoveFolder Id='ProgramMenuDir' On='uninstall' />
+						<RegistryValue Root='HKCU' Key='Software\[Manufacturer]\[ProductName]' Type='string' Value='' KeyPath='yes' />
+					</Component>
+				</Directory>
+			</Directory>
+
+			<Directory Id="DesktopFolder" Name="Desktop" />
+		</Directory>
+	</Fragment>
+
+	<Fragment>
+		<Icon Id="soul2dIcon.ico" SourceFile="..\..\..\build-aux\windows\soul2d.ico" />
+
+		<!-- soul2d main app: the Rust editor (soul2d-editor.exe) is installed as soul2d.exe -->
+		<ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+
+			<Component Id="soul2d" Win64="yes" Guid="1f5acf16-5f1d-491e-9102-2abcf5d631d4">
+				<File Id="soul2dEXE.exe" Name="soul2d.exe" Source="..\..\..\out\rust\release\soul2d-editor.exe" KeyPath="yes" />
+				
+				<!-- File Association for INX-->
+				<ProgId Id='soul2d.inx' Description='Soul2D Project File' Icon="soul2dEXE.exe">
+					<Extension Id='inx' ContentType='application/inx'>
+						<Verb Id='open' Command='Open' TargetFile='soul2dEXE.exe' Argument='"%1"' />
+					</Extension>
+				</ProgId>
+
+				<!-- Icons -->
+				<Shortcut Id="ProgramFilessoul2d" Directory="ProgramMenuDir" Name="Soul2D" WorkingDirectory='INSTALLFOLDER' Icon="soul2dIcon.ico" IconIndex="0" Advertise="yes" />
+			</Component>
+
+			<Component Id="Soul2dCore" Win64="yes" Guid="*">
+				<File Id="soul2dCoreEXE" Name="soul2d-core.exe" Source="..\..\..\out\rust\release\soul2d-core.exe" KeyPath="yes" />
+			</Component>
+
+			<Component Id="Njc" Win64="yes" Guid="*">
+				<File Id="njcEXE" Name="njc.exe" Source="..\..\..\out\rust\release\njc.exe" KeyPath="yes" />
+			</Component>
+
+			<!-- Same set as tools/copy-notices.sh. A fixed GUID: WiX generates one only for a single-file component. -->
+			<Component Id="Notices" Win64="yes" Guid="fcdbecd3-cd93-4b17-bef8-823a6a33f9db">
+				<File Id="noticeLicense" Name="LICENSE" Source="..\..\..\LICENSE" KeyPath="yes" />
+				<File Id="noticeNotoSans" Name="NotoSans-Regular-LICENSE" Source="..\..\..\res\NotoSans-Regular-LICENSE" />
+				<File Id="noticeNotoSansCJK" Name="NotoSansCJK-Regular-LICENSE" Source="..\..\..\res\NotoSansCJK-Regular-LICENSE" />
+				<File Id="noticeOpenDyslexic" Name="OpenDyslexic-LICENSE" Source="..\..\..\res\OpenDyslexic-LICENSE" />
+				<File Id="noticeEguiFonts" Name="epaint_default_fonts-LICENSES.txt" Source="..\..\..\res\epaint_default_fonts-LICENSES.txt" />
+				<File Id="noticeThirdParty" Name="THIRD_PARTY.md" Source="..\..\..\THIRD_PARTY.md" />
+				<File Id="noticeCrates" Name="rust-dependencies.tsv" Source="..\..\..\doc\licenses\rust-dependencies.tsv" />
+				<File Id="noticeCrateTexts" Name="rust-dependencies-licenses.txt" Source="..\..\..\doc\licenses\rust-dependencies-licenses.txt" />
+			</Component>
+
+		</ComponentGroup>
+
+		<Component Id="FileAssoc" Win64="yes" Guid="*" Directory="INSTALLFOLDER">
+
+			<!-- App Paths to support Start,Run -> "myapp" -->
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\soul2d.exe" Value="[INSTALLFOLDER]soul2d.exe" Type="string" KeyPath="yes" />
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\soul2d.exe" Name="Path" Value="[INSTALLFOLDER]" Type="string" />
+
+			<!-- Extend to the "open with" list + Win7 jump menu pinning  -->
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Classes\Applications\soul2d.exe\SupportedTypes" Name=".inx" Value="" Type="string" />
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Classes\Applications\soul2d.exe\shell\open" Name="FriendlyAppName" Value="Soul2D" Type="string" />
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Classes\Applications\soul2d.exe\shell\open\command" Value="&quot;[INSTALLFOLDER]soul2d.exe&quot; &quot;%1&quot;" Type="string" />
+
+			<!-- Add an 'Edit with Soul2D' to 'right click' even when not associated -->
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Classes\SystemFileAssociations\.inx\shell\edit.soul2d.exe" Value="Edit with Soul2D" Type="string" />
+			<RegistryValue Root="HKLM" Key="SOFTWARE\Classes\SystemFileAssociations\.inx\shell\edit.soul2d.exe\command" Value="&quot;[INSTALLFOLDER]soul2d.exe&quot; &quot;%1&quot;" Type="string" />
+		</Component>
+
+		<Component Id="DesktopIcon" Win64="yes" Guid="5495a276-0643-4197-876c-bdefcae95fd8" Directory="INSTALLFOLDER">
+			<RegistryValue Root="HKCU"
+						   Key="Software\Microsoft\soul2d"
+						   Name="installed"
+						   Type="integer"
+						   Value="1"
+						   KeyPath="yes" />
+			<Shortcut Id="Desktopsoul2d" Directory="DesktopFolder" Name="Soul2D" Target="[#soul2dEXE.exe]" WorkingDirectory='INSTALLFOLDER' Icon="soul2dIcon.ico" IconIndex="0" Advertise="no" />
+		</Component>
+
+		<ComponentGroup Id="Translations" Directory="i18n">
+			<Component Id="TranslationFiles" Win64="yes" Guid="24c059e8-81cf-473d-b944-513410a2a9e0">
+				<CreateFolder Directory="i18n"/>
+				<File Id="Danish" Name="da.mo" Source="..\..\..\out\i18n\da.mo" KeyPath="yes" />
+				<File Id="German" Name="de_DE.mo" Source="..\..\..\out\i18n\de_DE.mo" />
+				<File Id="GermanFormal" Name="de_DE@formal.mo" Source="..\..\..\out\i18n\de_DE@formal.mo" />
+				<File Id="Spanish" Name="es.mo" Source="..\..\..\out\i18n\es.mo" />
+				<File Id="Italian" Name="it.mo" Source="..\..\..\out\i18n\it.mo" />
+				<File Id="Japanese" Name="ja.mo" Source="..\..\..\out\i18n\ja.mo" />
+				<File Id="Korean" Name="ko.mo" Source="..\..\..\out\i18n\ko.mo" />
+				<File Id="ChineseCN" Name="zh-CN.mo" Source="..\..\..\out\i18n\zh-CN.mo" />
+				<File Id="ChineseTW" Name="zh-TW.mo" Source="..\..\..\out\i18n\zh-TW.mo" />
+			</Component>
+		</ComponentGroup>
+	
+		<!-- Example models -->
+		<!--<ComponentGroup Id="ExampleModels" Directory="INSTALLFOLDER">
+			TODO: Add a mechanism to make soul2d be able to find them easily.
+		</ComponentGroup>-->
+	</Fragment>
+</Wix>

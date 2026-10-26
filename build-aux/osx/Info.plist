@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.9.1</string>
+	<key>CFBundleName</key>
+	<string>Soul2D</string>
+	<key>CFBundleDisplayName</key>
+	<string>Soul2D</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.geekjapan.soul2d</string>
+	<key>CFBundleVersion</key>
+	<string>0.9.1</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>inoc</string>
+	<key>CFBundleExecutable</key>
+	<string>soul2d</string>
+	<key>CFBundleIconFile</key>
+	<string>soul2d</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Soul2D Project</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.geekjapan.soul2d.project</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.geekjapan.soul2d.project</string>
+			<key>UTTypeDescription</key>
+			<string>Soul2D Project</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>inx</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

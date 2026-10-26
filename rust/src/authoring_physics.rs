@@ -1,0 +1,1602 @@
+//! Typed editing of the physics settings a CMO3 stores in `physicsSettingsSourceSet` (PHY01, issue #236).
+//!
+//! The canonical authoring model keeps the set element's verbatim XML in `physicsSource`. This module derives a
+//! full-precision typed view from it and applies one typed edit per call, returning the candidate model for
+//! `commit_model`. `rewrite` splices the stored string back at the element's byte range, so unknown markup and
+//! full-precision numbers survive and the strict `read(reopened) == candidate` gate still holds. Groups have no
+//! stable identity: callers address them by document order under `expectedRevision`. A new group is a copy of a
+//! stored one (`duplicate`) with new GUIDs and the next free `PhysicsSetting<n>` ID, the form the supplied Cubism files
+//! use; a file with no group gets none, since the layout of a first group is unproven.
+
+use crate::authoring_graph::Graph;
+use crate::authoring_values::{self as values, Budget};
+use crate::caff::CaffDocument;
+use crate::preset_store::Kind;
+use roxmltree::{Document, Node, ParsingOptions};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+const MAX_GROUPS: usize = 256;
+const MAX_ITEMS_PER_LIST: usize = 1024;
+const MAX_TOTAL_ITEMS: usize = 16384;
+const MAX_NAME_BYTES: usize = 1024;
+const MIN_STRAND_VERTICES: usize = 2;
+
+struct Patch {
+    range: Range<usize>,
+    value: String,
+}
+
+/// What to check in the view of the document after an edit was spliced in.
+enum Verify {
+    /// A JSON path of object keys and array indices ending at the expected value.
+    Value { path: Vec<Value>, expected: Value },
+    Groups(usize),
+    ListItems { group: usize, list: String, count: usize },
+}
+
+fn verify(after: &Value, check: &Verify) -> Result<(), String> {
+    let actual = match check {
+        Verify::Value { path, .. } => {
+            let mut cursor = after;
+            for step in path {
+                cursor = match step {
+                    Value::String(key) => &cursor[key.as_str()],
+                    Value::Number(index) => &cursor[index.as_u64().unwrap_or(usize::MAX as u64) as usize],
+                    _ => &Value::Null,
+                };
+            }
+            cursor.clone()
+        }
+        Verify::Groups(count) => after["groups"]
+            .as_array()
+            .map_or(Value::Null, |groups| json!(groups.len() == *count)),
+        Verify::ListItems { group, list, count } => after["groups"][*group][list.as_str()]
+            .as_array()
+            .map_or(Value::Null, |items| json!(items.len() == *count)),
+    };
+    let expected = match check {
+        Verify::Value { expected, .. } => expected.clone(),
+        _ => json!(true),
+    };
+    let same_number = actual.as_f64().zip(expected.as_f64()).is_some_and(|(a, b)| a == b);
+    if actual == expected || same_number {
+        Ok(())
+    } else {
+        Err(format!("authoring physics edit did not apply: expected {expected}, wrote {actual}"))
+    }
+}
+
+fn parse(text: &str) -> Result<Document<'_>, String> {
+    Document::parse_with_options(
+        text,
+        ParsingOptions { allow_dtd: false, nodes_limit: 1_000_000, ..Default::default() },
+    )
+    .map_err(|error| format!("invalid authoring XML: {error}"))
+}
+
+fn direct_field<'d, 'i>(node: Node<'d, 'i>, name: &str) -> Option<Node<'d, 'i>> {
+    node.children().find(|child| child.is_element() && child.attribute("xs.n") == Some(name))
+}
+
+/// Every `xs.ref` target name in the document: the set of `xs.id`s some element depends on.
+fn inbound_refs<'d>(document: &'d Document<'d>) -> HashSet<&'d str> {
+    document
+        .descendants()
+        .filter(|node| node.is_element())
+        .filter_map(|node| node.attribute("xs.ref"))
+        .collect()
+}
+
+/// Whether an inline element's subtree carries no `xs.id` that another element references. Removing or replacing
+/// such a subtree cannot dangle a reference.
+fn subtree_unreferenced(node: Node<'_, '_>, inbound: &HashSet<&str>) -> bool {
+    node.descendants()
+        .filter(|node| node.is_element())
+        .all(|node| node.attribute("xs.id").is_none_or(|id| !inbound.contains(id)))
+}
+
+/// Whether this element's own `xs.id` is the target of some `xs.ref` elsewhere: shared storage.
+fn referenced(node: Node<'_, '_>, inbound: &HashSet<&str>) -> bool {
+    node.attribute("xs.id").is_some_and(|id| inbound.contains(id))
+}
+
+fn elements<'d, 'i>(node: Node<'d, 'i>) -> Vec<Node<'d, 'i>> {
+    node.children().filter(|child| child.is_element()).collect()
+}
+
+fn check_count(node: Node<'_, '_>, actual: usize) -> Result<(), String> {
+    if let Some(count) = node.attribute("count") {
+        if count.parse::<usize>().ok() != Some(actual) {
+            return Err("authoring array count does not match content".into());
+        }
+    }
+    Ok(())
+}
+
+/// A guid→id and id→guid map of the model's parameters, for translating `CParameterGuid` references.
+fn parameter_maps(model: &Value) -> Result<(HashMap<String, String>, HashMap<String, String>), String> {
+    let parameters = model
+        .get("parameters")
+        .and_then(Value::as_array)
+        .ok_or("authoring model lacks parameters")?;
+    let mut by_guid = HashMap::with_capacity(parameters.len());
+    let mut by_id = HashMap::with_capacity(parameters.len());
+    for parameter in parameters {
+        let guid = parameter["guid"].as_str().ok_or("authoring parameter lacks guid")?;
+        let id = parameter["id"].as_str().ok_or("authoring parameter lacks id")?;
+        by_guid.insert(guid.to_owned(), id.to_owned());
+        by_id.insert(id.to_owned(), guid.to_owned());
+    }
+    Ok((by_guid, by_id))
+}
+
+fn escape_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn escape_attribute(text: &str) -> String {
+    escape_text(text).replace('\'', "&apos;").replace('"', "&quot;")
+}
+
+fn number_text(value: f64) -> String {
+    format!("{value}")
+}
+
+/// The open-tag span of an element and the span of its content, for patching `count` and insert points.
+fn element_spans(text: &str, node: Node<'_, '_>) -> Result<(Range<usize>, Range<usize>), String> {
+    let range = node.range();
+    let element = &text[range.clone()];
+    let open_len = element
+        .find('>')
+        .map(|index| index + 1)
+        .ok_or("authoring element is truncated")?;
+    if element[..open_len].ends_with("/>") {
+        return Ok((range.start..range.start + open_len, range.end..range.end));
+    }
+    let close = element
+        .rfind("</")
+        .ok_or("authoring element lacks a closing tag")?;
+    Ok((range.start..range.start + open_len, range.start + open_len..range.start + close))
+}
+
+/// The `count='N'` attribute inside a list's open tag, as a patch over the digits only.
+fn count_patch(
+    text: &str,
+    list: Node<'_, '_>,
+    new_count: usize,
+    patches: &mut Vec<Patch>,
+) -> Result<(), String> {
+    let (open, _) = element_spans(text, list)?;
+    let head = &text[open.clone()];
+    let Some(attr) = head.find("count=") else {
+        return Ok(());
+    };
+    let start = open.start + attr + "count=".len();
+    let quote = text[start..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '\'' | '"'))
+        .ok_or("authoring count attribute lacks a quote")?;
+    let digits = start + 1;
+    let end = text[digits..]
+        .find(quote)
+        .map(|end| digits + end)
+        .ok_or("authoring count attribute is unterminated")?;
+    if text[digits..end].parse::<usize>().is_err() {
+        return Err("authoring count attribute is not a number".into());
+    }
+    patches.push(Patch { range: digits..end, value: new_count.to_string() });
+    Ok(())
+}
+
+/// The set element when it is a direct inline field of the model: the only layout this writer supports.
+fn editable_set<'d, 'i>(
+    graph: &Graph<'d, 'i>,
+    inbound: &HashSet<&str>,
+) -> Result<Option<Node<'d, 'i>>, String> {
+    let Some(model) = graph.model()? else {
+        return Ok(None);
+    };
+    let Some(field) = direct_field(model, "physicsSettingsSourceSet") else {
+        return Ok(None);
+    };
+    if field.attribute("xs.ref").is_some() || field.has_tag_name("null") {
+        return Err("authoring physics source uses shared or absent storage".into());
+    }
+    if field.attribute("xs.id").is_some_and(|id| inbound.contains(id)) {
+        return Err("authoring physics source is shared storage".into());
+    }
+    Ok(Some(field))
+}
+
+fn editable_list<'d, 'i>(
+    parent: Node<'d, 'i>,
+    name: &str,
+    inbound: &HashSet<&str>,
+) -> Result<Node<'d, 'i>, String> {
+    let list = direct_field(parent, name)
+        .ok_or_else(|| format!("authoring physics {name} list is missing"))?;
+    if list.attribute("xs.ref").is_some() || referenced(list, inbound) {
+        return Err(format!("authoring physics {name} list uses shared storage"));
+    }
+    Ok(list)
+}
+
+fn inline_slot<'d, 'i>(
+    graph: &Graph<'d, 'i>,
+    inbound: &HashSet<&str>,
+    slots: &[Node<'d, 'i>],
+    index: usize,
+    what: &str,
+) -> Result<Node<'d, 'i>, String> {
+    let slot = *slots
+        .get(index)
+        .ok_or_else(|| format!("authoring physics {what} index is outside the list"))?;
+    if slot.attribute("xs.ref").is_some() || referenced(slot, inbound) {
+        return Err(format!("authoring physics {what} uses shared storage"));
+    }
+    let node = graph.resolve(slot)?;
+    if referenced(node, inbound) {
+        return Err(format!("authoring physics {what} uses shared storage"));
+    }
+    Ok(node)
+}
+
+/// Checks a leaf element is safe to replace whole: right tag and name, no alias, no child elements, no externally
+/// referenced `xs.id`, and no attributes beyond `xs.n`, `xs.id` and the listed ones. Returns the `xs.id` attribute
+/// fragment to carry over, if any.
+fn check_leaf(
+    node: Node<'_, '_>,
+    tag: &str,
+    name: &str,
+    extra: &[&str],
+    inbound: &HashSet<&str>,
+) -> Result<String, String> {
+    if !node.has_tag_name(tag) || node.attribute("xs.n") != Some(name) {
+        return Err(format!("authoring physics {name} is not inline {tag} storage"));
+    }
+    if node.attribute("xs.ref").is_some() || node.children().any(|child| !child.is_text()) {
+        return Err(format!("authoring physics {name} uses shared storage or carries non-text children"));
+    }
+    let id = node.attribute("xs.id");
+    if id.is_some_and(|id| inbound.contains(id)) {
+        return Err(format!("authoring physics {name} is referenced elsewhere"));
+    }
+    for attribute in node.attributes() {
+        let attribute = attribute.name();
+        if attribute != "xs.n" && attribute != "xs.id" && !extra.contains(&attribute) {
+            return Err(format!("authoring physics {name} carries an unknown attribute"));
+        }
+    }
+    Ok(id.map(|id| format!(" xs.id='{}'", escape_attribute(id))).unwrap_or_default())
+}
+
+fn scalar_patch(
+    node: Node<'_, '_>,
+    tag: &str,
+    name: &str,
+    content: String,
+    inbound: &HashSet<&str>,
+) -> Result<Patch, String> {
+    let id = check_leaf(node, tag, name, &[], inbound)?;
+    Ok(Patch {
+        range: node.range(),
+        value: format!("<{tag} xs.n='{name}'{id}>{}</{tag}>", escape_text(&content)),
+    })
+}
+
+fn attribute_leaf_patch(
+    node: Node<'_, '_>,
+    tag: &str,
+    name: &str,
+    attribute: &str,
+    value: &str,
+    inbound: &HashSet<&str>,
+) -> Result<Patch, String> {
+    let id = check_leaf(node, tag, name, &[attribute], inbound)?;
+    if node
+        .children()
+        .any(|child| child.is_text() && !child.text().unwrap_or_default().trim().is_empty())
+    {
+        return Err(format!("authoring physics {name} carries non-whitespace text"));
+    }
+    Ok(Patch {
+        range: node.range(),
+        value: format!("<{tag} xs.n='{name}'{id} {attribute}='{}'/>", escape_attribute(value)),
+    })
+}
+
+/// The attribute that names a parameter GUID: a reference to the file's shared GUID object when it keeps one.
+fn parameter_reference(guid: &str, guid_objects: &HashMap<&str, &str>) -> String {
+    match guid_objects.get(guid) {
+        Some(id) => format!("xs.ref='{}'", escape_attribute(id)),
+        None => format!("uuid='{}'", escape_attribute(guid)),
+    }
+}
+
+/// Points a `CParameterGuid` field at another parameter, as an inline GUID or a reference.
+fn parameter_leaf_patch(
+    node: Node<'_, '_>,
+    name: &str,
+    guid: &str,
+    guid_objects: &HashMap<&str, &str>,
+    inbound: &HashSet<&str>,
+) -> Result<Patch, String> {
+    if !node.has_tag_name("CParameterGuid") || node.attribute("xs.n") != Some(name) {
+        return Err(format!("authoring physics {name} is not a CParameterGuid field"));
+    }
+    if node.attribute("xs.id").is_some() || referenced(node, inbound) {
+        return Err(format!("authoring physics {name} defines a shared GUID"));
+    }
+    if node.children().any(|child| child.is_element()) {
+        return Err(format!("authoring physics {name} uses shared storage or carries non-text children"));
+    }
+    if node.children().any(|child| child.text().is_some_and(|text| !text.trim().is_empty())) {
+        return Err(format!("authoring physics {name} carries non-whitespace text"));
+    }
+    if node.attributes().any(|attribute| !matches!(attribute.name(), "xs.n" | "uuid" | "xs.ref" | "note")) {
+        return Err(format!("authoring physics {name} carries an unknown attribute"));
+    }
+    Ok(Patch {
+        range: node.range(),
+        value: format!("<CParameterGuid xs.n='{name}' {}/>", parameter_reference(guid, guid_objects)),
+    })
+}
+
+/// A new list item written as a copy of `donor`, a stored item of the same list, with the requested values (and the
+/// defaults of `item_insert`) and new GUIDs. Fields the view does not show keep the donor's values.
+#[allow(clippy::too_many_arguments)]
+fn cloned_item(
+    text: &str,
+    inbound: &HashSet<&str>,
+    by_id: &HashMap<String, String>,
+    guid_objects: &HashMap<&str, &str>,
+    group: Node<'_, '_>,
+    list: &str,
+    donor: Node<'_, '_>,
+    value: &Value,
+) -> Result<String, String> {
+    let mut values = value.as_object().cloned().unwrap_or_default();
+    if list != "vertices" {
+        for (key, default) in [("weight", json!(100.0)), ("scale", json!(10.0)), ("reflect", json!(false))] {
+            values.entry(key).or_insert(default);
+        }
+    }
+    let mut patches = Vec::new();
+    for (field, value) in &values {
+        item_scalar(inbound, by_id, guid_objects, group, list, donor, field, value, &mut patches)?;
+    }
+    for node in donor.descendants().filter(|node| node.attribute("xs.n") == Some("guid")) {
+        if let Some(attribute) = node.attributes().find(|attribute| attribute.name() == "uuid") {
+            let guid = crate::animation_source::new_guid()?;
+            patches.push(Patch { range: attribute.range_value(), value: guid });
+        }
+    }
+    let range = donor.range();
+    let mut out = text[range.clone()].to_owned();
+    patches.sort_by_key(|patch| patch.range.start);
+    if patches.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
+        return Err("authoring physics item copy produced overlapping changes".into());
+    }
+    for patch in patches.iter().rev() {
+        out.replace_range(patch.range.start - range.start..patch.range.end - range.start, &patch.value);
+    }
+    Ok(out)
+}
+
+/// Replaces an element whose tag itself changes (`<i>` ↔ `<null>`), keeping the same safety checks.
+fn replace_leaf(
+    node: Node<'_, '_>,
+    name: &str,
+    new_text: String,
+    inbound: &HashSet<&str>,
+) -> Result<Patch, String> {
+    if node.attribute("xs.ref").is_some() || node.children().any(|child| !child.is_text()) {
+        return Err(format!("authoring physics {name} uses shared storage or carries non-text children"));
+    }
+    if node
+        .attribute("xs.id")
+        .is_some_and(|id| inbound.contains(id))
+    {
+        return Err(format!("authoring physics {name} is referenced elsewhere"));
+    }
+    if node
+        .attributes()
+        .any(|attribute| !matches!(attribute.name(), "xs.n" | "xs.id"))
+    {
+        return Err(format!("authoring physics {name} carries an unknown attribute"));
+    }
+    Ok(Patch { range: node.range(), value: new_text })
+}
+
+fn finite(value: &Value) -> Result<f64, String> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "authoring physics value must be a finite number".to_owned())
+}
+
+fn native_finite(value: &Value, name: &str) -> Result<f64, String> {
+    let value = finite(value)?;
+    if !(value as f32).is_finite() {
+        return Err(format!("authoring physics {name} exceeds native float range"));
+    }
+    Ok(value)
+}
+
+fn request_index(object: &Map<String, Value>, name: &str) -> Result<Option<usize>, String> {
+    object
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| format!("{name} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn request_string<'a>(object: &'a Map<String, Value>, name: &str) -> Result<Option<&'a str>, String> {
+    object
+        .get(name)
+        .map(|value| value.as_str().ok_or_else(|| format!("{name} must be a string")))
+        .transpose()
+}
+
+fn optional_number(object: &Map<String, Value>, name: &str, default: f64) -> Result<f64, String> {
+    match object.get(name) {
+        Some(value) => native_finite(value, name),
+        None => Ok(default),
+    }
+}
+
+fn optional_bool(object: &Map<String, Value>, name: &str, default: bool) -> Result<bool, String> {
+    match object.get(name) {
+        Some(value) => value.as_bool().ok_or_else(|| format!("{name} must be a boolean")),
+        None => Ok(default),
+    }
+}
+
+/// `live2d.physics3.read`: the full-precision typed view of the stored physics source.
+pub(crate) fn view(container: &CaffDocument, model: &Value) -> Result<Value, String> {
+    let xml = container.main_xml();
+    let text = std::str::from_utf8(&xml)
+        .map_err(|error| format!("authoring XML is not UTF-8: {error}"))?;
+    let document = parse(text)?;
+    let graph = Graph::new(&document)?;
+    let (by_guid, _) = parameter_maps(model)?;
+    let inbound = inbound_refs(&document);
+    view_document(&graph, &inbound, &by_guid)
+}
+
+fn view_document(
+    graph: &Graph<'_, '_>,
+    inbound: &HashSet<&str>,
+    by_guid: &HashMap<String, String>,
+) -> Result<Value, String> {
+    let Some(model) = graph.model()? else {
+        return Err("authoring source contains no model".into());
+    };
+    let Some(set) = graph.field(model, "physicsSettingsSourceSet")? else {
+        return Ok(json!({"format": "live2d.authoring.physics.v1", "present": false}));
+    };
+    if set.has_tag_name("null") {
+        return Ok(json!({"format": "live2d.authoring.physics.v1", "present": false}));
+    }
+    let direct = direct_field(model, "physicsSettingsSourceSet")
+        .filter(|field| field.id() == set.id() && field.attribute("xs.ref").is_none());
+    let set_editable = direct
+        .is_some_and(|field| field.attribute("xs.id").is_none_or(|id| !inbound.contains(id)));
+    let mut budget = Budget::new(5_000_000);
+    let fps = graph
+        .field(set, "settingFPS")?
+        .filter(|rate| !rate.has_tag_name("null"))
+        .map(|rate| {
+            rate.text()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "invalid authoring physics rate".to_owned())
+        })
+        .transpose()?;
+    let Some(list) = graph.field(set, "_sourceCubismPhysics")? else {
+        return Ok(json!({"format": "live2d.authoring.physics.v1", "present": true,
+            "editable": false, "fps": fps, "groups": []}));
+    };
+    let list = graph.resolve(list)?;
+    let slots = elements(list);
+    check_count(list, slots.len())?;
+    if slots.len() > MAX_GROUPS {
+        return Err("authoring physics exceeds 256 settings".into());
+    }
+    let list_inline = direct_field(set, "_sourceCubismPhysics")
+        .is_some_and(|field| {
+            field.id() == list.id() && field.attribute("xs.ref").is_none()
+        })
+        && !referenced(list, inbound);
+    let mut groups = Vec::with_capacity(slots.len());
+    let mut total = 0usize;
+    for (index, slot) in slots.iter().enumerate() {
+        let group = graph.resolve(*slot)?;
+        let shared = slot.attribute("xs.ref").is_some()
+            || referenced(*slot, inbound)
+            || referenced(group, inbound);
+        let editable = set_editable && list_inline && !shared;
+        let items = |name: &str,
+                     kind: &str,
+                     shared: bool,
+                     editable: bool,
+                     budget: &mut Budget,
+                     out: &mut Vec<Value>|
+         -> Result<(), String> {
+            let Some(field) = graph.field(group, name)? else {
+                return Ok(());
+            };
+            let list = graph.resolve(field)?;
+            let item_slots = elements(list);
+            check_count(list, item_slots.len())?;
+            if item_slots.len() > MAX_ITEMS_PER_LIST {
+                return Err("authoring physics list exceeds 1024 entries".into());
+            }
+            let shared = shared
+                || field.attribute("xs.ref").is_some()
+                || referenced(field, inbound)
+                || referenced(list, inbound);
+            for (item_index, item_slot) in item_slots.iter().enumerate() {
+                out.push(view_item(
+                    graph, inbound, by_guid, *item_slot, item_index, kind, shared,
+                    editable && !shared, budget,
+                )?);
+            }
+            Ok(())
+        };
+        let (mut inputs, mut outputs, mut vertices) = (Vec::new(), Vec::new(), Vec::new());
+        items("inputs", "inputs", shared, editable, &mut budget, &mut inputs)?;
+        items("outputs", "outputs", shared, editable, &mut budget, &mut outputs)?;
+        items("vertices", "vertices", shared, editable, &mut budget, &mut vertices)?;
+        total += inputs.len() + outputs.len() + vertices.len();
+        if inputs.len() > MAX_ITEMS_PER_LIST
+            || outputs.len() > MAX_ITEMS_PER_LIST
+            || vertices.len() > MAX_ITEMS_PER_LIST
+            || total > MAX_TOTAL_ITEMS
+        {
+            return Err("authoring physics exceeds entry budget".into());
+        }
+        let range = |name: &str| -> Result<Value, String> {
+            let field = |part: &str| values::number_field(graph, group, &format!("normalized{name}{part}"), None);
+            Ok(json!({"min": field("ValueMin")?, "default": field("DefaultValue")?,
+                "max": field("ValueMax")?}))
+        };
+        let name = values::text_field(graph, group, "name")?.unwrap_or("");
+        groups.push(json!({
+            "index": index,
+            "name": budget.text(name)?,
+            "editable": editable,
+            "shared": shared,
+            "normalization": {"position": range("Position")?, "angle": range("Angle")?},
+            "inputs": inputs,
+            "outputs": outputs,
+            "vertices": vertices,
+        }));
+    }
+    Ok(json!({"format": "live2d.authoring.physics.v1", "present": true,
+        "editable": set_editable && list_inline, "fps": fps, "groups": groups}))
+}
+
+fn view_item(
+    graph: &Graph<'_, '_>,
+    inbound: &HashSet<&str>,
+    by_guid: &HashMap<String, String>,
+    slot: Node<'_, '_>,
+    index: usize,
+    list: &str,
+    container_shared: bool,
+    editable_path: bool,
+    budget: &mut Budget,
+) -> Result<Value, String> {
+    let item = graph.resolve(slot)?;
+    let shared = slot.attribute("xs.ref").is_some()
+        || referenced(slot, inbound)
+        || container_shared
+        || !subtree_unreferenced(item, inbound);
+    let mut entry = Map::new();
+    entry.insert("index".into(), json!(index));
+    entry.insert("shared".into(), json!(shared));
+    entry.insert("editable".into(), json!(editable_path && !shared));
+    let number = |name: &str| -> Result<Value, String> {
+        match values::text_field(graph, item, name)? {
+            Some(text) => Ok(json!(values::finite(text)?)),
+            None => Ok(Value::Null),
+        }
+    };
+    let parameter = |name: &str, budget: &mut Budget| -> Result<(Value, Value), String> {
+        let Some(guid) = values::guid_field(graph, item, name)? else {
+            return Ok((Value::Null, Value::Null));
+        };
+        let id = match by_guid.get(guid) {
+            Some(id) => budget.text(id)?,
+            None => String::new(),
+        };
+        Ok((json!(id), json!(budget.text(guid)?)))
+    };
+    match list {
+        "inputs" | "outputs" => {
+            let field = if list == "inputs" { "source" } else { "destination" };
+            let (id, guid) = parameter(field, budget)?;
+            entry.insert(field.into(), id);
+            entry.insert(format!("{field}Guid"), guid);
+            let token = graph
+                .field(item, "type")?
+                .and_then(|node| node.attribute("v"))
+                .unwrap_or("");
+            let token = budget.text(token)?;
+            let known = matches!(token.as_str(), "SRC_TO_X" | "SRC_TO_G_ANGLE");
+            entry.insert("typeToken".into(), json!(token));
+            entry.insert(
+                "type".into(),
+                match token.as_str() {
+                    "SRC_TO_X" => json!("X"),
+                    "SRC_TO_G_ANGLE" => json!("Angle"),
+                    _ => Value::Null,
+                },
+            );
+            entry.insert("weight".into(), number("weight")?);
+            entry.insert("reflect".into(), json!(values::bool_field(graph, item, "isReverse", false)?));
+            if let Some(vertex) = values::text_field(graph, item, "vertexIndex")? {
+                entry.insert(
+                    "vertexIndex".into(),
+                    vertex.trim().parse::<u64>().map_or(Value::Null, Value::from),
+                );
+            }
+            if let Some(scale) = values::text_field(graph, item, "angleScale")? {
+                entry.insert("scale".into(), json!(values::finite(scale)?));
+            }
+            if !known || (list == "outputs" && token != "SRC_TO_G_ANGLE") {
+                entry.insert("editable".into(), json!(false));
+            }
+        }
+        "vertices" => {
+            let position = graph.field(item, "position")?;
+            let axis = |name: &str| -> Result<Value, String> {
+                let Some(position) = position else {
+                    return Ok(Value::Null);
+                };
+                match values::text_field(graph, position, name)? {
+                    Some(text) => Ok(json!(values::finite(text)?)),
+                    None => Ok(Value::Null),
+                }
+            };
+            entry.insert("x".into(), axis("x")?);
+            entry.insert("y".into(), axis("y")?);
+            for name in ["mobility", "delay", "acceleration", "radius"] {
+                entry.insert(name.into(), number(name)?);
+            }
+        }
+        _ => return Err("unknown physics list".into()),
+    }
+    Ok(Value::Object(entry))
+}
+
+/// `live2d.physics3.edit` on the document side: validates one typed edit and returns the candidate model whose
+/// `physicsSource` holds the patched set text. `rewrite` splices it back.
+pub(crate) fn edit(
+    container: &CaffDocument,
+    model: &Value,
+    request: &Value,
+) -> Result<Value, String> {
+    let xml = container.main_xml();
+    let text = std::str::from_utf8(&xml)
+        .map_err(|error| format!("authoring XML is not UTF-8: {error}"))?;
+    edit_text(text, model, request).map(|(candidate, _)| candidate)
+}
+
+/// One typed edit of the document text `text`: the candidate model and the whole document text with the edit
+/// spliced in, which a following edit takes as its `text`.
+fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, String), String> {
+    if model.get("format").and_then(Value::as_str) != Some("live2d.authoring.source.v1") {
+        return Err("authoring physics edit requires a source.v1 model".into());
+    }
+    let object = request
+        .as_object()
+        .ok_or("authoring physics edit request must be an object")?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "op" | "expectedRevision" | "group" | "list" | "index" | "insert" | "remove" | "field" | "value" | "duplicate"
+        ) {
+            return Err(format!("authoring physics edit carries an unknown key {key:?}"));
+        }
+    }
+    let group_index = request_index(object, "group")?;
+    let list_name = request_string(object, "list")?;
+    let item_index = request_index(object, "index")?;
+    let insert_at = request_index(object, "insert")?;
+    let remove = optional_bool(object, "remove", false)?;
+    let duplicate = optional_bool(object, "duplicate", false)?;
+    let field = request_string(object, "field")?;
+    let value = object.get("value");
+    if insert_at.is_some() && group_index.is_none() {
+        return Err("creating a physics group is not supported".into());
+    }
+    if insert_at.is_some() && list_name.is_none() {
+        return Err("authoring physics insert requires a list".into());
+    }
+
+    let document = parse(text)?;
+    let graph = Graph::new(&document)?;
+    let inbound = inbound_refs(&document);
+    let (by_guid, by_id) = parameter_maps(model)?;
+    // Cubism files keep a parameter's GUID as a shared object and refer to it; others store the GUID inline.
+    let guid_objects: HashMap<&str, &str> = document.descendants()
+        .filter(|node| node.parent_element().is_some_and(|p| p.has_tag_name("shared") || p.parent_element().is_none()))
+        .filter_map(|node| Some((node.attribute("uuid")?, node.attribute("xs.id")?))).collect();
+    let set = editable_set(&graph, &inbound)?
+        .ok_or("authoring model has no physics settings")?;
+    let list = editable_list(set, "_sourceCubismPhysics", &inbound)?;
+    let slots = elements(list);
+    check_count(list, slots.len())?;
+    if slots.len() > MAX_GROUPS {
+        return Err("authoring physics exceeds 256 settings".into());
+    }
+
+    let mut patches = Vec::new();
+    let check: Verify = match (group_index, list_name, item_index, insert_at, remove, field, value) {
+        // A new group: a copy of one the file stores, at the end, with new GUIDs and the next free
+        // `PhysicsSetting<n>` ID.
+        (Some(group), None, None, None, false, None, None) if duplicate => {
+            let node = inline_slot(&graph, &inbound, &slots, group, "group")?;
+            if node.descendants().any(|inner| inner.attribute("xs.id").is_some()) {
+                return Err("authoring physics group defines shared objects".into());
+            }
+            if slots.len() + 1 > MAX_GROUPS {
+                return Err("authoring physics exceeds 256 settings".into());
+            }
+            let ids: Vec<u64> = slots.iter().filter_map(|slot| direct_field(*slot, "id")?.attribute("idstr")?
+                .strip_prefix("PhysicsSetting")?.parse().ok()).collect();
+            let id = format!("PhysicsSetting{}", ids.iter().max().copied().unwrap_or(slots.len() as u64) + 1);
+            let id_field = direct_field(node, "id").ok_or("authoring physics group lacks an id field")?;
+            let mut local = Vec::new();
+            let idstr = id_field.attributes().find(|attribute| attribute.name() == "idstr")
+                .ok_or("authoring physics group id lacks idstr")?;
+            local.push(Patch { range: idstr.range_value(), value: id });
+            for inner in node.descendants().filter(|inner| inner.attribute("xs.n") == Some("guid")) {
+                if let Some(attribute) = inner.attributes().find(|attribute| attribute.name() == "uuid") {
+                    local.push(Patch { range: attribute.range_value(), value: crate::animation_source::new_guid()? });
+                }
+            }
+            let range = node.range();
+            let mut copy = text[range.clone()].to_owned();
+            local.sort_by_key(|patch| patch.range.start);
+            for patch in local.iter().rev() {
+                copy.replace_range(patch.range.start - range.start..patch.range.end - range.start, &patch.value);
+            }
+            let end = slots.last().map_or(range.end, |last| last.range().end);
+            patches.push(Patch { range: end..end, value: copy });
+            count_patch(text, list, slots.len() + 1, &mut patches)?;
+            Verify::Groups(slots.len() + 1)
+        }
+        (Some(group), None, None, None, false, Some(field), Some(value)) => {
+            let node = inline_slot(&graph, &inbound, &slots, group, "group")?;
+            match field {
+                "name" => {
+                    let name = value.as_str().ok_or("name must be a string")?;
+                    if name.len() > MAX_NAME_BYTES {
+                        return Err("authoring physics name exceeds 1024 bytes".into());
+                    }
+                    let target = direct_field(node, "name")
+                        .ok_or("authoring physics group lacks an inline name field")?;
+                    patches.push(scalar_patch(target, "s", "name", name.to_owned(), &inbound)?);
+                    Verify::Value {
+                        path: vec![json!("groups"), json!(group), json!("name")],
+                        expected: json!(name),
+                    }
+                }
+                _ => {
+                    let (xml_name, kind) = match field {
+                        "normalization.position.min" => ("normalizedPositionValueMin", "normalizedPosition"),
+                        "normalization.position.default" => ("normalizedPositionDefaultValue", "normalizedPosition"),
+                        "normalization.position.max" => ("normalizedPositionValueMax", "normalizedPosition"),
+                        "normalization.angle.min" => ("normalizedAngleValueMin", "normalizedAngle"),
+                        "normalization.angle.default" => ("normalizedAngleDefaultValue", "normalizedAngle"),
+                        "normalization.angle.max" => ("normalizedAngleValueMax", "normalizedAngle"),
+                        _ => return Err("unsupported authoring physics group field".into()),
+                    };
+                    let new = native_finite(value, field)?;
+                    let read = |part: &str| values::number_field(&graph, node, &format!("{kind}{part}"), None);
+                    let (min, default, max) = match xml_name {
+                        name if name.ends_with("ValueMin") => (new, read("DefaultValue")?, read("ValueMax")?),
+                        name if name.ends_with("DefaultValue") => (read("ValueMin")?, new, read("ValueMax")?),
+                        _ => (read("ValueMin")?, read("DefaultValue")?, new),
+                    };
+                    if !(min <= default && default <= max) {
+                        return Err("authoring physics normalization must keep min <= default <= max".into());
+                    }
+                    let target = direct_field(node, xml_name)
+                        .ok_or("authoring physics group lacks an inline normalization field")?;
+                    patches.push(scalar_patch(target, "f", xml_name, number_text(new), &inbound)?);
+                    let mut path = vec![json!("groups"), json!(group), json!("normalization")];
+                    for part in field["normalization.".len()..].split('.') {
+                        path.push(json!(part));
+                    }
+                    Verify::Value { path, expected: json!(new) }
+                }
+            }
+        }
+        (Some(group), None, None, None, true, None, None) => {
+            let slot = *slots
+                .get(group)
+                .ok_or("authoring physics group index is outside the list")?;
+            if slot.attribute("xs.ref").is_some() || referenced(slot, &inbound) {
+                return Err("authoring physics group uses shared storage".into());
+            }
+            if !subtree_unreferenced(slot, &inbound) {
+                return Err("authoring physics group is referenced elsewhere".into());
+            }
+            patches.push(Patch { range: slot.range(), value: String::new() });
+            count_patch(text, list, slots.len() - 1, &mut patches)?;
+            Verify::Groups(slots.len() - 1)
+        }
+        // Set-level `settingFPS`: an integer rate or null for the vendor's unset value.
+        (None, None, None, None, false, Some("fps"), Some(value)) => {
+            let (tag, content) = if value.is_null() {
+                ("null", String::new())
+            } else {
+                let fps = value
+                    .as_u64()
+                    .filter(|fps| (1..=240).contains(fps))
+                    .ok_or("fps must be null or an integer in 1..=240")?;
+                ("i", fps.to_string())
+            };
+            match direct_field(set, "settingFPS") {
+                Some(node) => {
+                    let id = node
+                        .attribute("xs.id")
+                        .filter(|id| !inbound.contains(id))
+                        .map(|id| format!(" xs.id='{}'", escape_attribute(id)))
+                        .unwrap_or_default();
+                    let text = if content.is_empty() {
+                        format!("<null xs.n='settingFPS'{id}/>")
+                    } else {
+                        format!("<{tag} xs.n='settingFPS'{id}>{content}</{tag}>")
+                    };
+                    patches.push(replace_leaf(node, "settingFPS", text, &inbound)?);
+                }
+                None => {
+                    let (_, inner) = element_spans(text, set)?;
+                    if inner.is_empty() {
+                        return Err("authoring physics set is self-closing".into());
+                    }
+                    patches.push(Patch {
+                        range: inner.end..inner.end,
+                        value: format!("<{tag} xs.n='settingFPS'>{content}</{tag}>"),
+                    });
+                }
+            }
+            Verify::Value { path: vec![json!("fps")], expected: value.clone() }
+        }
+        (None, None, None, None, false, Some(_), Some(_)) => {
+            return Err("unsupported authoring physics set field".into());
+        }
+        (None, _, _, _, _, _, _) => return Err("authoring physics edit lacks a group".into()),
+        (Some(group), Some(list_name), index, insert_at, remove, field, value) => {
+            let group_slot = *slots
+                .get(group)
+                .ok_or("authoring physics group index is outside the list")?;
+            if group_slot.attribute("xs.ref").is_some() {
+                return Err("authoring physics group uses shared storage".into());
+            }
+            let group_node = inline_slot(&graph, &inbound, &slots, group, "group")?;
+            if !matches!(list_name, "inputs" | "outputs" | "vertices") {
+                return Err("unsupported authoring physics list".into());
+            }
+            let list_node = editable_list(group_node, list_name, &inbound)?;
+            let items = elements(list_node);
+            check_count(list_node, items.len())?;
+            if items.len() > MAX_ITEMS_PER_LIST {
+                return Err("authoring physics list exceeds 1024 entries".into());
+            }
+            match (index, insert_at, remove, field, value) {
+                (Some(index), None, false, Some(field), Some(value)) => {
+                    let item = inline_slot(&graph, &inbound, &items, index, "list item")?;
+                    let key = item_scalar(
+                        &inbound, &by_id, &guid_objects, group_node, list_name, item, field, value, &mut patches,
+                    )?;
+                    Verify::Value {
+                        path: vec![
+                            json!("groups"),
+                            json!(group),
+                            json!(list_name),
+                            json!(index),
+                            json!(key),
+                        ],
+                        expected: value.clone(),
+                    }
+                }
+                (Some(index), None, true, None, None) => {
+                    item_remove(
+                        &graph, &inbound, text, group_node, list_name, list_node, &items, index, &mut patches,
+                    )?;
+                    Verify::ListItems {
+                        group,
+                        list: list_name.to_owned(),
+                        count: items.len() - 1,
+                    }
+                }
+                (None, Some(insert), false, None, Some(value)) => {
+                    if insert > items.len() {
+                        return Err("authoring physics insert index is outside the list".into());
+                    }
+                    if items.len() + 1 > MAX_ITEMS_PER_LIST {
+                        return Err("authoring physics list exceeds 1024 entries".into());
+                    }
+                    if list_name == "vertices" && insert == 0 && !items.is_empty() {
+                        return Err("authoring physics vertex insert may not displace the strand root".into());
+                    }
+                    let vertex_count = if list_name == "outputs" {
+                        elements(editable_list(group_node, "vertices", &inbound)?).len()
+                    } else {
+                        0
+                    };
+                    let element = item_insert(&by_id, &guid_objects, list_name, vertex_count, insert, value)?;
+                    // A stored item of the same list is the layout to follow, when the file has one.
+                    let donor = slots.iter().filter_map(|slot| {
+                        let group = slot.attribute("xs.ref").is_none().then_some(*slot)?;
+                        let list = editable_list(group, list_name, &inbound).ok()?;
+                        elements(list).into_iter().find(|item| {
+                            item.attribute("xs.ref").is_none() && item.descendants().all(|node| node.attribute("xs.id").is_none())
+                        })
+                    }).next();
+                    let element = match donor {
+                        Some(donor) => cloned_item(text, &inbound, &by_id, &guid_objects, group_node, list_name, donor, value)?,
+                        None => element,
+                    };
+                    if item_insert_offset(text, list_node, &items, insert, &mut patches, &element)? {
+                        count_patch(text, list_node, items.len() + 1, &mut patches)?;
+                    }
+                    if list_name == "vertices" {
+                        renumber_outputs(&graph, &inbound, group_node, insert, 1, &mut patches)?;
+                    }
+                    Verify::ListItems {
+                        group,
+                        list: list_name.to_owned(),
+                        count: items.len() + 1,
+                    }
+                }
+                _ => return Err("unsupported authoring physics edit".into()),
+            }
+        }
+        _ => return Err("unsupported authoring physics edit".into()),
+    };
+
+    let range = set.range();
+    let mut body = text[range.clone()].to_owned();
+    patches.sort_by_key(|patch| patch.range.start);
+    let mut cursor = range.start;
+    for patch in &patches {
+        if patch.range.start < range.start || patch.range.end > range.end || patch.range.start < cursor {
+            return Err("authoring physics edit produced overlapping changes".into());
+        }
+        cursor = patch.range.end;
+    }
+    for patch in patches.iter().rev() {
+        body.replace_range(patch.range.start - range.start..patch.range.end - range.start, &patch.value);
+    }
+
+    // Prove the splice did what the request asked before the candidate leaves: reparse the document with the new
+    // set text in place and check the addressed value in the same view the read tool returns.
+    let spliced = format!("{}{}{}", &text[..range.start], body, &text[range.end..]);
+    {
+        let document = parse(&spliced)?;
+        let graph = Graph::new(&document)?;
+        let inbound = inbound_refs(&document);
+        let after = view_document(&graph, &inbound, &by_guid)?;
+        verify(&after, &check)?;
+    }
+
+    let mut candidate = model.clone();
+    candidate["physicsSource"] = Value::String(body);
+    Ok((candidate, spliced))
+}
+
+/// The view key a scalar field maps to, for the post-edit check.
+fn json_key(list: &str, field: &str) -> String {
+    match (list, field) {
+        ("inputs" | "outputs", "reflect") => "reflect",
+        ("outputs", "scale") => "scale",
+        ("outputs", "vertexIndex") => "vertexIndex",
+        _ => field,
+    }
+    .to_owned()
+}
+
+/// One scalar edit inside an `inputs`, `outputs` or `vertices` item. Returns the view key of the edited field.
+fn item_scalar(
+    inbound: &HashSet<&str>,
+    by_id: &HashMap<String, String>,
+    guid_objects: &HashMap<&str, &str>,
+    group: Node<'_, '_>,
+    list: &str,
+    item: Node<'_, '_>,
+    field: &str,
+    value: &Value,
+    patches: &mut Vec<Patch>,
+) -> Result<String, String> {
+    let target = |name: &str| -> Result<Node<'_, '_>, String> {
+        direct_field(item, name)
+            .ok_or_else(|| format!("authoring physics item lacks an inline {name} field"))
+    };
+    match (list, field) {
+        ("inputs", "source") | ("outputs", "destination") => {
+            let id = value.as_str().ok_or("physics parameter reference must be an ID string")?;
+            let guid = by_id
+                .get(id)
+                .ok_or_else(|| format!("authoring physics names unknown parameter {id:?}"))?;
+            patches.push(parameter_leaf_patch(target(field)?, field, guid, guid_objects, inbound)?);
+        }
+        ("inputs", "type") => {
+            let token = match value.as_str() {
+                Some("X") => "SRC_TO_X",
+                Some("Angle") => "SRC_TO_G_ANGLE",
+                _ => return Err("authoring physics input type must be \"X\" or \"Angle\"".into()),
+            };
+            patches.push(attribute_leaf_patch(target("type")?, "CPhysicsSourceType", "type", "v", token, inbound)?);
+        }
+        ("outputs", "type") => {
+            return Err("authoring physics output type is fixed to Angle".into());
+        }
+        ("inputs" | "outputs", "weight") => {
+            let weight = native_finite(value, "weight")?;
+            if !(0.0..=100.0).contains(&weight) {
+                return Err("authoring physics weight is outside 0..=100".into());
+            }
+            patches.push(scalar_patch(target("weight")?, "f", "weight", number_text(weight), inbound)?);
+        }
+        ("inputs" | "outputs", "reflect") => {
+            let reflect = value.as_bool().ok_or("reflect must be a boolean")?;
+            patches.push(scalar_patch(
+                target("isReverse")?, "b", "isReverse", reflect.to_string(), inbound,
+            )?);
+        }
+        ("inputs" | "outputs", "scale") => {
+            let scale = native_finite(value, "scale")?;
+            patches.push(scalar_patch(target("angleScale")?, "f", "angleScale", number_text(scale), inbound)?);
+        }
+        ("outputs", "vertexIndex") => {
+            let vertex = value
+                .as_u64()
+                .filter(|vertex| *vertex >= 1)
+                .ok_or("authoring physics vertexIndex must be a positive integer")?;
+            let vertices = editable_list(group, "vertices", inbound)?;
+            if vertex as usize >= elements(vertices).len() {
+                return Err("authoring physics vertexIndex is outside the strand".into());
+            }
+            patches.push(scalar_patch(target("vertexIndex")?, "i", "vertexIndex", vertex.to_string(), inbound)?);
+        }
+        ("vertices", "x" | "y") => {
+            let position = target("position")?;
+            if !position.has_tag_name("GVector2")
+                || position.attribute("xs.ref").is_some()
+                || referenced(position, inbound)
+            {
+                return Err("authoring physics vertex position is not inline GVector2 storage".into());
+            }
+            let axis = direct_field(position, field)
+                .ok_or_else(|| format!("authoring physics vertex lacks an inline {field} field"))?;
+            let value = native_finite(value, field)?;
+            patches.push(scalar_patch(axis, "f", field, number_text(value), inbound)?);
+        }
+        ("vertices", "mobility") => {
+            let value = native_finite(value, "mobility")?;
+            if !(0.0..=1.0).contains(&value) {
+                return Err("authoring physics mobility is outside 0..=1".into());
+            }
+            patches.push(scalar_patch(target("mobility")?, "f", "mobility", number_text(value), inbound)?);
+        }
+        ("vertices", "delay" | "acceleration" | "radius") => {
+            let number = native_finite(value, field)?;
+            if number < 0.0 {
+                return Err(format!("authoring physics {field} must be nonnegative"));
+            }
+            if field == "radius" && number == 0.0 {
+                let items = elements(editable_list(group, "vertices", inbound)?);
+                if items.first().is_some_and(|first| first.id() != item.id()) {
+                    return Err("authoring physics radius may be zero only on the first vertex".into());
+                }
+            }
+            patches.push(scalar_patch(target(field)?, "f", field, number_text(number), inbound)?);
+        }
+        _ => return Err("unsupported authoring physics field".into()),
+    }
+    Ok(json_key(list, field))
+}
+
+/// Remove one list item, renumbering outputs when a vertex removal shifts the strand.
+fn item_remove(
+    graph: &Graph<'_, '_>,
+    inbound: &HashSet<&str>,
+    text: &str,
+    group: Node<'_, '_>,
+    list: &str,
+    list_node: Node<'_, '_>,
+    items: &[Node<'_, '_>],
+    index: usize,
+    patches: &mut Vec<Patch>,
+) -> Result<(), String> {
+    let slot = *items
+        .get(index)
+        .ok_or("authoring physics item index is outside the list")?;
+    if slot.attribute("xs.ref").is_some() || referenced(slot, inbound) {
+        return Err("authoring physics list item uses shared storage".into());
+    }
+    if !subtree_unreferenced(slot, inbound) {
+        return Err("authoring physics item is referenced elsewhere".into());
+    }
+    if list == "vertices" {
+        if items.len() <= MIN_STRAND_VERTICES {
+            return Err("authoring physics strand needs at least two vertices".into());
+        }
+        renumber_outputs(graph, inbound, group, index, -1, patches)?;
+    }
+    patches.push(Patch { range: slot.range(), value: String::new() });
+    count_patch(text, list_node, items.len() - 1, patches)?;
+    Ok(())
+}
+
+/// Shift every inline output's `vertexIndex` across a removed or inserted vertex position `at` by `delta`
+/// (-1 or +1). A removal landing exactly on a referenced vertex, or an output stored as an alias, refuses.
+fn renumber_outputs(
+    graph: &Graph<'_, '_>,
+    inbound: &HashSet<&str>,
+    group: Node<'_, '_>,
+    at: usize,
+    delta: isize,
+    patches: &mut Vec<Patch>,
+) -> Result<(), String> {
+    if graph.field(group, "outputs")?.is_none() {
+        return Ok(());
+    }
+    let outputs = editable_list(group, "outputs", inbound)
+        .map_err(|_| "authoring physics outputs list uses shared storage".to_owned())?;
+    for slot in elements(outputs) {
+        if slot.attribute("xs.ref").is_some() || referenced(slot, inbound) {
+            return Err("authoring physics output needing renumbering uses shared storage".into());
+        }
+        let output = graph.resolve(slot)?;
+        if referenced(output, inbound) {
+            return Err("authoring physics output needing renumbering uses shared storage".into());
+        }
+        let Some(index_text) = values::text_field(graph, output, "vertexIndex")? else {
+            continue;
+        };
+        let index = index_text
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "authoring physics output vertexIndex is not a number")?;
+        if delta < 0 && index == at {
+            return Err("an authoring physics output names the removed vertex".into());
+        }
+        if index >= at {
+            let shifted = index as isize + delta;
+            if shifted < 1 {
+                return Err("authoring physics vertex renumbering leaves the strand".into());
+            }
+            if slot.attribute("xs.ref").is_some() {
+                return Err("authoring physics output needing renumbering uses shared storage".into());
+            }
+            let field = direct_field(output, "vertexIndex")
+                .ok_or("authoring physics output lacks an inline vertexIndex field")?;
+            patches.push(scalar_patch(field, "i", "vertexIndex", shifted.to_string(), inbound)?);
+        }
+    }
+    Ok(())
+}
+
+/// The element text for an inserted list item, with every authored field validated.
+fn item_insert(
+    by_id: &HashMap<String, String>,
+    guid_objects: &HashMap<&str, &str>,
+    list: &str,
+    vertex_count: usize,
+    insert: usize,
+    value: &Value,
+) -> Result<String, String> {
+    let object = value.as_object().ok_or("inserted physics item must be an object")?;
+    let allowed: &[&str] = match list {
+        "vertices" => &["x", "y", "mobility", "delay", "acceleration", "radius"],
+        "inputs" => &["source", "type", "scale", "weight", "reflect"],
+        "outputs" => &["destination", "vertexIndex", "scale", "weight", "reflect"],
+        _ => return Err("unsupported authoring physics list".into()),
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("inserted physics {list} item carries an unknown key {key:?}"));
+        }
+    }
+    match list {
+        "vertices" => {
+            for name in ["x", "y", "mobility", "delay", "acceleration", "radius"] {
+                if !object.contains_key(name) {
+                    return Err(format!("inserted physics vertex lacks {name}"));
+                }
+            }
+            let mobility = native_finite(&object["mobility"], "mobility")?;
+            if !(0.0..=1.0).contains(&mobility) {
+                return Err("inserted physics mobility is outside 0..=1".into());
+            }
+            let delay = optional_number(object, "delay", f64::NAN)?;
+            let acceleration = optional_number(object, "acceleration", f64::NAN)?;
+            let radius = optional_number(object, "radius", f64::NAN)?;
+            if delay < 0.0 || acceleration < 0.0 || radius < 0.0 {
+                return Err("inserted physics delay, acceleration and radius must be nonnegative".into());
+            }
+            if radius == 0.0 && insert != 0 {
+                return Err("inserted physics radius may be zero only at index 0".into());
+            }
+            let x = optional_number(object, "x", f64::NAN)?;
+            let y = optional_number(object, "y", f64::NAN)?;
+            Ok(format!(
+                "<CPhysicsVertex><GVector2 xs.n='position'><f xs.n='x'>{}</f><f xs.n='y'>{}</f></GVector2>\
+                 <f xs.n='mobility'>{}</f><f xs.n='delay'>{}</f><f xs.n='acceleration'>{}</f>\
+                 <f xs.n='radius'>{}</f></CPhysicsVertex>",
+                number_text(x), number_text(y), number_text(mobility),
+                number_text(delay), number_text(acceleration), number_text(radius),
+            ))
+        }
+        "inputs" => {
+            let source = object
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or("inserted physics input lacks a source parameter ID")?;
+            let guid = by_id
+                .get(source)
+                .ok_or_else(|| format!("authoring physics names unknown parameter {source:?}"))?;
+            let token = match object.get("type").and_then(Value::as_str) {
+                Some("X") => "SRC_TO_X",
+                Some("Angle") => "SRC_TO_G_ANGLE",
+                _ => return Err("inserted physics input type must be \"X\" or \"Angle\"".into()),
+            };
+            let weight = optional_number(object, "weight", 100.0)?;
+            if !(0.0..=100.0).contains(&weight) {
+                return Err("inserted physics weight is outside 0..=100".into());
+            }
+            let scale = optional_number(object, "scale", 10.0)?;
+            let reflect = optional_bool(object, "reflect", false)?;
+            Ok(format!(
+                "<CPhysicsInput><CParameterGuid xs.n='source' {}/>\
+                 <CPhysicsSourceType xs.n='type' v='{}'/><f xs.n='angleScale'>{}</f>\
+                 <f xs.n='weight'>{}</f><b xs.n='isReverse'>{}</b></CPhysicsInput>",
+                parameter_reference(guid, guid_objects), token, number_text(scale), number_text(weight), reflect,
+            ))
+        }
+        "outputs" => {
+            let destination = object
+                .get("destination")
+                .and_then(Value::as_str)
+                .ok_or("inserted physics output lacks a destination parameter ID")?;
+            let guid = by_id
+                .get(destination)
+                .ok_or_else(|| format!("authoring physics names unknown parameter {destination:?}"))?;
+            let vertex = object
+                .get("vertexIndex")
+                .and_then(Value::as_u64)
+                .filter(|vertex| *vertex >= 1 && (*vertex as usize) < vertex_count)
+                .ok_or("inserted physics output vertexIndex is outside the strand")?;
+            let weight = optional_number(object, "weight", 100.0)?;
+            if !(0.0..=100.0).contains(&weight) {
+                return Err("inserted physics weight is outside 0..=100".into());
+            }
+            let scale = optional_number(object, "scale", 10.0)?;
+            let reflect = optional_bool(object, "reflect", false)?;
+            Ok(format!(
+                "<CPhysicsOutput><CParameterGuid xs.n='destination' {}/>\
+                 <CPhysicsSourceType xs.n='type' v='SRC_TO_G_ANGLE'/><f xs.n='angleScale'>{}</f>\
+                 <f xs.n='weight'>{}</f><b xs.n='isReverse'>{}</b><i xs.n='vertexIndex'>{}</i></CPhysicsOutput>",
+                parameter_reference(guid, guid_objects), number_text(scale), number_text(weight), reflect, vertex,
+            ))
+        }
+        _ => Err("unsupported authoring physics list".into()),
+    }
+}
+
+/// The byte offset an inserted element goes to: before the slot at `insert`, after the previous slot, or inside an
+/// empty list. Returns true when the list element still needs its `count` patched.
+fn item_insert_offset(
+    text: &str,
+    list: Node<'_, '_>,
+    items: &[Node<'_, '_>],
+    insert: usize,
+    patches: &mut Vec<Patch>,
+    element: &str,
+) -> Result<bool, String> {
+    if insert < items.len() {
+        let start = items[insert].range().start;
+        patches.push(Patch { range: start..start, value: element.to_owned() });
+        return Ok(true);
+    }
+    if let Some(last) = items.last() {
+        let end = last.range().end;
+        patches.push(Patch { range: end..end, value: element.to_owned() });
+        return Ok(true);
+    }
+    let (open, inner) = element_spans(text, list)?;
+    if inner.is_empty() && text[open.clone()].ends_with("/>") {
+        // A self-closing empty list expands around the new item, carrying its attributes and the new count.
+        let tag = list.tag_name().name();
+        let attrs: String = list
+            .attributes()
+            .filter(|attribute| attribute.name() != "count")
+            .map(|attribute| format!(" {}='{}'", attribute.name(), escape_attribute(attribute.value())))
+            .collect();
+        patches.push(Patch {
+            range: list.range(),
+            value: format!("<{tag}{attrs} count='1'>{element}</{tag}>"),
+        });
+        return Ok(false);
+    }
+    patches.push(Patch { range: inner.end..inner.end, value: element.to_owned() });
+    Ok(true)
+}
+
+/// The presets of the user for the inputs of a physics group (PHY02, issue #236), in
+/// `physics3-input-presets.json` of the settings directory. There is none built in.
+pub(crate) const INPUT_PRESETS: Kind = Kind {
+    file: "physics3-input-presets.json",
+    noun: "physics input preset",
+    entry: input_preset_entry,
+    builtin: |_| false,
+};
+
+/// The presets of the user for the physical model of a group, its pendulum vertices, in
+/// `physics3-model-presets.json` of the settings directory. There is none built in.
+pub(crate) const MODEL_PRESETS: Kind = Kind {
+    file: "physics3-model-presets.json",
+    noun: "physics model preset",
+    entry: model_preset_entry,
+    builtin: |_| false,
+};
+
+/// The fields a preset keeps of an input and of a vertex. `scale` is the only one an item may leave out.
+const INPUT_KEYS: [&str; 5] = ["source", "type", "weight", "reflect", "scale"];
+const VERTEX_KEYS: [&str; 6] = ["x", "y", "mobility", "delay", "acceleration", "radius"];
+
+fn input_preset_entry(request: &Value) -> Result<Value, String> {
+    preset_entry("inputs", request)
+}
+
+fn model_preset_entry(request: &Value) -> Result<Value, String> {
+    preset_entry("vertices", request)
+}
+
+/// The list a preset request names: the inputs of a group or its pendulum vertices.
+fn preset_list(request: &Value) -> Result<&'static str, String> {
+    match request.get("list").and_then(Value::as_str) {
+        Some("inputs") => Ok("inputs"),
+        Some("vertices") => Ok("vertices"),
+        _ => Err("a physics preset list must be inputs or vertices".into()),
+    }
+}
+
+/// The store kind of the list a preset request names.
+pub(crate) fn preset_kind(request: &Value) -> Result<&'static Kind, String> {
+    match preset_list(request)? {
+        "inputs" => Ok(&INPUT_PRESETS),
+        _ => Ok(&MODEL_PRESETS),
+    }
+}
+
+/// What a preset keeps of `request`: the `items` of one list, checked like the values `live2d.physics3.edit`
+/// takes. Every entry read from the file goes through here as well.
+fn preset_entry(list: &str, request: &Value) -> Result<Value, String> {
+    let keys: &[&str] = if list == "inputs" { &INPUT_KEYS } else { &VERTEX_KEYS };
+    let least = if list == "inputs" { 1 } else { MIN_STRAND_VERTICES };
+    let items = request.get("items").and_then(Value::as_array).ok_or("items must be an array")?;
+    if !(least..=MAX_ITEMS_PER_LIST).contains(&items.len()) {
+        return Err(format!("a preset for {list} needs {least} to {MAX_ITEMS_PER_LIST} items"));
+    }
+    for (index, item) in items.iter().enumerate() {
+        let item = item.as_object().ok_or("a preset item must be an object")?;
+        if let Some(key) = item.keys().find(|key| !keys.contains(&key.as_str())) {
+            return Err(format!("a preset item of {list} carries an unknown key {key:?}"));
+        }
+        if let Some(key) = keys.iter().find(|key| **key != "scale" && !item.contains_key(**key)) {
+            return Err(format!("a preset item of {list} needs {key}"));
+        }
+        for (key, value) in item {
+            check_preset_field(key, value, index)?;
+        }
+    }
+    Ok(json!({ "items": items }))
+}
+
+fn check_preset_field(key: &str, value: &Value, index: usize) -> Result<(), String> {
+    match key {
+        "source" => {
+            if !value.as_str().is_some_and(|id| !id.is_empty() && id.len() <= MAX_NAME_BYTES) {
+                return Err("a preset item source must be a parameter ID".into());
+            }
+        }
+        "type" => {
+            if !matches!(value.as_str(), Some("X" | "Angle")) {
+                return Err("a preset item type must be \"X\" or \"Angle\"".into());
+            }
+        }
+        "reflect" => {
+            if !value.is_boolean() {
+                return Err("a preset item reflect must be a boolean".into());
+            }
+        }
+        _ => {
+            let number = native_finite(value, key)?;
+            match key {
+                "weight" if !(0.0..=100.0).contains(&number) => {
+                    return Err("a preset item weight is outside 0..=100".into());
+                }
+                "mobility" if !(0.0..=1.0).contains(&number) => {
+                    return Err("a preset item mobility is outside 0..=1".into());
+                }
+                "delay" | "acceleration" | "radius" if number < 0.0 => {
+                    return Err(format!("a preset item {key} must be nonnegative"));
+                }
+                "radius" if number == 0.0 && index != 0 => {
+                    return Err("a preset item radius may be zero only on the first vertex".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The request of `live2d.physics3.preset.save`, with `items` copied from the list of group `group` when it names
+/// one. `view` is the typed view of the document, needed only then. A null field counts as absent, and what a
+/// preset cannot keep is refused rather than dropped without a word.
+pub(crate) fn preset_request(view: Option<&Value>, request: &Value) -> Result<Value, String> {
+    let mut object: Map<String, Value> = request
+        .as_object()
+        .ok_or("a physics preset save request must be an object")?
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "op" | "list" | "name" | "overwrite" | "group" | "items"))
+    {
+        return Err(format!("a physics preset save request carries an unknown key {key:?}"));
+    }
+    let list = preset_list(request)?;
+    match (object.contains_key("group"), object.contains_key("items")) {
+        (true, true) => return Err("a physics preset takes group or items, not both".into()),
+        (false, false) => return Err("a physics preset needs group or items".into()),
+        _ => {}
+    }
+    if let Some(group) = request_index(&object, "group")? {
+        let view = view.ok_or("physics reading requires an active Live2D document")?;
+        let groups = view["groups"].as_array().ok_or("authoring model has no physics settings")?;
+        let source = groups.get(group).ok_or("authoring physics group index is outside the list")?;
+        let keys: &[&str] = if list == "inputs" { &INPUT_KEYS } else { &VERTEX_KEYS };
+        let items: Vec<Value> = source[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let kept: Map<String, Value> = keys
+                    .iter()
+                    .filter_map(|key| {
+                        let value = item.get(*key).filter(|value| !value.is_null())?;
+                        Some(((*key).to_owned(), value.clone()))
+                    })
+                    .collect();
+                Value::Object(kept)
+            })
+            .collect();
+        object.insert("items".into(), Value::Array(items));
+    }
+    Ok(Value::Object(object))
+}
+
+/// `live2d.physics3.edit` with `preset`: makes the `list` of group `group` the saved `entry`. The fields both
+/// lists share are set one by one, then the items the preset has beyond the group are inserted at the end, and the
+/// items the group has beyond the preset are removed from the end. Each step is a `live2d.physics3.edit` on the
+/// text the step before it made. A step the edit refuses (a parameter the document lacks, shared storage, an
+/// output that names a removed vertex) refuses the whole request, and the one candidate returned is one undo step.
+pub(crate) fn apply_preset(
+    container: &CaffDocument,
+    model: &Value,
+    request: &Value,
+    entry: &Value,
+) -> Result<Value, String> {
+    let object = request.as_object().ok_or("a physics preset edit request must be an object")?;
+    if object.keys().any(|key| !matches!(key.as_str(), "op" | "expectedRevision" | "group" | "list" | "preset")) {
+        return Err("a physics preset edit takes group, list and preset only".into());
+    }
+    let list = preset_list(request)?;
+    let group = request_index(object, "group")?.ok_or("authoring physics edit lacks a group")?;
+    let now = view(container, model)?;
+    let groups = now["groups"].as_array().ok_or("authoring model has no physics settings")?;
+    let now = groups
+        .get(group)
+        .map(|group| &group[list])
+        .and_then(Value::as_array)
+        .ok_or("authoring physics group index is outside the list")?;
+    let wanted = entry["items"].as_array().ok_or("a physics preset entry lacks items")?;
+    let keys: &[&str] = if list == "inputs" { &INPUT_KEYS } else { &VERTEX_KEYS };
+    let same = |a: &Value, b: &Value| a == b || a.as_f64().zip(b.as_f64()).is_some_and(|(a, b)| a == b);
+    let mut steps = Vec::new();
+    for (index, (have, want)) in now.iter().zip(wanted).enumerate() {
+        for key in keys {
+            if let Some(value) = want.get(*key).filter(|value| !same(&have[*key], value)) {
+                steps.push(json!({"group": group, "list": list, "index": index, "field": key, "value": value}));
+            }
+        }
+    }
+    for (index, item) in wanted.iter().enumerate().skip(now.len()) {
+        steps.push(json!({"group": group, "list": list, "insert": index, "value": item}));
+    }
+    for index in (wanted.len()..now.len()).rev() {
+        steps.push(json!({"group": group, "list": list, "index": index, "remove": true}));
+    }
+    let xml = container.main_xml();
+    let mut text = std::str::from_utf8(&xml)
+        .map_err(|error| format!("authoring XML is not UTF-8: {error}"))?
+        .to_owned();
+    let mut candidate = model.clone();
+    // shortcut: each step parses the document again; one shared patch list if a preset of 1000 items is too slow.
+    for step in &steps {
+        (candidate, text) = edit_text(&text, &candidate, step)?;
+    }
+    Ok(candidate)
+}
+
+/// `rewrite`'s half: with the candidate model's `physicsSource` differing, replace the inline set element's bytes
+/// with the stored string. Anything but inline storage refuses.
+pub(crate) fn splice_source(
+    text: &str,
+    initial_xml: &str,
+    candidate_xml: &str,
+) -> Result<String, String> {
+    let document = parse(text)?;
+    let graph = Graph::new(&document)?;
+    let inbound = inbound_refs(&document);
+    let model = graph.model()?.ok_or("authoring source contains no model")?;
+    let field = direct_field(model, "physicsSettingsSourceSet")
+        .filter(|field| field.attribute("xs.ref").is_none() && !field.has_tag_name("null"))
+        .ok_or("authoring physics source is not inline model storage")?;
+    if field.attribute("xs.id").is_some_and(|id| inbound.contains(id)) {
+        return Err("authoring physics source is shared storage".into());
+    }
+    let range = field.range();
+    if text[range.clone()] != *initial_xml {
+        return Err("authoring physics source does not match the stored model".into());
+    }
+    Ok(format!("{}{}{}", &text[..range.start], candidate_xml, &text[range.end..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_item_budgets_copied_parameter_ids() {
+        let document = parse(
+            "<CPhysicsInput><CParameterGuid xs.n='source' uuid='guid-one'/>\
+             <CPhysicsSourceType xs.n='type' v='SRC_TO_X'/></CPhysicsInput>",
+        )
+        .unwrap();
+        let graph = Graph::new(&document).unwrap();
+        let inbound = inbound_refs(&document);
+        let by_guid = HashMap::from([(
+            String::from("guid-one"),
+            String::from("a-parameter-id-longer-than-the-limit"),
+        )]);
+        let mut budget = Budget::new(4).with_text_limit(8);
+        let error = view_item(
+            &graph, &inbound, &by_guid, document.root_element(), 0, "inputs", false, true,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert!(error.contains("copied-text"), "{error}");
+    }
+}

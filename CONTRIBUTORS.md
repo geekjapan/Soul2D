@@ -1,0 +1,102 @@
+# Contributors
+
+## Soul2D
+
+### Maintainer
+  [geekjapan](https://github.com/geekjapan)
+
+### Technology Used
+  Rust
+  egui
+  eframe
+  glow
+  OpenGL
+
+### Fonts Used
+  Noto
+  Noto CJK
+  OpenDyslexic
+  Material Icons
+
+### Special Thanks
+  [nijigenerate](https://github.com/nijigenerate/nijigenerate)
+  [Inochi2D Project](https://inochi2d.com/)
+
+## Inherited credits
+
+Soul2D is a fork of nijigenerate, which grew from Inochi2D Creator. The credits below come from those projects and
+are kept as they were. The logos and mascot artwork they name are not shipped with Soul2D; see
+[res/ARTWORK.md](res/ARTWORK.md).
+
+### nijigenerate credits
+
+#### Project Managment
+
+##### Project Creator and BDFL
+  [seagetch](https://twitter.com/seagetch)
+
+#### Designers
+##### nijilive Logo
+  [seagetch](https://twitter.com/seagetch) 
+
+#### Mascot
+##### Mascot Design
+  [seagetch](https://twitter.com/seagetch)
+
+##### Mascot Model Art
+  [DALL-E3](https://chat.openai.com)
+
+##### Chibi UI Mascot
+  [DALL-E3](https://chat.openai.com)
+
+### Inochi2D Credits
+
+#### Project Managment
+
+##### Project Creator and BDFL
+  [Luna the Foxgirl](https://twitter.com/LunaFoxgirlVT)
+
+##### ImGui Binding Maintainer
+  [Joshua T. Fisher](https://twitter.com/Timewatcher)
+
+##### UX Designer
+  [Nethyr_UX](https://twitter.com/Nethyr_UX)
+
+#### Designers
+##### Inochi2D Logo
+  [James Daniel](https://twitter.com/rakujira) 
+
+#### Code Contributors
+  [Asahi Lina](https://twitter.com/LinaAsahi)
+  [seagetch](https://twitter.com/seagetch)
+  [carbotaniuman](https://github.com/carbotaniuman)
+  [Grillo](https://vt.social/@grillo_delmal)
+  [Aki-nyan](https://twitter.com/lethalbit)
+  [PanzerKern](https://github.com/pankern)
+
+#### Mascot
+##### Mascot Design
+  [Kinu](https://twitter.com/Kinugitsune)
+
+##### Mascot Model Art
+  [ku-ini](https://twitter.com/duckmastah)
+
+##### Chibi UI Mascot
+  [いろは](https://twitter.com/iroha_matsurika)
+
+#### Documentation
+  [Luna the Foxgirl](https://twitter.com/LunaFoxgirlVT)
+
+#### Translators
+##### Dansk
+  [Luna the Foxgirl](https://twitter.com/LunaFoxgirlVT)
+##### Italiano
+  [Adryzz](https://twitter.com/Adryzz6)
+##### 日本語
+  [seagetch](https://twitter.com/seagetch)
+  [40Nix](https://twitter.com/40Nix)
+  [小栗さえ](https://twitter.com/OkuriSae)
+  [ねじくぎ](https://twitter.com/scrwnl)
+##### 中文
+  [LovelyA72](https://twitter.com/LovelyA72) (简体中文)
+  [cheetosysst](https://twitter.com/Thect_36) (繁體中文)

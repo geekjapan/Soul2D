@@ -1,0 +1,32 @@
+name: Rust development build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-development-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --manifest-path rust/Cargo.toml
+      - name: Build shared core, CLI, editor and test targets
+        shell: bash
+        run: ./tools/build-rust-core.sh --locked --all-targets --features gui
+      - name: Install a headless X server and Wayland compositor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth weston imagemagick libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
+      - name: Launch the editor on X11 and Wayland
+        run: ./tools/verify-linux-launch.sh "$RUNNER_TEMP/linux-launch"

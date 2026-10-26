@@ -1,0 +1,8 @@
+# Installed as .cargo/config.toml by the Flatpak manifest: build from the crates that
+# `cargo vendor` wrote to build-aux/linux/flatpak/nightly/vendor. The path is relative to the
+# directory that holds .cargo, which is the module's source root.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "build-aux/linux/flatpak/nightly/vendor"

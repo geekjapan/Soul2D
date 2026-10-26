@@ -1,0 +1,54 @@
+id: io.github.geekjapan.soul2d
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: soul2d
+finish-args:
+  - --device=dri          # OpenGL rendering
+  - --socket=fallback-x11
+  - --share=ipc
+  - --socket=wayland
+  # The path prompts' Browse... uses the XDG file chooser portal, which grants the chosen file, but
+  # paths typed into a prompt and Recent Files stay plain paths. Grant the three user folders that hold
+  # projects and artwork instead of the whole host (system paths, other users, removable media). A
+  # project kept elsewhere needs: flatpak override --user --filesystem=<dir> io.github.geekjapan.soul2d
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+  - --filesystem=xdg-pictures
+
+modules:
+  - name: soul2d
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        # A writable Cargo home inside the build directory; the crate sources are vendored (see sources below).
+        CARGO_HOME: /run/build/soul2d/cargo
+    build-commands:
+      # Point Cargo at the vendored crates: the build sandbox has no network.
+      - install -Dm644 build-aux/linux/flatpak/nightly/cargo-vendor-config.toml .cargo/config.toml
+      # tools/build-rust-core.sh already passes --offline and uses out/rust as the target dir.
+      - ./tools/build-rust-core.sh --locked --release --features gui
+      - bash ./gentl.sh
+      - install -Dm755 ./out/rust/release/soul2d-editor /app/bin/soul2d
+      - install -Dm755 -t /app/bin ./out/rust/release/soul2d-core ./out/rust/release/njc
+      # The editor scans its own executable folder for *.mo catalogues.
+      - install -Dm644 -t /app/bin ./out/*.mo
+      # Licence, font and crate notices
+      - ./tools/copy-notices.sh /app/share/licenses/io.github.geekjapan.soul2d
+      # Metadata
+      - install -Dm644 ./build-aux/linux/flatpak/nightly/io.github.geekjapan.soul2d.metainfo.xml /app/share/metainfo/io.github.geekjapan.soul2d.metainfo.xml
+      - install -Dm644 ./build-aux/linux/flatpak/nightly/io.github.geekjapan.soul2d.desktop /app/share/applications/io.github.geekjapan.soul2d.desktop
+      - install -Dm644 ./res/logo_256.png /app/share/icons/hicolor/256x256/apps/io.github.geekjapan.soul2d.png
+    sources:
+      # The crate sources are not committed. Before building, vendor them next to this manifest (the repository
+      # root below is copied whole, so build-aux/linux/flatpak/nightly/vendor travels with it):
+      #   cargo vendor --locked --manifest-path rust/Cargo.toml build-aux/linux/flatpak/nightly/vendor
+      - type: dir
+        path: ../../../.. # The root of the soul2d repo
+        skip:
+          - out
+          - .git
+          - .claude

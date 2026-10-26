@@ -1,0 +1,163 @@
+<root fileFormatVersion="503030001">
+  <main><CAnimation xs.ref="animation"/></main>
+  <shared>
+    <CAnimation xs.id="animation">
+      <s xs.n="name">CurveStructureFixture</s>
+      <ResourceManager xs.n="resourceManager">
+        <carray_list xs.n="_resourceRefList" count="1">
+          <ResourceEntry><CResource_Linked_Model xs.n="resourceRef" xs.ref="resource"/></ResourceEntry>
+        </carray_list>
+      </ResourceManager>
+      <carray_list xs.n="_scenes" discount="999" count='0002'><CSceneSource xs.ref="scene"/><CSceneSource xs.ref="scene-kept"/></carray_list>
+      <s xs.n="futureRootData">keep-root &amp; 0.1234500</s>
+    </CAnimation>
+    <CResource_Linked_Model xs.id="resource">
+      <CGuid xs.n="guid" uuid="res-guid"/>
+      <s xs.n="name">Model</s><s xs.n="srcFile">fixture.cmo3</s>
+    </CResource_Linked_Model>
+    <CSceneSource xs.id="scene">
+      <CGuid xs.n="guid" uuid="scene-guid"/>
+      <CAnimation xs.n="_animation" xs.ref="animation"/>
+      <s xs.n="sceneName">Scene</s>
+      <CMovieInfo xs.n="movieInfo"><f xs.n="fps">60</f><i xs.n="duration">120</i></CMovieInfo>
+      <CTrackSourceSet xs.n="trackSourceSet">
+        <carray_list xs.n="_sources" count="2"><CMvTrack_Live2DModel_Source xs.ref="track"/><CMvTrack_Live2DModel_Source xs.ref="track2"/></carray_list>
+      </CTrackSourceSet>
+    </CSceneSource>
+    <CMvTrack_Live2DModel_Source xs.id="track">
+      <CGuid xs.n="guid" uuid="track-guid"/><s xs.n="name">Track</s>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene"/>
+      <CModelGuid xs.n="_resourceGuid" uuid="res-guid"/>
+      <CMvKeyParamEffect xs.n="keyParamEffect">
+        <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track"/>
+        <carray_list xs.n="attrList" discount="999" count='0002'><CMvAttrF xs.ref="attr"/><CMvAttrF xs.ref="attr-opaque"/></carray_list>
+      </CMvKeyParamEffect>
+      <i xs.n="start">0</i><i xs.n="internalOffset">0</i><i xs.n="duration">120</i>
+    </CMvTrack_Live2DModel_Source>
+    <CMvTrack_Live2DModel_Source xs.id="track2">
+      <CGuid xs.n="guid" uuid="track2-guid"/><s xs.n="name">Track2</s>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene"/>
+      <CModelGuid xs.n="_resourceGuid" uuid="res-guid"/>
+      <CMvKeyParamEffect xs.n="keyParamEffect">
+        <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track2"/>
+        <carray_list xs.n="attrList" count="1"><CMvAttrF xs.ref="attr-t2"/></carray_list>
+      </CMvKeyParamEffect>
+      <i xs.n="start">0</i><i xs.n="internalOffset">0</i><i xs.n="duration">120</i>
+    </CMvTrack_Live2DModel_Source>
+    <CMvAttrF xs.id="attr">
+      <CGuid xs.n="guid" uuid="parameter-guid"/>
+      <CAttrId xs.n="id" idstr="live2dParam_ParamTest"/>
+      <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track"/>
+      <CMutableSequence xs.n="valueData">
+        <CMvAttrF xs.n="attr" xs.ref="attr"/>
+        <array xs.n="points" count="2" type="CBezierPt">
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">0</i><d xs.n="doubleValue">0</d><b xs.n="isCorner">false</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">-7</i><d xs.n="posF">-2</d><d xs.n="doubleValue">-0.5</d><b xs.n="isPosOptimized">true</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">7</i><d xs.n="posF">3</d><d xs.n="doubleValue">0.5</d><b xs.n="isPosOptimized">true</b></CBezierCtrlPt>
+            <s xs.n="futurePointData">opaque-key-data &amp; 0.12345678901234567890</s>
+          </CBezierPt>
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">10</i><d xs.n="doubleValue">1</d><b xs.n="isCorner">true</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">10</i><d xs.n="posF">10</d><d xs.n="doubleValue">1</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">10</i><d xs.n="posF">10</d><d xs.n="doubleValue">1</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+          </CBezierPt>
+        </array>
+        <carray_list xs.n="curveTypes" count="2"><CCurveType v="LINEAR"/><CCurveType v="LINEAR"/></carray_list>
+        <d xs.n="curMin">0.0000</d><d xs.n="curMax">1.0000</d>
+      </CMutableSequence>
+      <COptionParam xs.n="optionParam"><CParameterId xs.n="KEY_PARAM_ID" idstr="ParamTest"/></COptionParam>
+      <f xs.n="rangeMin">-1</f><f xs.n="rangeMax">1</f>
+      <s xs.n="futureCurveData">keep-curve &amp; 7.777</s>
+    </CMvAttrF>
+    <CMvAttrF xs.id="attr-t2">
+      <CGuid xs.n="guid" uuid="parameter-guid"/>
+      <CAttrId xs.n="id" idstr="live2dParam_ParamTest"/>
+      <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track2"/>
+      <CMutableSequence xs.n="valueData">
+        <CMvAttrF xs.n="attr" xs.ref="attr-t2"/>
+        <array xs.n="points" count="1" type="CBezierPt">
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">0</i><d xs.n="doubleValue">0</d><b xs.n="isCorner">false</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">0</i><d xs.n="posF">0</d><d xs.n="doubleValue">0</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">0</i><d xs.n="posF">0</d><d xs.n="doubleValue">0</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+          </CBezierPt>
+        </array>
+        <carray_list xs.n="curveTypes" count="1"><CCurveType v="STEP"/></carray_list>
+        <d xs.n="curMin">0.0000</d><d xs.n="curMax">0.0000</d>
+      </CMutableSequence>
+      <COptionParam xs.n="optionParam"><CParameterId xs.n="KEY_PARAM_ID" idstr="ParamTest"/></COptionParam>
+      <f xs.n="rangeMin">-1</f><f xs.n="rangeMax">1</f>
+    </CMvAttrF>
+    <CMvAttrF xs.id="attr-opaque"><CAttrId xs.n="id" idstr="other_effect"/></CMvAttrF>
+  <CSceneSource xs.id="scene-kept">
+      <CGuid xs.n="guid" uuid="scene-kept-guid"/>
+      <CAnimation xs.n="_animation" xs.ref="animation"/>
+      <s xs.n="sceneName">残す &amp; &lt;Scene&gt;</s>
+      <CMovieInfo xs.n="movieInfo"><f xs.n="fps">60</f><i xs.n="duration">120</i></CMovieInfo>
+      <CTrackSourceSet xs.n="trackSourceSet">
+        <carray_list xs.n="_sources" count="2"><CMvTrack_Live2DModel_Source xs.ref="track-kept"/><CMvTrack_Live2DModel_Source xs.ref="track2-kept"/></carray_list>
+      </CTrackSourceSet>
+    </CSceneSource><CMvTrack_Live2DModel_Source xs.id="track-kept">
+      <CGuid xs.n="guid" uuid="track-kept-guid"/><s xs.n="name">Track</s>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene-kept"/>
+      <CModelGuid xs.n="_resourceGuid" uuid="res-guid"/>
+      <CMvKeyParamEffect xs.n="keyParamEffect">
+        <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track-kept"/>
+        <carray_list xs.n="attrList" discount="999" count='0002'><CMvAttrF xs.ref="attr-kept"/><CMvAttrF xs.ref="attr-opaque"/></carray_list>
+      </CMvKeyParamEffect>
+      <i xs.n="start">0</i><i xs.n="internalOffset">0</i><i xs.n="duration">120</i>
+    </CMvTrack_Live2DModel_Source><CMvTrack_Live2DModel_Source xs.id="track2-kept">
+      <CGuid xs.n="guid" uuid="track2-kept-guid"/><s xs.n="name">Track2</s>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene-kept"/>
+      <CModelGuid xs.n="_resourceGuid" uuid="res-guid"/>
+      <CMvKeyParamEffect xs.n="keyParamEffect">
+        <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track2-kept"/>
+        <carray_list xs.n="attrList" count="1"><CMvAttrF xs.ref="attr-t2-kept"/></carray_list>
+      </CMvKeyParamEffect>
+      <i xs.n="start">0</i><i xs.n="internalOffset">0</i><i xs.n="duration">120</i>
+    </CMvTrack_Live2DModel_Source><CMvAttrF xs.id="attr-kept">
+      <CGuid xs.n="guid" uuid="parameter-guid"/>
+      <CAttrId xs.n="id" idstr="live2dParam_ParamTest"/>
+      <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track-kept"/>
+      <CMutableSequence xs.n="valueData">
+        <CMvAttrF xs.n="attr" xs.ref="attr-kept"/>
+        <array xs.n="points" count="2" type="CBezierPt">
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">0</i><d xs.n="doubleValue">0</d><b xs.n="isCorner">false</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">-7</i><d xs.n="posF">-2</d><d xs.n="doubleValue">-0.5</d><b xs.n="isPosOptimized">true</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">7</i><d xs.n="posF">3</d><d xs.n="doubleValue">0.5</d><b xs.n="isPosOptimized">true</b></CBezierCtrlPt>
+            <s xs.n="futurePointData">opaque-key-data &amp; 0.12345678901234567890</s>
+          </CBezierPt>
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">10</i><d xs.n="doubleValue">1</d><b xs.n="isCorner">true</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">10</i><d xs.n="posF">10</d><d xs.n="doubleValue">1</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">10</i><d xs.n="posF">10</d><d xs.n="doubleValue">1</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+          </CBezierPt>
+        </array>
+        <carray_list xs.n="curveTypes" count="2"><CCurveType v="LINEAR"/><CCurveType v="LINEAR"/></carray_list>
+        <d xs.n="curMin">0.0000</d><d xs.n="curMax">1.0000</d>
+      </CMutableSequence>
+      <COptionParam xs.n="optionParam"><CParameterId xs.n="KEY_PARAM_ID" idstr="ParamTest"/></COptionParam>
+      <f xs.n="rangeMin">-1</f><f xs.n="rangeMax">1</f>
+      <s xs.n="futureCurveData">keep-curve &amp; 7.777</s>
+    </CMvAttrF><CMvAttrF xs.id="attr-t2-kept">
+      <CGuid xs.n="guid" uuid="parameter-guid"/>
+      <CAttrId xs.n="id" idstr="live2dParam_ParamTest"/>
+      <CMvTrack_Live2DModel_Source xs.n="track" xs.ref="track2-kept"/>
+      <CMutableSequence xs.n="valueData">
+        <CMvAttrF xs.n="attr" xs.ref="attr-t2-kept"/>
+        <array xs.n="points" count="1" type="CBezierPt">
+          <CBezierPt>
+            <CSeqPt xs.n="anchor"><i xs.n="pos">0</i><d xs.n="doubleValue">0</d><b xs.n="isCorner">false</b></CSeqPt>
+            <CBezierCtrlPt xs.n="prev"><i xs.n="pos">0</i><d xs.n="posF">0</d><d xs.n="doubleValue">0</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+            <CBezierCtrlPt xs.n="next"><i xs.n="pos">0</i><d xs.n="posF">0</d><d xs.n="doubleValue">0</d><b xs.n="isPosOptimized">false</b></CBezierCtrlPt>
+          </CBezierPt>
+        </array>
+        <carray_list xs.n="curveTypes" count="1"><CCurveType v="STEP"/></carray_list>
+        <d xs.n="curMin">0.0000</d><d xs.n="curMax">0.0000</d>
+      </CMutableSequence>
+      <COptionParam xs.n="optionParam"><CParameterId xs.n="KEY_PARAM_ID" idstr="ParamTest"/></COptionParam>
+      <f xs.n="rangeMin">-1</f><f xs.n="rangeMax">1</f>
+    </CMvAttrF></shared>
+</root>
