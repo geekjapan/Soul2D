@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: ./tools/build-rust-core.sh --locked --all-targets --features gui
       - name: Run Rust tests including GUI and doc tests
-        run: cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui
+        run: cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --no-fail-fast
       - name: Check the command manifest and editor dispatch
         run: |
           ./tools/verify-command-manifest.sh

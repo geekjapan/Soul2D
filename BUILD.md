@@ -68,7 +68,7 @@ and cached Cargo dependencies. A failed platform does not cancel the other platf
 After building all targets with the `gui` feature, run:
 
 ```sh
-cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui
+cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --no-fail-fast
 python3 tools/verify-rust-core.py
 ./tools/verify-command-manifest.sh
 git diff --exit-code -- doc/commands.manifest.json

@@ -426,12 +426,8 @@ pub(crate) fn inspect(request: &Value) -> Result<Value, String> {
     let references = model3.get("FileReferences").filter(|value| value.is_object())
         .ok_or("the .model3.json has no FileReferences")?;
     let moc = references["Moc"].as_str().ok_or("the .model3.json names no Moc")?;
-    // References are relative to the .model3.json; one that leaves its folder is refused.
-    if Path::new(moc).is_absolute() || Path::new(moc).components().any(|part| part == std::path::Component::ParentDir) {
-        return Err("the .model3.json Moc reference must stay inside its folder".into());
-    }
     let folder = Path::new(path).parent().unwrap_or(Path::new("."));
-    let moc_path = folder.join(moc);
+    let moc_path = sibling(folder, moc, "Moc")?;
     let mut model = read(&crate::read_bounded_file(&moc_path.to_string_lossy(), MAX_MOC3_BYTES, ".moc3")?)?;
     let textures = references["Textures"].as_array().cloned().unwrap_or_default();
     if let Some(over) = model["drawables"].as_array().into_iter().flatten()
@@ -1400,7 +1396,7 @@ pub(crate) fn runtime_scene(
 /// A reference inside a `.model3.json`, kept inside the file's folder.
 fn sibling(folder: &Path, reference: &str, what: &str) -> Result<std::path::PathBuf, String> {
     let path = Path::new(reference);
-    if path.is_absolute() || path.components().any(|part| part == std::path::Component::ParentDir) {
+    if path.components().any(|part| !matches!(part, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
         return Err(format!("the .model3.json {what} reference must stay inside its folder"));
     }
     Ok(folder.join(path))
@@ -1710,6 +1706,10 @@ mod tests {
         assert_eq!(sibling(folder, "runtime/a.moc3", "Moc").unwrap(), folder.join("runtime/a.moc3"));
         assert!(error(sibling(folder, "../b/a.moc3", "Moc")).contains("inside its folder"));
         assert!(error(sibling(folder, "/etc/passwd", "texture")).contains("inside its folder"));
+        #[cfg(windows)]
+        for reference in [r"\models\a.moc3", r"C:\models\a.moc3", r"C:a.moc3", r"\\server\share\a.moc3"] {
+            assert!(error(sibling(folder, reference, "Moc")).contains("inside its folder"));
+        }
         let dir = std::env::temp_dir().join(format!("soul2d-moc3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.moc3"), fixture().bytes()).unwrap();
