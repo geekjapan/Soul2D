@@ -5484,6 +5484,8 @@ mod frame_tests {
         if Platform::current() != Platform::MacOs {
             rig.store.set("UIScale", 1.5).unwrap();
             frame(&ctx, &mut windows, &mut rig, Vec::new());
+            // egui applies a requested zoom at the start of the next pass.
+            frame(&ctx, &mut windows, &mut rig, Vec::new());
             assert_eq!(ctx.zoom_factor(), 1.5);
         }
     }
