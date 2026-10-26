@@ -173,7 +173,7 @@ locations need `flatpak override --user --filesystem=<dir> io.github.geekjapan.s
 `build-aux/windows/wix/Product.wxs` is a WiX 3 source. It packages `out\rust\release\soul2d-editor.exe`
 (installed as `soul2d.exe`), `soul2d-core.exe`, `njc.exe`, the notice set and `out\i18n\*.mo`.
 `gentl.sh` writes `out\*.mo` (it needs `msgfmt`); copy them to `out\i18n\` first.
-`build-aux/windows/soul2d.rc` carries the icon and version information: compile it with `rc`
+`build-aux/windows/soul2d.rc` carries the icon and version information: compile it with `rc /c65001`
 from a Visual Studio developer prompt and pass the `.res` file to the linker through `RUSTFLAGS`
 (`-C target-feature=+crt-static -C link-arg=<path>\out\soul2d.res`) when building the release binaries.
 
@@ -187,6 +187,8 @@ light -nologo -sval -ext WixUIExtension -cultures:en-us -out ..\..\..\out\Soul2D
 ```
 
 `-sval` skips ICE validation, which needs the Windows Installer service.
+All three executables retain the icon and version resources. The editor retains the console
+subsystem so its existing stdin/stdout MCP entry remains available.
 
 ### Packaging checks
 
@@ -196,7 +198,15 @@ light -nologo -sval -ext WixUIExtension -cultures:en-us -out ..\..\..\out\Soul2D
 start it by hand (`workflow_dispatch`) before a release. The `flatpak` job vendors the crates, builds and bundles the
 Flatpak, installs the bundle and runs `soul2d-core --mcp` in the sandbox. The `wix` job builds the
 release binaries and the MSI, extracts it with `msiexec /a`, checks that the executables and notices are beside
-`soul2d.exe` and the catalogues in `i18n` under it, and runs the extracted `soul2d-core.exe --mcp`. Neither job uploads the package.
+`soul2d.exe` and the catalogues in `i18n` under it, and runs the extracted `soul2d-core.exe --mcp`.
+It then performs a real quiet installation on the disposable Windows runner with
+`tools/verify-windows-install.ps1`. The verifier checks installed x64 executables and resources,
+resolves and launches the advertised Start Menu shortcut, and opens an owned INX through
+its file association. It checks the installed process, its window visible style, its owned MCP
+listener and the loaded document identity before uninstalling. Window visible style is not
+an assertion about rendered pixels or an unobscured desktop. A missing window or listener
+fails the check. Installation logs and JSON observations are retained for three days; isolated
+settings and tokens are excluded. Neither job uploads the package.
 
 ### Status
 

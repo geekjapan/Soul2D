@@ -172,7 +172,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force out | Out-Null
           # Icon and version information, linked into the executables by the next step.
-          rc /nologo /fo "$env:GITHUB_WORKSPACE\out\soul2d.res" build-aux\windows\soul2d.rc
+          rc /nologo /c65001 /fo "$env:GITHUB_WORKSPACE\out\soul2d.res" build-aux\windows\soul2d.rc
           if ($LASTEXITCODE -ne 0) { throw "rc failed with exit code $LASTEXITCODE" }
       - name: Build the release binaries
         shell: bash
@@ -232,3 +232,20 @@ jobs:
           if ($missing) { throw "missing from the MSI: $($missing -join ', ')" }
           python tools/verify-mcp-initialize.py (Join-Path $app 'soul2d-core.exe') --mcp
           if ($LASTEXITCODE -ne 0) { throw "soul2d-core.exe --mcp did not answer initialize" }
+      - name: Generate the owned INX installation fixture
+        shell: bash
+        run: python tools/verify-rust-core.py --fixture-only
+      - name: Verify the installed Windows product
+        shell: pwsh
+        run: |
+          ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
+            -Fixture out/rust-verification/fixture.inx `
+            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install"
+      - name: Upload Windows installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install
+          path: ${{ runner.temp }}/windows-install
+          if-no-files-found: warn
+          retention-days: 3
