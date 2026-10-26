@@ -122,10 +122,25 @@ fn recovery_names(dir: &Path) -> PathBuf { dir.join("rust-recovery-1.inx") }
 
 // ---------- 3
 #[test] fn item3_slow_reader_bounded() {
+    #[cfg(windows)]
+    fn socket_buffer(stream: &TcpStream, option: i32, size: i32) {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "Ws2_32")]
+        extern "system" {
+            fn setsockopt(socket: usize, level: i32, option: i32, value: *const std::ffi::c_char, len: i32) -> i32;
+        }
+        let result = unsafe {
+            setsockopt(stream.as_raw_socket() as usize, 0xffff, option,
+                (&size as *const i32).cast(), std::mem::size_of_val(&size) as i32)
+        };
+        assert_eq!(result, 0, "setsockopt: {}", std::io::Error::last_os_error());
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let client = std::thread::spawn(move || {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        #[cfg(windows)]
+        socket_buffer(&s, 0x1002, 4096); // SO_RCVBUF
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         write!(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         let start = Instant::now();
@@ -139,6 +154,9 @@ fn recovery_names(dir: &Path) -> PathBuf { dir.join("rust-recovery-1.inx") }
         total
     });
     let (stream, _) = listener.accept().unwrap();
+    // Windows can otherwise buffer the entire response before the slow reader drains it.
+    #[cfg(windows)]
+    socket_buffer(&stream, 0x1001, 0); // SO_SNDBUF: disable send buffering.
     let mut session = soul2d_core::Session::new();
     let budget = Duration::from_secs(2);
     let big = "x".repeat(4 * 1024 * 1024);
@@ -148,7 +166,7 @@ fn recovery_names(dir: &Path) -> PathBuf { dir.join("rust-recovery-1.inx") }
     });
     let elapsed = t.elapsed();
     let got = client.join().unwrap();
-    if got < 4 * 1024 * 1024 { assert!(result.is_err(), "an incomplete timed-out response is reported to the host"); }
+    assert!(result.is_err(), "the bounded slow reader forces the response to time out");
     let _ = &mut session;
     println!("elapsed={elapsed:?} client received {got} bytes of 4MiB");
     assert!(elapsed < budget + Duration::from_millis(1500) + Duration::from_millis(500), "elapsed {elapsed:?}");

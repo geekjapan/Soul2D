@@ -64,6 +64,8 @@ jobs:
       - name: Install native build and display dependencies
         if: runner.os == 'Linux'
         run: |
+          # Use Ubuntu's primary mirror after slow Azure mirror downloads in CI.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston imagemagick libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
       - name: Check documentation and package metadata

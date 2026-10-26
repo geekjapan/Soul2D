@@ -567,7 +567,9 @@ pub(crate) fn image_source_warnings(model: &Value, name: &str) -> Vec<String> {
 /// Refuses a name a document gives that is not a local absolute path: a relative one would resolve against this
 /// process's folder, not the document's, and a network or device name (`\\host\share`) would open a connection.
 pub(crate) fn local_path(path: &str) -> Result<(), &'static str> {
-    if path.starts_with("\\\\") || path.starts_with("//") {
+    let verbatim_disk = matches!(Path::new(path).components().next(),
+        Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)));
+    if (path.starts_with("\\\\") || path.starts_with("//")) && !verbatim_disk {
         return Err("is a network or device path");
     }
     if !Path::new(path).is_absolute() {
@@ -2212,6 +2214,18 @@ pub fn probe_encoders(program: &str, timeout: Duration) -> Result<Vec<VideoCodec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_paths_refuse_network_and_device_names() {
+        for path in [r"\\host\share\image.png", "//host/share/image.png", r"\\.\pipe\image", r"\\?\UNC\host\share\image.png"] {
+            assert_eq!(local_path(path), Err("is a network or device path"));
+        }
+        assert_eq!(local_path("relative/image.png"), Err("is not an absolute path"));
+        #[cfg(windows)]
+        for path in [r"C:\images\a.png", r"\\?\C:\images\a.png"] {
+            assert_eq!(local_path(path), Ok(()));
+        }
+    }
 
     #[test]
     fn windows_encoder_lookup_preserves_application_system_and_path_order() {

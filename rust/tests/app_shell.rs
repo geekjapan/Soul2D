@@ -863,7 +863,7 @@ fn a_panic_writes_a_report_to_the_dump_directory() {
     assert!(name.starts_with("soul2d-test-crashdump-") && name.ends_with(".txt"), "{name}");
     let text = fs::read_to_string(&reports[0]).unwrap();
     assert!(text.starts_with("=== Args State ===\n"), "{text}");
-    assert!(text.contains("\n\n=== Exception ===\npanic at tests/app_shell.rs:"), "{text}");
+    assert!(text.contains(&format!("\n\n=== Exception ===\npanic at {}:", file!())), "{text}");
     assert!(text.contains("simulated failure"), "{text}");
     fs::remove_dir_all(root).unwrap();
 }

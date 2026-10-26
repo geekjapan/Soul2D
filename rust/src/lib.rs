@@ -7700,7 +7700,13 @@ fn validated_linked_image(path: &str) -> Result<std::path::PathBuf, String> {
 }
 
 fn read_bounded_file(path: &str, limit: u64, kind: &str) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|error| format!("could not open {kind} file: {error}"))?;
+    let file = File::open(path).map_err(|error| {
+        if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+            format!("{kind} source must be a regular file")
+        } else {
+            format!("could not open {kind} file: {error}")
+        }
+    })?;
     if !file
         .metadata()
         .map_err(|error| error.to_string())?
@@ -8770,7 +8776,13 @@ fn publish_new(
 
 /// The bytes of a regular file named by a request, up to the authoring container limit.
 fn read_regular_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|error| format!("could not open {what} file: {error}"))?;
+    let file = File::open(path).map_err(|error| {
+        if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+            format!("{what} source must be a regular file")
+        } else {
+            format!("could not open {what} file: {error}")
+        }
+    })?;
     if !file.metadata().map_err(|error| error.to_string())?.is_file() {
         return Err(format!("{what} source must be a regular file"));
     }
