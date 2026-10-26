@@ -145,6 +145,7 @@ fn case_alias_shares_recovery_on_a_case_insensitive_filesystem() {
  let mut aa=Autosave::new(&cfg,now(0));aa.set_project(Some(a.clone()),now(0));aa.autosave_now(&Settings::new(true,1,1),now(1),write).unwrap();
  assert!(unclean_exit(&cfg,&a));assert!(unclean_exit(&cfg,&b));assert_eq!(list_backups(&cfg,&b).unwrap().len(),1);
 }
+#[cfg(unix)]
 #[test]
 fn symlink_alias_agrees_until_parent_is_missing() {
  use std::os::unix::fs::symlink;

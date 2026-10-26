@@ -7,9 +7,9 @@ that `soul2d-core`, `njc` and `soul2d-editor` exist in `out/rust/debug/` or
 checks its executable, `Info.plist` and icon.
 
 These commands build development source. They do not create a supported
-distribution. `rust-core.yml` builds all targets, runs Rust tests and checks the editor launch on Linux;
-`packaging.yml` builds the Flatpak and the MSI (see below). Windows and macOS runtime
-support remains experimental.
+distribution. `rust-core.yml` builds all targets and runs Rust tests on Linux, Windows
+and macOS. It also checks the editor launch on Linux. `packaging.yml` builds the Flatpak
+and the MSI (see below). Windows and macOS GUI runtime support remains experimental.
 
 `rust/Cargo.toml` holds the one product version. `python3 tools/verify-version.py`
 fails when `Info.plist`, `Product.wxs`, `version.h` or `Cargo.lock` disagree with it;
@@ -62,7 +62,9 @@ To compile every target, including the test targets, without running tests:
 ## Run CI checks locally
 
 `rust-core.yml` runs these checks on pull requests and pushes to `main`, and through
-`workflow_dispatch`. It uses stable Rust, the committed lockfile and cached Cargo dependencies.
+`workflow_dispatch`. Its matrix covers Ubuntu 24.04 x64, Windows 2025 x64, and macOS 15
+on both Apple Silicon and Intel. It uses stable Rust, Python 3.12, the committed lockfile
+and cached Cargo dependencies. A failed platform does not cancel the other platforms.
 After building all targets with the `gui` feature, run:
 
 ```sh
@@ -83,6 +85,8 @@ The other `tools/verify-*.py` scripts drive the Rust binaries and fixtures.
 On Linux, CI also runs `./tools/verify-linux-launch.sh` with Xvfb, Weston and Mesa
 installed. It retains launch logs and screenshots for three days, including on failure.
 The job has a 45-minute timeout, and a newer run on the same ref cancels the previous run.
+On Windows, use `soul2d-core.exe` in the MCP initialization command. The FFI, CLI and MCP
+checks run on every platform. Native editor window checks run only on Linux.
 File-format checks that use external models require separately acquired
 inputs and their licenses. Keep those inputs under the ignored `build/` directory.
 

@@ -16,15 +16,38 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            exe: ''
+          - os: windows-2025
+            exe: '.exe'
+          - os: macos-15
+            exe: ''
+          - os: macos-15-intel
+            exe: ''
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      PYTHONUTF8: 1
     steps:
+      - name: Preserve fixture line endings on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Set up stable Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
@@ -39,14 +62,15 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
       - name: Install native build and display dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston imagemagick libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
       - name: Check documentation and package metadata
         run: |
-          python3 tools/verify-doc-twins.py
-          python3 tools/verify-version.py
-          python3 tools/check-project-artifacts.py
+          python tools/verify-doc-twins.py
+          python tools/verify-version.py
+          python tools/check-project-artifacts.py
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
       - name: Build shared core, CLI, editor and test targets
@@ -59,13 +83,14 @@ jobs:
           ./tools/verify-command-manifest.sh
           git diff --exit-code -- doc/commands.manifest.json
       - name: Verify core FFI, CLI and MCP behavior
-        run: python3 tools/verify-rust-core.py
+        run: python tools/verify-rust-core.py
       - name: Verify MCP stdio initialization
-        run: python3 tools/verify-mcp-initialize.py ./out/rust/debug/soul2d-core --mcp
+        run: python tools/verify-mcp-initialize.py ./out/rust/debug/soul2d-core${{ matrix.exe }} --mcp
       - name: Launch the editor on X11 and Wayland
+        if: runner.os == 'Linux'
         run: ./tools/verify-linux-launch.sh "$RUNNER_TEMP/linux-launch"
       - name: Upload editor launch evidence
-        if: ${{ always() }}
+        if: ${{ always() && runner.os == 'Linux' }}
         uses: actions/upload-artifact@v4
         with:
           name: linux-launch
