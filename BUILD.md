@@ -88,6 +88,11 @@ installed. It retains launch logs and screenshots for three days, including on f
 The job has a 45-minute timeout, and a newer run on the same ref cancels the previous run.
 On Windows, use `soul2d-core.exe` in the MCP initialization command. The FFI, CLI and MCP
 checks run on every platform. Native editor window checks run only on Linux.
+Three scripted HTTP MCP workflows also run on every platform. They check edits,
+undo, saved state and reopening without starting an AI agent or using provider credentials.
+Linux additionally runs the four real FFmpeg export tests that the default suite ignores,
+including decoding, audio duration and audio placement. The two licensed-corpus tests
+still require separately acquired inputs.
 File-format checks that use external models require separately acquired
 inputs and their licenses. Keep those inputs under the ignored `build/` directory.
 
