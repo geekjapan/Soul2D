@@ -27,8 +27,6 @@ jobs:
             exe: '.exe'
           - os: macos-15
             exe: ''
-          - os: macos-15-intel
-            exe: ''
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:

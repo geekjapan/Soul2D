@@ -63,7 +63,8 @@ To compile every target, including the test targets, without running tests:
 
 `rust-core.yml` runs these checks on pull requests and pushes to `main`, and through
 `workflow_dispatch`. Its matrix covers Ubuntu 24.04 x64, Windows 2025 x64, and macOS 15
-on both Apple Silicon and Intel. It uses stable Rust, Python 3.12, the committed lockfile
+on Apple Silicon. Intel macOS and 32-bit Windows are outside the supported CI targets.
+It uses stable Rust, Python 3.12, the committed lockfile
 and cached Cargo dependencies. A failed platform does not cancel the other platforms.
 After building all targets with the `gui` feature, run:
 
