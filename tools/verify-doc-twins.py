@@ -28,7 +28,7 @@ def first_line(path):
 def twin_link(page, src, dst):
     # Link from user-doc/tutorial/<src>/<page> to user-doc/tutorial/<dst>/<page>.
     here = os.path.dirname(os.path.join(TUTORIAL, src, page))
-    return os.path.relpath(os.path.join(TUTORIAL, dst, page), here)
+    return os.path.relpath(os.path.join(TUTORIAL, dst, page), here).replace(os.sep, "/")
 
 
 def broken_links(path):
