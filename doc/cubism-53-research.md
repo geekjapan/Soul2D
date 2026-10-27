@@ -1,6 +1,7 @@
 # Cubism 5.3 Pro reference research
 
-Status: **PRIMARY SOURCES READ; NO VENDOR ACCEPTANCE RUN**. Retrieved on 2026-10-10.
+Status: **REFERENCE RESEARCH; FULL VENDOR ACCEPTANCE INCOMPLETE**.
+Initial retrieval was on 2026-10-10. Successor documentation was rechecked on 2026-10-27.
 The full target remains Cubism 5.3 Pro, all features. This note is an initial
 source inventory, not proof that Soul2D implements those features or that the
 inventory is exhaustive.
@@ -11,8 +12,10 @@ The official 5.3 update history and release list both record Cubism Editor
 5.3.04 as a stable release dated 2026-09-03. It is the newest stable 5.3 release
 listed in the captured pages. Select **Cubism Editor 5.3.04 Pro** as the
 reference release. Beta and 5.4 alpha announcements do not change this target.
-The actual executable build metadata, SHA-256, licensed edition, and installed
-platform remain unpinned because the reference environment is not set up. [S2][S3]
+This initial source selection did not pin executable metadata, SHA-256, licensed
+edition or platform. A later macOS 5.3.04 trial session establishes only the
+bounded physics observations recorded in [Issue #16](https://github.com/geekjapan/Soul2D/issues/16),
+not full Pro acceptance. [S2][S3]
 
 The SDK manual announces **Cubism 5 SDK for Native R5** on 2026-04-02. Select
 that official SDK family for the macOS runtime-reference plan, not a beta SDK.
@@ -89,9 +92,9 @@ geometry capture is not a reference rasterizer. [S6][S8]
 
 ## Capture and reproducibility
 
-The approved retrieval captured only public HTML from `www.live2d.com` and
+The initial approved retrieval captured only public HTML from `www.live2d.com` and
 `docs.live2d.com`. It downloaded no SDK, executable, header, library, model,
-or license activation material. No vendor software was installed or executed.
+or license activation material. That retrieval did not install or execute vendor software.
 
 The earlier captures recorded requested and final URLs, retrieval time, HTTP
 status, and SHA-256 of each raw HTML page. They, and the fresh Cloud public-HTML
@@ -115,9 +118,20 @@ per-feature inventory reconciliation, module-level D-to-Rust migration map,
 full-feature conversion mapping, and reviewed comparison procedures with literal
 pre-run tolerances. No numerical tolerances are frozen by this research.
 
-The licensed Editor and matching Native R5/Core environment are not set up.
-Acquisition, installation, activation, license acceptance, and spending remain
-separate approval gates. The overall goal and every phase remain incomplete.
+The bounded trial session does not establish the complete Editor and matching
+Native R5/Core reference environment. Acquisition, installation, activation,
+license acceptance and spending retain their separate approval gates.
+The overall goal and every phase remain incomplete.
+
+## Successor review on 2026-10-27
+
+The official release history still lists 5.3.04 as stable and 5.3.05 beta1 as
+prerelease. The [5.4 alpha notice](https://www.live2d.com/information/cubism-5_4-alpha/)
+states that both availability and use ended on 2026-10-18 at 23:59 JST.
+The [successor backlog](cubism-feature-ledger.md#successor-feature-backlog) records
+six candidates from the alpha2 manual, with implementation and evidence gaps.
+The compatibility baseline remains 5.3.04. No successor runtime or source-schema
+compatibility is established by this documentation review.
 
 ## Primary sources
 

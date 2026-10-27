@@ -257,3 +257,25 @@ or accepted Soul2D behavior.
   It does not settle asymmetric/even key pairing or the exact nested-space
   transformation. A three-key, single-deformer observation is the next bounded
   definition check; these notes are not implementation or vendor acceptance.
+
+### Successor feature backlog
+
+The [alpha2 manual](https://cubism.live2d.com/editor-alpha/doc/manual/alpha2/ja/index.html)
+describes these candidates. They are outside the 5.3.04 baseline. The states below
+distinguish related code from implementation of the successor feature. All six
+successor vendor workflows remain **UNTESTED**. No expired alpha is run.
+
+| ID | Candidate | Implemented related behavior | Missing behavior or evidence |
+| --- | --- | --- | --- |
+| NEXT01 | Model parameter controllers and SDK export | INX animation controllers in `controller.rs` | Model-controller source authoring, `.paramctrl3.json` export and matching SDK evaluation are **MISSING**. ANI18 remains separate. |
+| NEXT02 | Saved visibility, lock and parameter state sets | Individual visibility, lock and parameter operations in the command manifest | Saved named sets, source representation and restore behavior are **UNTESTED**. Individual controls do not establish this workflow. |
+| NEXT03 | Atlas packing improvements | INX atlas packing and manual pins in `atlas.rs` | Per-texture targets and retained rotation/scale in native CMO3 atlas authoring are **UNTESTED**. IO04 does not imply successor acceptance. |
+| NEXT04 | PSD import with combined layers, groups and masks | PSD layer/group/mask parsing in `psd.rs` | The combined import and reimport workflow is **UNTESTED**. Issue #10 separately tracks creation of native CMO3 data. |
+| NEXT05 | External API editing operations | API01 has an **ACCEPTED_MAPPING** to Soul2D tools | The successor editing-method inventory and its mapping are **MISSING**. The 5.3 decision does not accept methods added later. |
+| NEXT06 | Saved-version display and overwrite warnings | Readers retain the XML `fileFormatVersion` as document metadata | The native version display, cross-version overwrite warning and user choice are **UNTESTED**. Retained metadata alone does not establish them. |
+
+The manual warns that alpha2 models cannot be read by alpha1 or 5.3 and does not
+guarantee later beta compatibility. CAFF's container profile and the XML
+`fileFormatVersion` are separate values. Reader acceptance of a changed version
+label does not prove support for a new schema. Appropriately licensed files
+written by a usable successor release remain required for that comparison.
