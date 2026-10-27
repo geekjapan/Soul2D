@@ -15814,7 +15814,8 @@ mod editor_state_tests {
     impl LifecyclePeer {
         fn attach(app: &mut EditorApp, endpoint: Option<crate::editor_agent::McpEndpoint>) -> Self {
             use std::process::{Command, Stdio};
-            let mut child = Command::new("python3").args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
+            let mut child = Command::new(if cfg!(windows) { "python" } else { "python3" })
+                .args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
                 .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             let (frames, reader) = std::sync::mpsc::channel();
             let (queued, acknowledged) = std::sync::mpsc::sync_channel(0);
@@ -19661,8 +19662,14 @@ mod editor_state_tests {
         let before_snapshot = app.controller.snapshot().clone();
         let run_dir = temp_dir(&format!("acp-quit-review-peer-{scenario}"));
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/acp-panel-approval-fixture.py");
-        app.tools.store.set("ACP.Command", format!("python3 -I \"{}\" --run-dir \"{}\"",
-            fixture.display(), run_dir.display())).unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let interpreter = std::process::Command::new(python).args(["-I", "-c", "import sys; print(sys.executable)"])
+            .output().unwrap();
+        assert!(interpreter.status.success(), "fixture interpreter probe failed: {interpreter:?}");
+        let interpreter = String::from_utf8(interpreter.stdout).unwrap().trim().to_owned();
+        assert!(!interpreter.is_empty(), "fixture interpreter probe returned no executable path");
+        app.tools.store.set("ACP.Command", format!("\"{}\" -I \"{}\" --run-dir \"{}\"",
+            interpreter, fixture.display(), run_dir.display())).unwrap();
         app.tools.store.set("ACP.Workdir", env!("CARGO_MANIFEST_DIR").to_owned()).unwrap();
         app.agent.set_enabled(true);
         app.agent.start(&app.tools.store);
@@ -19674,7 +19681,7 @@ mod editor_state_tests {
             while !app.agent.state().ready {
                 harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
                 if Instant::now() >= deadline || app.agent.state().closed {
-                    return Err(format!("fixture initialization failed: {} {:?}", app.agent.status(), app.agent.error()));
+                    return Err(format!("fixture initialization failed using {interpreter}: {} {:?}", app.agent.status(), app.agent.error()));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
