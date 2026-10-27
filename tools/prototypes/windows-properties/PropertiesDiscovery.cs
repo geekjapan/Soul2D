@@ -137,6 +137,8 @@ public static class PropertiesDiscovery {
                     if (dialog == IntPtr.Zero) throw new Exception("No visible Properties dialog with the exact helper PID and owner");
                     report["dialogHwnd"] = dialog.ToInt64();
                     report["dialogOwnerHwnd"] = GetWindow(dialog, 4).ToInt64();
+                    EditorDesktop.ShowWindow(dialog, 9);
+                    report["placement"] = EditorDesktop.PlaceForCapture(dialog, pid);
                     AutomationElement details;
                     var root = AutomationElement.FromHandle(dialog);
                     report["beforeTree"] = Tree(root, out details, Path.Combine(evidence, "before-tree.tsv"));
@@ -150,7 +152,6 @@ public static class PropertiesDiscovery {
                     if (!details.TryGetCurrentPattern(SelectionItemPattern.Pattern, out selection) ||
                         !((SelectionItemPattern)selection).Current.IsSelected) throw new Exception("Details is not selected");
                     report["detailsSelected"] = true;
-                    EditorDesktop.ShowWindow(dialog, 9);
                     EditorDesktop.SetForegroundWindow(dialog);
                     Thread.Sleep(200);
                     var frame = EditorDesktop.Capture(dialog, pid);

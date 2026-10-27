@@ -218,6 +218,7 @@ function Observe-Paint($Editor, [string]$Kind, $Observation) {
     $a = [int[]]@(239, 31, 151); $b = [int[]]@(23, 211, 67)
     try {
         [void][EditorDesktop]::ShowWindow($Editor.MainWindowHandle, 9)
+        $Observation.paint.placement = [EditorDesktop]::PlaceForCapture($Editor.MainWindowHandle, [uint32]$Editor.Id)
         [void][EditorDesktop]::SetForegroundWindow($Editor.MainWindowHandle)
         [void](Invoke-EditorTool 'editor_viewport_set' @{ background = $a })
         $deadline = [DateTime]::UtcNow.AddSeconds(15)

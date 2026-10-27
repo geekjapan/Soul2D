@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -28,11 +29,16 @@ public sealed class EditorFrame {
 public static class EditorDesktop {
     [StructLayout(LayoutKind.Sequential)] private struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct MonitorInfo { public uint Size; public Rect Monitor, Work; public uint Flags; }
     [StructLayout(LayoutKind.Sequential)] private struct BitmapInfo {
         public uint Size; public int Width, Height; public ushort Planes, BitCount;
         public uint Compression, SizeImage; public int XPels, YPels; public uint Used, Important;
     }
     [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr window, ref Point point);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
@@ -53,6 +59,31 @@ public static class EditorDesktop {
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
     [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr dc);
 
+    public static string PlaceForCapture(IntPtr window, uint expectedPid) {
+        uint pid;
+        GetWindowThreadProcessId(window, out pid);
+        if (expectedPid == 0 || pid != expectedPid || !IsWindowVisible(window) || IsIconic(window))
+            throw new Exception("Cannot place a window without the expected visible owner");
+        Rect before;
+        var monitor = MonitorFromWindow(window, 2);
+        var info = new MonitorInfo { Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)) };
+        if (!GetWindowRect(window, out before) || monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info))
+            throw new Exception("Cannot observe the owned window and monitor work area");
+        int width = checked(before.Right - before.Left), height = checked(before.Bottom - before.Top);
+        int workWidth = checked(info.Work.Right - info.Work.Left), workHeight = checked(info.Work.Bottom - info.Work.Top);
+        string geometry = String.Format(CultureInfo.InvariantCulture, "window=({0},{1},{2},{3}); work=({4},{5},{6},{7})",
+            before.Left, before.Top, width, height, info.Work.Left, info.Work.Top, workWidth, workHeight);
+        if (width <= 0 || height <= 0 || workWidth < width || workHeight < height)
+            throw new Exception("Owned window does not fit its monitor work area: " + geometry);
+        int x = checked(info.Work.Left + (workWidth - width) / 2), y = checked(info.Work.Top + (workHeight - height) / 2);
+        GetWindowThreadProcessId(window, out pid);
+        if (pid != expectedPid) throw new Exception("Owned window changed before positioning");
+        const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+        if (!SetWindowPos(window, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+            throw new Exception("Cannot position the owned window: " + Marshal.GetLastWin32Error() + "; " + geometry);
+        return geometry + String.Format(CultureInfo.InvariantCulture, "; requested=({0},{1})", x, y);
+    }
+
     public static EditorFrame Capture(IntPtr window, uint expectedPid) {
         uint pid;
         GetWindowThreadProcessId(window, out pid);
@@ -66,7 +97,9 @@ public static class EditorDesktop {
         if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || origin.X < GetSystemMetrics(76)
             || origin.Y < GetSystemMetrics(77) || origin.X + width > GetSystemMetrics(76) + GetSystemMetrics(78)
             || origin.Y + height > GetSystemMetrics(77) + GetSystemMetrics(79))
-            throw new Exception("Editor client is outside the capturable desktop");
+            throw new Exception(String.Format(CultureInfo.InvariantCulture,
+                "Editor client is outside the capturable desktop: client=({0},{1},{2},{3}); desktop=({4},{5},{6},{7})",
+                origin.X, origin.Y, width, height, GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79)));
         IntPtr screen = GetDC(IntPtr.Zero), dc = IntPtr.Zero, bitmap = IntPtr.Zero, previous = IntPtr.Zero;
         try {
             if (screen == IntPtr.Zero) throw new Exception("Cannot acquire desktop DC");
