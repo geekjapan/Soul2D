@@ -7,6 +7,27 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+function Get-VerificationExitCode($Receipt) {
+    if ($Receipt.installation -ne 'PASS' -or $Receipt.cleanup.errors.Count -ne 0 `
+        -or $Receipt.cleanup.uninstallExitCode -ne 0) { return 1 }
+    foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
+        if ($Receipt.cleanup[$field] -ne $true) { return 1 }
+    }
+    if ($null -eq $Receipt.failure -and $Receipt.shortcut -eq 'PASS' -and $Receipt.association -eq 'PASS' `
+        -and $Receipt.launches.Count -eq 2 -and $Receipt.launches[0].kind -eq 'start-menu' `
+        -and $Receipt.launches[1].kind -eq 'association' -and $Receipt.launches[0].accepted -eq $true `
+        -and $Receipt.launches[1].accepted -eq $true) { return 0 }
+    if ($Receipt.shortcut -ne 'FAIL' -or $Receipt.association -ne 'NOT_RUN' -or $Receipt.launches.Count -ne 1) { return 1 }
+    $launch = $Receipt.launches[0]
+    $diagnostic = $launch.directDiagnostic
+    if ($launch.kind -eq 'start-menu' -and $launch.accepted -eq $false -and $null -ne $diagnostic `
+        -and $diagnostic.exited -eq $true -and $diagnostic.exitCode -eq 1 -and $diagnostic.hwnd -eq 0 `
+        -and $diagnostic.stderr -ceq 'Error: OpenGL(PainterError("egui_glow requires opengl 2.0+. "))' `
+        -and $Receipt.failure -eq 'start-menu did not produce an installed editor window and owned MCP listener before the deadline.') { return 2 }
+    return 1
+}
+
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' `
     -or -not [Environment]::Is64BitProcess) {
     throw 'This verifier installs a product and requires a disposable Windows x64 GitHub Actions runner.'
@@ -84,7 +105,10 @@ foreach ($field in @($expectedResources.Keys)) {
     if (-not $match.Success) { throw "Missing expected version macro $macro" }
     $expectedResources[$field] = $match.Groups[1].Value.Replace('\0', '')
 }
-$result = [ordered]@{ productCode = $productCode; files = @(); binaries = @(); launches = @(); cleanup = @{}; failure = $null }
+$result = [ordered]@{ productCode = $productCode; files = @(); binaries = @(); launches = @();
+    cleanup = @{ uninstallExitCode = $null; productAbsent = $false; installDirectoryAbsent = $false;
+        shortcutAbsent = $false; registrationsAbsent = $false; associationAbsent = $false; errors = @() };
+    installation = 'NOT_RUN'; shortcut = 'NOT_RUN'; association = 'NOT_RUN'; native = 'NOT_RUN'; failure = $null }
 $ownedEditors = [Collections.Generic.List[int]]::new()
 $ownedConfigs = [Collections.Generic.List[string]]::new()
 $cleanupFailures = [Collections.Generic.List[string]]::new()
@@ -126,7 +150,7 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $start.UseShellExecute = $true
     $start.WorkingDirectory = $installDirectory
     $observation = [ordered]@{ kind = $Kind; shellPath = $ShellPath; accepted = $false;
-        shellPid = $null; processes = @(); httpError = $null; configFiles = @() }
+        shellPid = $null; processes = @(); httpError = $null; configFiles = @(); directDiagnostic = $null }
     $result.launches += $observation
     $started = [Diagnostics.Process]::Start($start)
     if ($null -ne $started) { $observation.shellPid = $started.Id; $started.Dispose() }
@@ -178,6 +202,7 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
             $text = [IO.File]::ReadAllText($log).Replace($env:SOUL2D_MCP_BEARER, '[redacted]')
             [IO.File]::WriteAllText($log, $text)
         }
+        $observation.directDiagnostic.stderr = [IO.File]::ReadAllText($stderr).Trim()
         throw "$Kind did not produce an installed editor window and owned MCP listener before the deadline."
     }
     if (-not $state.editor -or $state.document.modified -or $state.document.path -ne $ExpectedPath) {
@@ -244,15 +269,20 @@ try {
     if ([InstalledSoul2D]::MsiGetComponentPath($productCode, $component.ToString(), $target, [ref]$length) -ne 3 `
         -or $target.ToString() -ne $editorPath) { throw 'Shortcut does not resolve to the installed editor component.' }
     $result.shortcutTarget = $target.ToString()
+    $result.installation = 'PASS'
+    $result.shortcut = 'FAIL'
     Wait-Editor 'start-menu' $shortcutPath $null
+    $result.shortcut = 'PASS'
     $association = Join-Path $evidence 'installed project-日本語.inx'
     Copy-Item -LiteralPath $fixturePath -Destination $association
     $before = (Get-FileHash -LiteralPath $association).Hash
     $fixtureBytes = [IO.File]::ReadAllBytes($association)
     $jsonLength = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($fixtureBytes, 8))
     $script:expectedName = ([Text.Encoding]::UTF8.GetString($fixtureBytes, 12, $jsonLength) | ConvertFrom-Json).meta.name
+    $result.association = 'FAIL'
     Wait-Editor 'association' $association $association
     if ((Get-FileHash -LiteralPath $association).Hash -ne $before) { throw 'Installed launch changed the input fixture.' }
+    $result.association = 'PASS'
 } catch {
     $result.failure = $_.Exception.Message
 } finally {
@@ -284,7 +314,13 @@ try {
     $result.cleanup.errors = @($cleanupFailures.ToArray())
     $env:INOCHI_CONFIG_PATH = $oldConfig
     $env:SOUL2D_MCP_BEARER = $oldBearer
+    $result.exitCode = Get-VerificationExitCode $result
+    $result.native = switch ($result.exitCode) { 0 { 'PASS' }; 2 { 'UNSUPPORTED' }; default { 'FAIL' } }
     $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $evidence 'result.json') -Encoding utf8NoBOM
 }
-if ($null -ne $result.failure -or $cleanupFailures.Count -ne 0) { throw 'Installed Windows acceptance failed; see result.json and MSI logs.' }
+if ($result.exitCode -eq 2) {
+    Write-Output 'UNSUPPORTED: hosted Windows OpenGL is below 2.0. Installation checks passed; native acceptance remains unmet.'
+    exit 2
+}
+if ($result.exitCode -ne 0) { throw 'Installed Windows acceptance failed; see result.json and MSI logs.' }
 Write-Output 'PASS: installed x64 resources, advertised shortcut, INX association and uninstall.'

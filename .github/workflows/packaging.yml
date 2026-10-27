@@ -157,6 +157,9 @@ jobs:
       - name: Fetch locked Rust dependencies
         shell: bash
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
+      - name: Check Windows installation outcome handling
+        shell: pwsh
+        run: ./tools/test-windows-install-outcome.ps1
       - name: Compile Windows resources
         shell: pwsh
         run: |
@@ -235,12 +238,36 @@ jobs:
       - name: Generate the owned INX installation fixture
         shell: bash
         run: python tools/verify-rust-core.py --fixture-only
-      - name: Verify the installed Windows product
+      - name: Verify Windows installation and report native GUI support
+        id: windows-install
         shell: pwsh
         run: |
-          ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
+          $PSNativeCommandUseErrorActionPreference = $false
+          pwsh -NoProfile -File ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
             -Fixture out/rust-verification/fixture.inx `
             -EvidenceDirectory "$env:RUNNER_TEMP/windows-install"
+          $code = $LASTEXITCODE
+          if ($code -notin @(0, 2)) { throw "Windows installation verification failed with exit code $code." }
+          $receipt = Get-Content -Raw "$env:RUNNER_TEMP/windows-install/result.json" | ConvertFrom-Json
+          if ($receipt.exitCode -ne $code -or $receipt.installation -ne 'PASS' -or $receipt.cleanup.errors.Count -ne 0 `
+              -or $receipt.cleanup.uninstallExitCode -ne 0) { throw 'Inconsistent installation verification receipt.' }
+          foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
+            if ($receipt.cleanup.$field -ne $true) { throw "Incomplete installation cleanup: $field" }
+          }
+          if ($code -eq 2) {
+            if ($receipt.native -ne 'UNSUPPORTED' -or $receipt.shortcut -ne 'FAIL' `
+                -or $receipt.association -ne 'NOT_RUN') { throw 'Missing unsupported-native receipt.' }
+            Write-Output '::warning::Windows installation checks passed. Native GUI acceptance is UNSUPPORTED because hosted OpenGL is below 2.0; INX association launch was not run.'
+            'native=UNSUPPORTED' >> $env:GITHUB_OUTPUT
+            '### Windows installation checks passed. Native GUI acceptance is UNSUPPORTED; INX association launch is NOT_RUN. See windows-install evidence. Issue #17 remains open.' >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            if ($receipt.native -ne 'PASS' -or $receipt.shortcut -ne 'PASS' -or $receipt.association -ne 'PASS') {
+              throw 'Missing native acceptance receipt.'
+            }
+            'native=PASS' >> $env:GITHUB_OUTPUT
+            '### Windows installation and both native launch paths passed.' >> $env:GITHUB_STEP_SUMMARY
+          }
+          exit 0
       - name: Upload Windows installation evidence
         if: always()
         uses: actions/upload-artifact@v4

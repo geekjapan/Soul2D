@@ -203,11 +203,16 @@ release binaries and the MSI, extracts it with `msiexec /a`, checks that the exe
 `soul2d.exe` and the catalogues in `i18n` under it, and runs the extracted `soul2d-core.exe --mcp`.
 It then performs a real quiet installation on the disposable Windows runner with
 `tools/verify-windows-install.ps1`. The verifier checks installed x64 executables and resources,
-resolves and launches the advertised Start Menu shortcut, and opens an owned INX through
-its file association. It checks the installed process, its window visible style, its owned MCP
+resolves and attempts to launch the advertised Start Menu shortcut, then opens an owned INX through
+its file association if startup succeeds. Native acceptance checks the installed process, its window visible style, its owned MCP
 listener and the loaded document identity before uninstalling. Window visible style is not
 an assertion about rendered pixels or an unobscured desktop. A missing window or listener
-fails the check. Installation logs and JSON observations are retained for three days; isolated
+fails native acceptance. On a hosted runner, the exact observed OpenGL-below-2.0 startup
+error is recorded as `UNSUPPORTED`, with association launch `NOT_RUN`. The verifier returns
+2 only after installation checks and cleanup pass. Packaging CI reports that case with a
+warning and summary; it does not count as native acceptance or complete Issue #17.
+Other startup errors and installation or cleanup failures fail CI. Outcome-policy tests
+run before the Windows build. Installation logs and JSON observations are retained for three days; isolated
 settings and tokens are excluded. Neither job uploads the package.
 
 ### Status
