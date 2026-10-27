@@ -11,6 +11,8 @@ $references = @([System.Windows.Automation.AutomationElement].Assembly.Location,
     [System.Windows.Automation.ControlType].Assembly.Location, [System.Windows.Rect].Assembly.Location,
     [System.Windows.Forms.Form].Assembly.Location, 'System.dll', 'System.Core.dll', 'System.Drawing.dll')
 Add-Type -Path @($CaptureSource, (Join-Path $PSScriptRoot 'PropertiesDiscovery.cs')) -ReferencedAssemblies $references
+[PropertiesDiscovery]::VerifyIdentityPolicy()
+Write-Output 'PASS: observed Properties pair, invalid/replaced dialog and stub, and baseline refusal checks.'
 $result = [PropertiesDiscovery]::Run($FilePath, $EvidenceDirectory)
 $result | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'discovery.json') -Encoding UTF8
 if ($result.status -ne 'OBSERVED') { throw 'Properties discovery did not complete; see discovery.json.' }
