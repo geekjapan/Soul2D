@@ -28,7 +28,8 @@ pub fn editable_source(source: &Value) -> bool {
 }
 
 fn source_name(source: &Value) -> &str {
-    source["name"].as_str().or_else(|| source["id"].as_str()).unwrap_or("Source")
+    ["name", "id", "guid"].into_iter().filter_map(|key| source[key].as_str())
+        .find(|value| !value.trim().is_empty()).unwrap_or("Source")
 }
 
 fn source_label(source: &Value) -> String {
@@ -883,6 +884,25 @@ mod tests {
     }
 
     #[test]
+    fn source_labels_fall_back_to_nonempty_identifiers_without_changing_names() {
+        for (name, id, guid, expected) in [
+            (Some("Face"), Some("mesh"), Some("g"), "Face"),
+            (Some("  顔  "), Some("mesh"), Some("g"), "  顔  "),
+            (Some(""), Some("mesh"), Some("g"), "mesh"),
+            (Some(" \t"), Some("mesh"), Some("g"), "mesh"),
+            (None, Some("mesh"), Some("g"), "mesh"),
+            (Some(""), Some(" "), Some("g"), "g"),
+            (None, None, Some("g"), "g"),
+            (Some(""), Some(" "), Some("\t"), "Source"),
+            (None, None, None, "Source"),
+        ] {
+            let source = json!({"name": name, "id": id, "guid": guid, "data": {"type": "ArtMesh"}});
+            assert_eq!(source_name(&source), expected);
+            assert_eq!(source_label(&source), format!("{expected} [ArtMesh]"));
+        }
+    }
+
+    #[test]
     fn sources_and_forms_are_filtered_like_d() {
         let source = json!({"guid": "a", "data": {"type": "ArtMesh"}, "forms": [
             {"guid": "ok", "coordinateType": "Canvas", "data": {"type": "ArtMesh", "positions": [1, 2]}},
@@ -1149,6 +1169,7 @@ mod tests {
     fn the_editor_lists_the_source_and_form_with_named_controls_and_loads_the_first_vertex() {
         let mut rig = Rig::new("forms-names");
         let output = rig.draw();
+        assert!(texts(&output).iter().any(|text| text == "mesh [ArtMesh]"), "{:?}", texts(&output));
         for label in ["Source", "Form"] {
             assert!(has(&output, Role::ComboBox, label), "{label}");
         }
