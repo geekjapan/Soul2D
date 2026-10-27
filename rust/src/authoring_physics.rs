@@ -410,6 +410,47 @@ fn replace_leaf(
     Ok(Patch { range: node.range(), value: new_text })
 }
 
+fn selection_patch(
+    text: &str, graph: &Graph<'_, '_>, inbound: &HashSet<&str>, set: Node<'_, '_>, guid: Option<&str>,
+) -> Result<Option<Patch>, String> {
+    let name = "selectedCubismPhysics";
+    let resolved = graph.field(set, name)?;
+    let slot = direct_field(set, name);
+    let (range, id) = match (slot, resolved) {
+        (Some(slot), Some(_)) => {
+            let tag = if slot.has_tag_name("null") { "null" } else { "CPhysicsSettingsGuid" };
+            let extra: &[&str] = if tag == "null" { &[] } else { &["uuid", "note"] };
+            let id = check_leaf(slot, tag, name, extra, inbound)?;
+            if slot.children().any(|child| child.is_text() && !child.text().unwrap_or_default().trim().is_empty()) {
+                return Err("authoring physics selected group carries non-whitespace text".into());
+            }
+            if tag != "null" {
+                let attribute = slot.attributes().find(|attribute| attribute.name() == "uuid")
+                    .filter(|attribute| !attribute.value().trim().is_empty())
+                    .ok_or("authoring physics selected group lacks identity")?;
+                if let Some(guid) = guid.filter(|_| slot.attribute("note").is_some()) {
+                    return Ok((attribute.value() != guid).then(|| Patch {
+                        range: attribute.range_value(), value: escape_attribute(guid),
+                    }));
+                }
+            } else if guid.is_none() { return Ok(None); }
+            (slot.range(), id)
+        }
+        (None, Some(_)) => return Err("authoring physics selected group uses inherited storage".into()),
+        (None, None) => {
+            if guid.is_none() { return Ok(None); }
+            let (_, inner) = element_spans(text, set)?;
+            (inner.end..inner.end, String::new())
+        }
+        _ => return Err("authoring physics selected group cannot be resolved".into()),
+    };
+    let value = match guid {
+        Some(guid) => format!("<CPhysicsSettingsGuid xs.n='{name}'{id} uuid='{}' note='(no debug info)'/>", escape_attribute(guid)),
+        None => format!("<null xs.n='{name}'{id}/>"),
+    };
+    Ok(Some(Patch { range, value }))
+}
+
 fn finite(value: &Value) -> Result<f64, String> {
     value
         .as_f64()
@@ -744,6 +785,7 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
     }
 
     let mut patches = Vec::new();
+    let mut selected_after: Option<Option<String>> = None;
     let check: Verify = match (group_index, list_name, item_index, insert_at, remove, field, value) {
         (None, None, None, Some(0), false, None, Some(value)) if !duplicate => {
             if !list.has_tag_name("carray_list") {
@@ -755,7 +797,13 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
             let used: HashSet<_> = document.descendants().filter_map(|node| node.attribute("idstr")).collect();
             let id = (1..=used.len() + 1).map(|number| format!("PhysicsSetting{number}"))
                 .find(|id| !used.contains(id.as_str())).ok_or("no free physics setting ID")?;
-            let element = first_group(&by_id, &guid_objects, &id, value)?;
+            let guid = crate::animation_source::new_guid()?;
+            if document.descendants().any(|node| node.attribute("uuid") == Some(&guid)) {
+                return Err("authoring physics identity collision".into());
+            }
+            let element = first_group(&by_id, &guid_objects, &id, &guid, value)?;
+            patches.extend(selection_patch(text, &graph, &inbound, set, Some(&guid))?);
+            selected_after = Some(Some(guid));
             if item_insert_offset(text, list, &slots, 0, &mut patches, &element)? {
                 count_patch(text, list, 1, &mut patches)?;
             }
@@ -854,6 +902,39 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
             }
             if !subtree_unreferenced(slot, &inbound) {
                 return Err("authoring physics group is referenced elsewhere".into());
+            }
+            if let Some(guid) = values::guid_field(&graph, slot, "guid")? {
+                let identity = direct_field(slot, "guid").ok_or("authoring physics group identity is inherited")?;
+                check_leaf(identity, "CPhysicsSettingsGuid", "guid", &["uuid", "note"], &inbound)?;
+                let selection = graph.field(set, "selectedCubismPhysics")?;
+                let selected = values::guid_field(&graph, set, "selectedCubismPhysics")? == Some(guid);
+                for node in document.descendants().filter(|node| node.is_element()) {
+                    if slot.range().contains(&node.range().start) || selected && selection.is_some_and(|value| value.id() == node.id()) {
+                        continue;
+                    }
+                    let resolved = graph.resolve(node)?;
+                    if resolved.has_tag_name("CPhysicsSettingsGuid") && resolved.attribute("uuid") == Some(guid) {
+                        return Err("authoring physics group has an opaque or ambiguous GUID link".into());
+                    }
+                }
+                if selected {
+                    let mut next = None;
+                    if let Some(survivor) = slots.iter().enumerate().find(|(index, _)| *index != group).map(|(_, slot)| *slot) {
+                        if !graph.field(survivor, "guid")?.is_some_and(|node| node.has_tag_name("CPhysicsSettingsGuid")) {
+                            return Err("authoring physics remaining group has an unsupported identity".into());
+                        }
+                        let target = values::guid_field(&graph, survivor, "guid")?
+                            .ok_or("authoring physics remaining group lacks a selectable identity")?;
+                        let mut matches = 0;
+                        for candidate in slots.iter().enumerate().filter(|(index, _)| *index != group).map(|(_, slot)| *slot) {
+                            if values::guid_field(&graph, candidate, "guid")? == Some(target) { matches += 1; }
+                        }
+                        if matches != 1 { return Err("authoring physics remaining group identity is ambiguous".into()); }
+                        next = Some(target.to_owned());
+                    }
+                    patches.extend(selection_patch(text, &graph, &inbound, set, next.as_deref())?);
+                    selected_after = Some(next);
+                }
             }
             patches.push(Patch { range: slot.range(), value: String::new() });
             count_patch(text, list, slots.len() - 1, &mut patches)?;
@@ -1014,6 +1095,19 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
         let inbound = inbound_refs(&document);
         let after = view_document(&graph, &inbound, &by_guid)?;
         verify(&after, &check)?;
+        if let Some(expected) = selected_after {
+            let set = editable_set(&graph, &inbound)?.ok_or("authoring physics set disappeared")?;
+            let actual = values::guid_field(&graph, set, "selectedCubismPhysics")?;
+            if actual != expected.as_deref() { return Err("authoring physics selected group did not apply".into()); }
+            if let Some(guid) = actual {
+                let list = editable_list(set, "_sourceCubismPhysics", &inbound)?;
+                let mut matches = 0;
+                for group in elements(list) {
+                    if values::guid_field(&graph, group, "guid")? == Some(guid) { matches += 1; }
+                }
+                if matches != 1 { return Err("authoring physics selected group must have one target".into()); }
+            }
+        }
     }
 
     let mut candidate = model.clone();
@@ -1218,6 +1312,7 @@ fn first_group(
     by_id: &HashMap<String, String>,
     guid_objects: &HashMap<&str, &str>,
     id: &str,
+    guid: &str,
     value: &Value,
 ) -> Result<String, String> {
     let object = value.as_object().ok_or("new physics group must be an object")?;
@@ -1261,8 +1356,9 @@ fn first_group(
         }
         lists.push_str("</carray_list>");
     }
-    Ok(format!("<CPhysicsSettingsSource><CPhysicsSettingId xs.n='id' idstr='{id}'/>\
-        <s xs.n='name'>{}</s>{lists}{ranges}</CPhysicsSettingsSource>", escape_text(name)))
+    Ok(format!("<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' uuid='{}' note='(no debug info)'/>\
+        <CPhysicsSettingId xs.n='id' idstr='{id}'/>\
+        <s xs.n='name'>{}</s>{lists}{ranges}</CPhysicsSettingsSource>", escape_attribute(guid), escape_text(name)))
 }
 
 fn item_insert(

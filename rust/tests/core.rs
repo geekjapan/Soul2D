@@ -3097,7 +3097,9 @@ fn physics3_read(session: &mut Session) -> Value {
 fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step() {
     for (list, selection) in [("<carray_list xs.n='_sourceCubismPhysics' count='0'/>", ""),
         ("<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>",
-            "<null xs.n='selectedCubismPhysics' xs.id='selection-private'/>")] {
+            "<null xs.n='selectedCubismPhysics' xs.id='selection-private'/>"),
+        ("<carray_list xs.n='_sourceCubismPhysics' count='0'/>",
+            "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' xs.id='selection-private' uuid='stale'/>")] {
         let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
             <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet?>\r\n\
             <?version CModelSource:15?>\r\n\
@@ -3105,6 +3107,10 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
             {}<?import com.live2d.graphics3d.type.GVector2?>", native_artmesh_xml("")).replace("<CDrawableSourceSet", &format!(
             "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><i xs.n='settingFPS'>60</i>\
              {list}{selection}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
+        let xml = if selection.starts_with("<CPhysicsSettingsGuid") {
+            xml.replacen("<?version CModelSource:15?>",
+                "<?import com.live2d.type.CPhysicsSettingsGuid?>\r\n<?version CModelSource:15?>", 1)
+        } else { xml };
         let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
         let group = json!({"name":"First & only", "normalization":{
             "position":{"min":-10.0,"default":0.0,"max":10.0}, "angle":{"min":-30.0,"default":0.0,"max":30.0}},
@@ -3177,7 +3183,101 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
             "group":0,"list":"vertices","index":1,"field":"delay","value":0.25})));
         assert_eq!(physics3_read(&mut reopened)["groups"][0]["vertices"][1]["delay"], 0.25);
+        let selection = |model: &Value| {
+            let parsed = roxmltree::Document::parse(model["physicsSource"].as_str().unwrap()).unwrap();
+            parsed.descendants().find(|node| node.attribute("xs.n") == Some("selectedCubismPhysics"))
+                .and_then(|node| node.attribute("uuid")).map(str::to_owned)
+        };
+        let prior = reopened.snapshot()["model"].clone();
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":0,"duplicate":true})));
+        let duplicated = reopened.snapshot()["model"].clone();
+        assert_eq!(selection(&duplicated), selection(&prior));
+        let parsed = roxmltree::Document::parse(duplicated["physicsSource"].as_str().unwrap()).unwrap();
+        let identities: Vec<_> = parsed.descendants().filter(|node| node.has_tag_name("CPhysicsSettingsGuid")
+            && node.attribute("xs.n") == Some("guid")).map(|node| node.attribute("uuid").unwrap().to_owned()).collect();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":1,"remove":true})));
+        assert_eq!(reopened.snapshot()["model"], prior, "removing the unselected copy preserves selection bytes");
+        result(&request(&mut reopened, json!({"op":"undo"})));
+        assert_eq!(reopened.snapshot()["model"], duplicated);
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":0,"remove":true})));
+        let remaining = reopened.snapshot()["model"].clone();
+        assert_eq!(selection(&remaining), Some(identities[1].clone()));
+        result(&request(&mut reopened, json!({"op":"undo"})));
+        assert_eq!(reopened.snapshot()["model"], duplicated);
+        result(&request(&mut reopened, json!({"op":"redo"})));
+        assert_eq!(reopened.snapshot()["model"], remaining);
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":0,"remove":true})));
+        assert_eq!(selection(&reopened.snapshot()["model"]), None);
+        assert!(physics3_read(&mut reopened)["groups"].as_array().unwrap().is_empty());
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "insert":0,"value":group})));
+        let recreated = reopened.snapshot()["model"].clone();
+        assert!(selection(&recreated).is_some());
+        assert_ne!(selection(&recreated), selection(&created));
+        let final_path = directory.join("recreated.cmo3");
+        result(&request(&mut reopened, json!({"op":"save","path":final_path})));
+        let mut final_session = Session::new();
+        result(&request(&mut final_session, json!({"op":"open","path":final_path})));
+        assert_eq!(final_session.snapshot()["model"], recreated);
         assert_eq!(fs::read(directory.join("empty.cmo3")).unwrap(), authoring_bytes(&xml));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_first_group_refuses_unsafe_selection_storage_atomically() {
+    for selection in [
+        "<null xs.n='selectedCubismPhysics' future='keep'/>",
+        "<null xs.n='selectedCubismPhysics'><!--keep--></null>",
+        "<null xs.n='selectedCubismPhysics'>keep</null>",
+        "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid=''/>",
+        "<null xs.n='selectedCubismPhysics' xs.id='selector'/><Future xs.ref='selector'/>",
+        "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' xs.ref='selector'/><CPhysicsSettingsGuid xs.id='selector' uuid='old'/>",
+        "<null xs.n='selectedCubismPhysics'/><null xs.n='selectedCubismPhysics'/>",
+        "<Base xs.n='super'><null xs.n='selectedCubismPhysics'/></Base>",
+    ] {
+        let xml = native_artmesh_xml("").replace("<CDrawableSourceSet", &format!(
+            "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><carray_list xs.n='_sourceCubismPhysics' count='0'/>{selection}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "unsafe-selection.cmo3");
+        physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "insert":0,"value":{"name":"First","normalization":{
+                "position":{"min":-10,"default":0,"max":10},"angle":{"min":-30,"default":0,"max":30}},
+                "inputs":[],"outputs":[],"vertices":[]}}));
+        assert_eq!(fs::read(directory.join("unsafe-selection.cmo3")).unwrap(), authoring_bytes(&xml));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_group_removal_refuses_unsafe_identity_links_atomically() {
+    let xml = native_physics_xml()
+        .replace("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' uuid='survivor'/>")
+        .replacen("uuid='survivor'", "uuid='selected'", 1)
+        .replacen("<i xs.n='settingFPS'>", "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid='selected' note='keep'/><i xs.n='settingFPS'>", 1);
+    for xml in [
+        xml.replace("<CPhysicsSettingsGuid xs.n='guid' uuid='survivor'/>", ""),
+        xml.replace("<CPhysicsSettingsGuid xs.n='guid' uuid='survivor'/>", "<Future xs.n='guid' uuid='survivor'/>"),
+        xml.replace("uuid='survivor'", "uuid='selected'"),
+        xml.replace("note='keep'", "note='keep' future='keep'"),
+        xml.replace("<Opaque xs.id='future-data'>", "<CPhysicsSettingsGuid xs.n='opaque-link' uuid='selected'/><Opaque xs.id='future-data'>"),
+        xml.replace("note='keep'", "note='keep' xs.id='selector'")
+            .replace("<Opaque xs.id='future-data'>", "<Future xs.ref='selector'/><Opaque xs.id='future-data'>"),
+    ] {
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "unsafe-removal.cmo3");
+        physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":0,"remove":true}));
+        assert_eq!(fs::read(directory.join("unsafe-removal.cmo3")).unwrap(), authoring_bytes(&xml));
         fs::remove_dir_all(directory).unwrap();
     }
 }

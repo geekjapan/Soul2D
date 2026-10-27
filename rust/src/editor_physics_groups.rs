@@ -697,6 +697,12 @@ mod tests {
         rig.click(Role::Button, "Create first group");
         assert_eq!(rig.revision(), revision + 1);
         assert_eq!(rig.view()["groups"][0]["name"], "Physics");
+        let created = rig.controller.snapshot()["model"].clone();
+        let parsed = roxmltree::Document::parse(created["physicsSource"].as_str().unwrap()).unwrap();
+        let guid = parsed.descendants().find(|node| node.has_tag_name("CPhysicsSettingsGuid")
+            && node.attribute("xs.n") == Some("guid")).unwrap().attribute("uuid").unwrap();
+        let selection = parsed.descendants().find(|node| node.attribute("xs.n") == Some("selectedCubismPhysics")).unwrap();
+        assert_eq!(selection.attribute("uuid"), Some(guid));
         rig.controller.core_request(&json!({"op":"undo"}));
         assert_eq!(rig.controller.snapshot()["model"], before);
         rig.draw();
@@ -704,6 +710,7 @@ mod tests {
         rig.controller.core_request(&json!({"op":"redo"}));
         rig.draw();
         assert_eq!(rig.view()["groups"][0]["name"], "Physics");
+        assert_eq!(rig.controller.snapshot()["model"], created);
     }
 
     #[test]

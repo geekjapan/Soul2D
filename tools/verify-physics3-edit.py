@@ -179,6 +179,10 @@ def verify(host, source):
     edit(host, "create-first-group", insert=0, value=created_group)
     created = host.call("created-snapshot", "snapshot", {})
     assert created["revision"] == empty["revision"] + 1
+    xml = ET.fromstring(created["model"]["physicsSource"])
+    group_guid = xml.find("./carray_list/CPhysicsSettingsSource/CPhysicsSettingsGuid[@xs.n='guid']").get("uuid")
+    assert group_guid
+    assert xml.find("./CPhysicsSettingsGuid[@xs.n='selectedCubismPhysics']").get("uuid") == group_guid
     first = view(host, "first-group-view")
     assert first["groups"][0]["name"] == created_group["name"]
     assert first["groups"][0]["normalization"] == created_group["normalization"]
@@ -191,6 +195,19 @@ def verify(host, source):
     host.call("save-first-group", "save", {"path": str(first_path)})
     host.call("reopen-first-group", "open", {"path": str(first_path)})
     assert view(host, "first-group-reopened") == first
+    edit(host, "duplicate-first-group", group=0, duplicate=True)
+    duplicated = host.call("duplicated-first-snapshot", "snapshot", {})
+    xml = ET.fromstring(duplicated["model"]["physicsSource"])
+    guids = [node.get("uuid") for node in xml.findall("./carray_list/CPhysicsSettingsSource/CPhysicsSettingsGuid[@xs.n='guid']")]
+    assert len(guids) == 2 and guids[0] == group_guid and guids[1] != group_guid
+    assert xml.find("./CPhysicsSettingsGuid[@xs.n='selectedCubismPhysics']").get("uuid") == group_guid
+    edit(host, "remove-selected-first-group", group=0, remove=True)
+    remaining = host.call("remaining-first-snapshot", "snapshot", {})
+    xml = ET.fromstring(remaining["model"]["physicsSource"])
+    assert xml.find("./CPhysicsSettingsGuid[@xs.n='selectedCubismPhysics']").get("uuid") == guids[1]
+    edit(host, "remove-final-first-group", group=0, remove=True)
+    cleared = host.call("cleared-first-snapshot", "snapshot", {})
+    assert ET.fromstring(cleared["model"]["physicsSource"]).find("./null[@xs.n='selectedCubismPhysics']") is not None
     verify_detach(host, source)
 
 

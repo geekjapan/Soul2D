@@ -1595,6 +1595,12 @@ and parameter IDs. The writer allocates the next unused `PhysicsSetting<n>` ID;
 it preserves the surrounding XML and container entries. Missing, null, shared or
 nonempty settings lists refuse this operation. Existing group duplication remains
 available. Creation is one Undo step and uses the same save/reopen checks as edits.
+Creation also gives the group a fresh GUID and selects it for the vendor editor.
+Duplication preserves the current selection. Removing the selected group chooses
+the first surviving group with a unique identity, or clears selection if none
+remain. Missing or ambiguous survivor identities, opaque outside GUID links, and
+unsupported selection storage refuse the removal atomically. Removing another
+group leaves selection unchanged.
 Saving changed physics source adds missing class imports to the XML prolog for
 classes introduced by the edit. Existing declarations and their formatting
 remain intact; a conflicting short class name refuses the edit atomically.
