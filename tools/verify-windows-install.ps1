@@ -21,7 +21,7 @@ function Get-VerificationExitCode($Receipt) {
         -and $Receipt.launches[1].accepted -eq $true -and $Receipt.editorStdio -eq 'PASS') {
         if ($Receipt.graphicsContext -notin @('system', 'test-software-wgl')) { return 1 }
         foreach ($launch in $Receipt.launches) {
-            if ($launch.paint.status -ne 'PASS' -or $launch.paint.restored -ne $true `
+            if ($launch.exitCode -ne 0 -or $launch.paint.status -ne 'PASS' -or $launch.paint.restored -ne $true `
                 -or $launch.console.attached -ne $true -or $launch.console.detached -ne $true `
                 -or $launch.console.processIds -notcontains $launch.pid) { return 1 }
             if ($Receipt.graphicsContext -eq 'test-software-wgl' -and $launch.softwareModule.verified -ne $true) { return 1 }
@@ -39,6 +39,13 @@ function Get-VerificationExitCode($Receipt) {
         -and $diagnostic.stderr -ceq 'Error: OpenGL(PainterError("egui_glow requires opengl 2.0+. "))' `
         -and $Receipt.failure -eq 'start-menu did not produce an installed editor window and owned MCP listener before the deadline.') { return 2 }
     return 1
+}
+
+function Get-ObservedProcess([int]$ProcessId) {
+    $process = Get-Process -Id $ProcessId
+    # PID-discovered processes need a retained handle to read ExitCode after they exit.
+    if ($process.get_Handle() -eq [IntPtr]::Zero) { throw 'Cannot retain the observed process handle.' }
+    return $process
 }
 
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' `
@@ -343,11 +350,14 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     }
     $observation.console = Observe-Console $editor $Kind
     Observe-Paint $editor $Kind $observation
-    $reply = Invoke-EditorTool 'editor_quit' @{}
-    if ($reply.quit.state -ne 'accepted') { throw 'Installed editor did not acknowledge clean Quit.' }
-    if (-not $editor.WaitForExit(15000)) { throw 'Installed editor did not exit after clean Quit.' }
-    $observation.exitCode = $editor.ExitCode
-    if ($editor.ExitCode -ne 0) { throw 'Installed editor exited unsuccessfully.' }
+    $editor = Get-ObservedProcess $editor.Id
+    try {
+        $reply = Invoke-EditorTool 'editor_quit' @{}
+        if ($reply.quit.state -ne 'accepted') { throw 'Installed editor did not acknowledge clean Quit.' }
+        if (-not $editor.WaitForExit(15000)) { throw 'Installed editor did not exit after clean Quit.' }
+        $observation.exitCode = $editor.get_ExitCode()
+        if ($observation.exitCode -ne 0) { throw 'Installed editor exited unsuccessfully.' }
+    } finally { $editor.Dispose() }
     $observation.accepted = $true
 }
 
