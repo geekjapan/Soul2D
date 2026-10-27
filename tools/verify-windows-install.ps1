@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$Fixture,
     [Parameter(Mandatory)][string]$EvidenceDirectory,
     [string]$SoftwareGlArchive,
+    [switch]$DiscoverProperties,
     [ValidateRange(10, 120)][int]$TimeoutSeconds = 60
 )
 
@@ -165,7 +166,7 @@ $result = [ordered]@{ productCode = $productCode; files = @(); binaries = @(); l
     sourceRevision = $env:GITHUB_SHA; msiSha256 = (Get-FileHash -LiteralPath $msiPath).Hash;
     graphicsContext = $(if ($SoftwareGlArchive) { 'test-software-wgl' } else { 'system' }); graphicsFixture = $null;
     installation = 'NOT_RUN'; shortcut = 'NOT_RUN'; association = 'NOT_RUN'; editorStdio = 'NOT_RUN';
-    native = 'NOT_RUN'; softwareGl = 'NOT_RUN'; failure = $null }
+    native = 'NOT_RUN'; softwareGl = 'NOT_RUN'; propertiesDiscovery = $null; failure = $null }
 $ownedEditors = [Collections.Generic.List[int]]::new()
 $ownedConfigs = [Collections.Generic.List[string]]::new()
 $cleanupFailures = [Collections.Generic.List[string]]::new()
@@ -421,6 +422,21 @@ try {
     }
     $result.files = @(Get-ChildItem -LiteralPath $installDirectory -Recurse -File | ForEach-Object { $_.FullName.Substring($installDirectory.Length + 1) })
     $originalInventory = Get-InstalledInventory
+    if ($DiscoverProperties) {
+        $propertiesEvidence = Join-Path $evidence 'properties-discovery'
+        $result.propertiesDiscovery = @{ status = 'FAIL'; evidence = $propertiesEvidence;
+            scope = 'Properties discovery only; Issue acceptance NOT_EVALUATED' }
+        try {
+            & (Join-Path $PSScriptRoot 'prototypes/windows-properties/probe.ps1') -FilePath $editorPath `
+                -EvidenceDirectory $propertiesEvidence -CaptureSource (Join-Path $PSScriptRoot 'windows-editor-observation.cs')
+        } finally {
+            $propertiesReceipt = Join-Path $propertiesEvidence 'result.json'
+            if (Test-Path -LiteralPath $propertiesReceipt) {
+                $result.propertiesDiscovery = Get-Content -Raw -LiteralPath $propertiesReceipt | ConvertFrom-Json
+            }
+        }
+        if ($result.propertiesDiscovery.status -ne 'OBSERVED') { throw 'Windows Properties discovery failed.' }
+    }
     python tools/verify-mcp-initialize.py (Join-Path $installDirectory 'soul2d-core.exe') --mcp
     if ($LASTEXITCODE -ne 0) { throw 'Installed core MCP initialization failed.' }
     $shortcuts = @(@([Environment]::GetFolderPath('CommonPrograms'), [Environment]::GetFolderPath('Programs')) |

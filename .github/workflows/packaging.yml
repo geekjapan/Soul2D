@@ -249,7 +249,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           pwsh -NoProfile -File ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
             -Fixture out/rust-verification/fixture.inx `
-            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install"
+            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install" -DiscoverProperties
           $code = $LASTEXITCODE
           if ($code -notin @(0, 2)) { throw "Windows installation verification failed with exit code $code." }
           $receipt = Get-Content -Raw "$env:RUNNER_TEMP/windows-install/result.json" | ConvertFrom-Json
@@ -258,6 +258,12 @@ jobs:
               -or $receipt.msiSha256 -ine (Get-FileHash out/Soul2D.msi).Hash `
               -or $receipt.installation -ne 'PASS' -or $receipt.cleanup.errors.Count -ne 0 `
               -or $receipt.cleanup.uninstallExitCode -ne 0) { throw 'Inconsistent installation verification receipt.' }
+          if ($receipt.propertiesDiscovery.status -ne 'OBSERVED' -or $receipt.propertiesDiscovery.helperExited -ne $true `
+              -or $receipt.propertiesDiscovery.cleanupErrors.Count -ne 0 `
+              -or $receipt.propertiesDiscovery.sha256Before -cne $receipt.propertiesDiscovery.sha256After) {
+            throw 'Windows Properties prototype did not produce a complete observation.'
+          }
+          '### Windows Properties discovery observed one installed editor. This is a throwaway topology/UIA experiment; three-file Properties acceptance is NOT_EVALUATED.' >> $env:GITHUB_STEP_SUMMARY
           foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
             if ($receipt.cleanup.$field -ne $true) { throw "Incomplete installation cleanup: $field" }
           }
