@@ -844,6 +844,27 @@ mod tests {
     }
 
     #[test]
+    fn physics_y_inputs_use_position_normalization_weight_and_reflection() {
+        let (mut document, source) = fixture();
+        document["PhysicsSettings"][0]["Input"][0]["Type"] = json!("Y");
+        document["PhysicsSettings"][0]["Normalization"]["Angle"] =
+            json!({"Minimum":-30,"Default":0,"Maximum":30});
+        let inputs = BTreeMap::from([("in".to_owned(), 30.0), ("out".to_owned(), 0.4)]);
+        for (weight, displacement) in [(60.0, 6.0), (12.5, 1.25)] {
+            for reflect in [false, true] {
+                document["PhysicsSettings"][0]["Input"][0]["Weight"] = json!(weight);
+                document["PhysicsSettings"][0]["Input"][0]["Reflect"] = json!(reflect);
+                let expected = [0.0, if reflect { displacement } else { -displacement }];
+                let mut runtime = Runtime::new(Rig::parse(&document, &source).unwrap());
+                runtime.stabilize(&inputs).unwrap();
+                assert_eq!(runtime.strands[0].positions[0], expected);
+                runtime.step(&inputs, 1.0 / 60.0).unwrap();
+                assert_eq!(runtime.strands[0].positions[0], expected);
+            }
+        }
+    }
+
+    #[test]
     fn stabilization_uses_configured_gravity_for_first_segment_angle() {
         let (document, source) = fixture();
         let mut runtime = Runtime::new(Rig::parse(&document, &source).unwrap());

@@ -1665,9 +1665,9 @@ and not from the CMO3 alone:
   the CMO3 was found for it, and all 63 vendor files hold these values.
 
 `Meta.Fps` is written only when the CMO3 sets `settingFPS`. The input types
-are `SRC_TO_X` (`X`) and `SRC_TO_G_ANGLE` (`Angle`), and an output must be an
-angle, whose `Scale` is `angleScale`. The 94 samples hold no other type, so any
-other is refused, as is an output whose vertex index is not between 1 and the
+are `SRC_TO_X` (`X`), `SRC_TO_Y` (`Y`) and `SRC_TO_G_ANGLE` (`Angle`).
+An output must be an angle, whose `Scale` is `angleScale`. Unknown input types
+and translation outputs are refused, as is an output whose vertex index is not between 1 and the
 vertex count less one, a setting without an input or an output, and a CMO3
 without a physics setting. A file created with a path ending in
 `.physics3.json` can be given to `live2d.physics.attach`. That reader has
@@ -1676,6 +1676,13 @@ limits the export does not apply, such as weights from 0 to 100 and at most
 two counts as well. The reader accepted the export of all 83 sample files and
 ran one step on each, measured once with a script that is not in the
 repository.
+
+Y inputs can be read, edited, inserted, saved as presets and exported. The
+installed Cubism 5.3.04 source-type enum declares `SRC_TO_Y`; owned tests cover
+its serialization and runtime position normalization, weight and reflection.
+The sample comparison below predates this support and contains no Y inputs.
+Cubism GUI round-trip and visual parity for authored Y inputs remain unverified.
+This does not add translation-output editing or reinterpret `translationScale`.
 
 `tools/verify-physics3-export.py <directories>` compares the export with a
 derivation written apart from it and with the vendor files, after parsing. On

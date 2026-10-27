@@ -225,7 +225,6 @@ fn physics_xml(text: &str) -> Result<Value, String> {
             .ok_or_else(|| "authoring parameter lacks an ID".to_owned())
     };
     let number = |node, name: &str| number_field(&graph, node, name, None).and_then(rounded);
-    // No sample holds another type: a vertical input, or an output that is not an angle.
     let kind = |node, known: &[(&str, &'static str)]| -> Result<&'static str, String> {
         let token = graph.field(node, "type")?.and_then(|kind| kind.attribute("v")).unwrap_or("");
         known.iter().find(|(source, _)| *source == token).map(|(_, written)| *written)
@@ -255,8 +254,11 @@ fn physics_xml(text: &str) -> Result<Value, String> {
         let mut inputs = Vec::new();
         for input in list(&graph, required_field(&graph, *source, "inputs")?, &mut budget)? {
             let source = json!({"Target": "Parameter", "Id": budget.text(parameter(input, "source")?)?});
+            let token = graph.field(input, "type")?.and_then(|kind| kind.attribute("v")).unwrap_or("");
+            let input_type = crate::authoring_physics::input_type_from_token(token)
+                .ok_or("unsupported authoring physics type")?;
             inputs.push(json!({"Source": source, "Weight": number(input, "weight")?,
-                "Type": kind(input, &[("SRC_TO_X", "X"), ("SRC_TO_G_ANGLE", "Angle")])?,
+                "Type": input_type,
                 "Reflect": bool_field(&graph, input, "isReverse", false)?}));
         }
         let mut outputs = Vec::new();
@@ -645,13 +647,30 @@ mod tests {
     }
 
     #[test]
+    fn physics_y_inputs_export_without_enabling_translation_outputs() {
+        let exported = physics_xml(&physics_fixture().replace("SRC_TO_X", "SRC_TO_Y")).unwrap();
+        let types: Vec<_> = exported["PhysicsSettings"].as_array().unwrap().iter()
+            .flat_map(|setting| setting["Input"].as_array().unwrap())
+            .map(|input| {
+                assert!(input.get("Scale").is_none());
+                input["Type"].as_str().unwrap()
+            }).collect();
+        assert_eq!(types, ["Y", "Angle", "Y"]);
+        for token in ["SRC_TO_X", "SRC_TO_Y"] {
+            let xml = physics_fixture().replace("uuid='hair'/><CPhysicsSourceType xs.n='type' v='SRC_TO_G_ANGLE'",
+                &format!("uuid='hair'/><CPhysicsSourceType xs.n='type' v='{token}'"));
+            assert_eq!(physics_xml(&xml).unwrap_err(), "unsupported authoring physics type");
+        }
+    }
+
+    #[test]
     fn physics_refuses_what_it_cannot_write() {
         let refusal = |old: &str, new: &str| {
             let fixture = physics_fixture();
             assert!(fixture.contains(old), "{old}");
             physics_xml(&fixture.replace(old, new)).unwrap_err()
         };
-        assert_eq!(refusal("SRC_TO_X", "SRC_TO_Y"), "unsupported authoring physics type");
+        assert_eq!(refusal("SRC_TO_X", "SRC_TO_UNKNOWN"), "unsupported authoring physics type");
         assert_eq!(refusal("uuid='hair'/><CPhysicsSourceType xs.n='type' v='SRC_TO_G_ANGLE'",
             "uuid='hair'/><CPhysicsSourceType xs.n='type' v='SRC_TO_X'"), "unsupported authoring physics type");
         // The first vertex is the fixed end of the strand, and the last index is one below the count.

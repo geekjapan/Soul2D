@@ -31,6 +31,7 @@ def load(name, filename):
 
 
 DRIVER = load("physics_bake_proof", "verify-animation-physics-bake.py")
+EXPORT = load("physics_export_oracle", "verify-physics3-export.py")
 CAFF = load("caff_proof", "verify-caff-authoring.py")
 SOURCE = load("source_proof", "verify-cmo-source.py")
 
@@ -100,6 +101,21 @@ def verify(host, source):
     assert group["name"] == "Sway" and group["inputs"][0]["source"] == "ParamTest", group
     assert len(group["vertices"]) == 2 and group["vertices"][1]["delay"] == 0.6, group
     assert group["vertices"][1]["radius"] == 3.0 and group["outputs"][0]["vertexIndex"] == 1
+
+    original = host.call("before-y-input", "snapshot", {})
+    edit(host, "set-y-input", group=0, list="inputs", index=0, field="type", value="Y")
+    vertical_view = view(host, "y-input-view")
+    assert vertical_view["groups"][0]["inputs"][0]["type"] == "Y"
+    vertical = host.call("y-input-snapshot", "snapshot", {})
+    expected = dict(original["model"])
+    expected["physicsSource"] = expected["physicsSource"].replace("SRC_TO_X", "SRC_TO_Y", 1)
+    assert vertical["model"] == expected and vertical["revision"] == original["revision"] + 1
+    host.call("undo-y-input", "undo", {})
+    assert host.call("undone-y-input", "snapshot", {})["model"] == original["model"]
+    host.call("redo-y-input", "redo", {})
+    assert view(host, "redone-y-input") == vertical_view
+    host.call("restore-x-input", "undo", {})
+    assert view(host, "restored-x-input") == initial
 
     edit(host, "rename", group=0, field="name", value="MCP & Sway")
     assert view(host, "renamed")["groups"][0]["name"] == "MCP & Sway"
@@ -172,7 +188,7 @@ def verify(host, source):
     created_group = {"name": "First & only", "normalization": {
         "position": {"min": -10, "default": 0, "max": 10},
         "angle": {"min": -30, "default": 0, "max": 30}},
-        "inputs": [{"source": "ParamTest", "type": "X"}],
+        "inputs": [{"source": "ParamTest", "type": "Y"}],
         "outputs": [{"destination": "ParamTest", "vertexIndex": 1}],
         "vertices": [{key: vertex[key] for key in ("x", "y", "mobility", "delay", "acceleration", "radius")}
                      for vertex in precise["groups"][0]["vertices"]]}
@@ -186,6 +202,9 @@ def verify(host, source):
     first = view(host, "first-group-view")
     assert first["groups"][0]["name"] == created_group["name"]
     assert first["groups"][0]["normalization"] == created_group["normalization"]
+    assert first["groups"][0]["inputs"][0]["type"] == "Y"
+    assert first["groups"][0]["inputs"][0]["typeToken"] == "SRC_TO_Y"
+    assert first["groups"][0]["inputs"][0]["editable"] is True
     assert first["groups"][0]["vertices"][1]["delay"] == 0.800001
     host.call("undo-first-group", "undo", {})
     assert host.call("undone-first-snapshot", "snapshot", {})["model"] == empty["model"]
@@ -195,6 +214,16 @@ def verify(host, source):
     host.call("save-first-group", "save", {"path": str(first_path)})
     host.call("reopen-first-group", "open", {"path": str(first_path)})
     assert view(host, "first-group-reopened") == first
+    vertical_path = host.run / "vertical.physics3.json"
+    vertical = host.call("export-vertical", "live2d_physics3_export", {"path": str(vertical_path)})
+    assert json.loads(vertical_path.read_text()) == vertical
+    assert EXPORT.derive(CAFF.decode(first_path.read_bytes())[1]) == vertical
+    assert vertical["PhysicsSettings"][0]["Input"][0]["Type"] == "Y"
+    assert "Scale" not in vertical["PhysicsSettings"][0]["Input"][0]
+    host.call("attach-vertical", "live2d_physics_attach", {"path": str(vertical_path)})
+    host.call("stabilize-vertical", "live2d_physics_stabilize", {})
+    host.call("step-vertical", "live2d_physics_step", {"dt": 1 / 60})
+    assert host.call("after-vertical-simulation", "snapshot", {})["model"] == created["model"]
     edit(host, "duplicate-first-group", group=0, duplicate=True)
     duplicated = host.call("duplicated-first-snapshot", "snapshot", {})
     xml = ET.fromstring(duplicated["model"]["physicsSource"])
@@ -242,6 +271,10 @@ def verify_detach(host, source):
     host.call("refuse-implicit-detach", "live2d_physics3_edit", {
         "expectedRevision": before["revision"], "group": 0, "field": "name", "value": "implicit"}, expected_error=True)
     assert host.call("after-implicit-refusal", "snapshot", {}) == before
+    host.call("refuse-shared-y-input", "live2d_physics3_edit", {
+        "expectedRevision": before["revision"], "group": 0, "list": "inputs", "index": 0,
+        "field": "type", "value": "Y"}, expected_error=True)
+    assert host.call("after-shared-y-refusal", "snapshot", {}) == before
     edit(host, "detach", detach=True)
     detached = host.call("detached-snapshot", "snapshot", {})
     detached_view = view(host, "detached-view")
@@ -300,9 +333,11 @@ def main():
     try:
         paths = [args.core.resolve(), args.njc.resolve(), args.fixture.resolve(), Path(__file__).resolve()]
         paths.extend(ROOT / name for name in [
-            "rust/src/authoring_physics.rs", "rust/src/authoring_scene.rs",
+            "rust/src/authoring_physics.rs", "rust/src/authoring.rs", "rust/src/native_physics.rs",
+            "rust/src/authoring_scene.rs",
             "rust/src/authoring_edit.rs", "rust/src/lib.rs", "rust/src/mcp.rs", "rust/Cargo.lock",
             "tools/verify-cmo-source.py", "tools/verify-caff-authoring.py", "tools/verify-rust-core.py",
+            "tools/verify-physics3-export.py",
         ])
         result["inputHashes"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
         source = run / "source.cmo3"

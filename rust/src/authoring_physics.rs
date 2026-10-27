@@ -22,6 +22,18 @@ const MAX_TOTAL_ITEMS: usize = 16384;
 const MAX_NAME_BYTES: usize = 1024;
 const MIN_STRAND_VERTICES: usize = 2;
 
+const INPUT_TYPES: [(&str, &str); 3] = [
+    ("X", "SRC_TO_X"), ("Y", "SRC_TO_Y"), ("Angle", "SRC_TO_G_ANGLE"),
+];
+
+pub(crate) fn input_type_from_token(token: &str) -> Option<&'static str> {
+    INPUT_TYPES.iter().find(|(_, stored)| *stored == token).map(|(name, _)| *name)
+}
+
+fn input_type_token(name: &str) -> Option<&'static str> {
+    INPUT_TYPES.iter().find(|(public, _)| *public == name).map(|(_, token)| *token)
+}
+
 struct Patch {
     range: Range<usize>,
     value: String,
@@ -672,16 +684,17 @@ fn view_item(
                 .and_then(|node| node.attribute("v"))
                 .unwrap_or("");
             let token = budget.text(token)?;
-            let known = matches!(token.as_str(), "SRC_TO_X" | "SRC_TO_G_ANGLE");
-            entry.insert("typeToken".into(), json!(token));
-            entry.insert(
-                "type".into(),
+            let kind = if list == "inputs" {
+                input_type_from_token(&token)
+            } else {
                 match token.as_str() {
-                    "SRC_TO_X" => json!("X"),
-                    "SRC_TO_G_ANGLE" => json!("Angle"),
-                    _ => Value::Null,
-                },
-            );
+                    "SRC_TO_X" => Some("X"),
+                    "SRC_TO_G_ANGLE" => Some("Angle"),
+                    _ => None,
+                }
+            };
+            entry.insert("typeToken".into(), json!(token));
+            entry.insert("type".into(), json!(kind));
             entry.insert("weight".into(), number("weight")?);
             entry.insert("reflect".into(), json!(values::bool_field(graph, item, "isReverse", false)?));
             if let Some(vertex) = values::text_field(graph, item, "vertexIndex")? {
@@ -693,7 +706,7 @@ fn view_item(
             if let Some(scale) = values::text_field(graph, item, "angleScale")? {
                 entry.insert("scale".into(), json!(values::finite(scale)?));
             }
-            if !known || (list == "outputs" && token != "SRC_TO_G_ANGLE") {
+            if kind.is_none() || (list == "outputs" && token != "SRC_TO_G_ANGLE") {
                 entry.insert("editable".into(), json!(false));
             }
         }
@@ -1151,11 +1164,8 @@ fn item_scalar(
             patches.push(parameter_leaf_patch(target(field)?, field, guid, guid_objects, inbound)?);
         }
         ("inputs", "type") => {
-            let token = match value.as_str() {
-                Some("X") => "SRC_TO_X",
-                Some("Angle") => "SRC_TO_G_ANGLE",
-                _ => return Err("authoring physics input type must be \"X\" or \"Angle\"".into()),
-            };
+            let token = value.as_str().and_then(input_type_token)
+                .ok_or("authoring physics input type must be \"X\", \"Y\" or \"Angle\"")?;
             patches.push(attribute_leaf_patch(target("type")?, "CPhysicsSourceType", "type", "v", token, inbound)?);
         }
         ("outputs", "type") => {
@@ -1419,11 +1429,8 @@ fn item_insert(
             let guid = by_id
                 .get(source)
                 .ok_or_else(|| format!("authoring physics names unknown parameter {source:?}"))?;
-            let token = match object.get("type").and_then(Value::as_str) {
-                Some("X") => "SRC_TO_X",
-                Some("Angle") => "SRC_TO_G_ANGLE",
-                _ => return Err("inserted physics input type must be \"X\" or \"Angle\"".into()),
-            };
+            let token = object.get("type").and_then(Value::as_str).and_then(input_type_token)
+                .ok_or("inserted physics input type must be \"X\", \"Y\" or \"Angle\"")?;
             let weight = optional_number(object, "weight", 100.0)?;
             if !(0.0..=100.0).contains(&weight) {
                 return Err("inserted physics weight is outside 0..=100".into());
@@ -1585,8 +1592,8 @@ fn check_preset_field(key: &str, value: &Value, index: usize) -> Result<(), Stri
             }
         }
         "type" => {
-            if !matches!(value.as_str(), Some("X" | "Angle")) {
-                return Err("a preset item type must be \"X\" or \"Angle\"".into());
+            if value.as_str().and_then(input_type_token).is_none() {
+                return Err("a preset item type must be \"X\", \"Y\" or \"Angle\"".into());
             }
         }
         "reflect" => {

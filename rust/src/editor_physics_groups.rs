@@ -507,7 +507,7 @@ impl PhysicsGroups {
                 .selected_text(if kind.is_empty() { "unknown" } else { kind })
                 .show_ui(ui, |ui| {
                     ui.add_enabled_ui(enabled, |ui| {
-                        for choice in ["X", "Angle"] {
+                        for choice in ["X", "Y", "Angle"] {
                             if ui.selectable_label(kind == choice, choice).clicked()
                                 && pending.is_none()
                             {
@@ -578,6 +578,38 @@ impl PhysicsGroups {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn physics_y_input_selector_dispatches_all_axes_and_preserves_history() {
+        let mut rig = Rig::new("physics-input-axes", cmo3_physics_bytes());
+        rig.click(Role::Button, "Sway (group 0)");
+        rig.click(Role::Button, "input inputs (1)");
+        for (choice, token) in [("Angle", "SRC_TO_G_ANGLE"), ("X", "SRC_TO_X"), ("Y", "SRC_TO_Y")] {
+            let before = rig.controller.snapshot()["model"].clone();
+            let revision = rig.revision();
+            let output = {
+                let (panel, controller) = (&mut rig.panel, &mut rig.controller);
+                rig.harness.click(Role::ComboBox, "type", |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, controller); });
+                })
+            };
+            let role = output.iter().find(|(_, node)|
+                crate::editor_test_support::name_of(&output, node).as_deref() == Some(choice))
+                .map(|(_, node)| node.role()).unwrap_or_else(|| panic!("missing input choice {choice}"));
+            rig.click(role, choice);
+            rig.draw();
+            assert!(rig.panel.error.is_none(), "{:?}", rig.panel.error);
+            assert_eq!(rig.revision(), revision + 1);
+            assert_eq!(rig.view()["groups"][0]["inputs"][0]["type"], choice);
+            assert_eq!(rig.view()["groups"][0]["inputs"][0]["typeToken"], token);
+            let changed = rig.controller.snapshot()["model"].clone();
+            rig.controller.core_request(&json!({"op":"undo"}));
+            assert_eq!(rig.controller.snapshot()["model"], before);
+            rig.controller.core_request(&json!({"op":"redo"}));
+            assert_eq!(rig.controller.snapshot()["model"], changed);
+            rig.draw();
+        }
+    }
+
     #[test]
     fn remote_quit_physics_drafts_ignore_opened_rows_and_store_operands() {
         let mut groups = super::PhysicsGroups::default();

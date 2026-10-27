@@ -25,7 +25,7 @@ SPEC = importlib.util.spec_from_file_location('oracle', ROOT / 'tools/verify-cmo
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
-TYPES = {'SRC_TO_X': 'X', 'SRC_TO_G_ANGLE': 'Angle'}
+TYPES = {'SRC_TO_X': 'X', 'SRC_TO_Y': 'Y', 'SRC_TO_G_ANGLE': 'Angle'}
 
 
 def derive(xml: bytes) -> dict | None:

@@ -51,6 +51,16 @@ simulation behavior.
 MCP clients use `live2d_physics3_edit` with the current `expectedRevision` and
 `detach: true`. Supply no other edit arguments.
 
+## Choose CMO3 physics input directions
+
+In the Physics groups panel, select an input and choose **X**, **Y** or **Angle**
+in **type**. Choosing the direction applies it immediately. Y drives vertical translation using the
+position normalization range, weight and reflection. You can also insert Y inputs
+and save or apply input presets containing them. Save and reopen the CMO3 to keep
+the authored direction, or export `.physics3.json` and attach it for simulation.
+Outputs remain limited to Angle. Cubism round-trip and visual parity for authored
+Y inputs have not been verified.
+
 ## Final points to check
 
 After you create the basic parameters, check the following:

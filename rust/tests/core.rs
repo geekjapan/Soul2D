@@ -2951,6 +2951,73 @@ fn native_physics_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn physics_y_inputs_edit_export_and_roundtrip_with_shared_history() {
+    let (mut session, revision, before, directory) = physics3_session(native_physics_bytes(), "y-input.cmo3");
+    let source = directory.join("y-input.cmo3");
+    let original = fs::read(&source).unwrap();
+    let edit = |revision, value: Value| json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+        "group":0,"list":"inputs","index":0,"field":"type","value":value});
+    result(&request(&mut session, edit(revision, json!("Y"))));
+    let mut expected = before["model"].clone();
+    expected["physicsSource"] = json!(expected["physicsSource"].as_str().unwrap().replacen("SRC_TO_X", "SRC_TO_Y", 1));
+    assert_eq!(session.snapshot()["model"], expected);
+    assert_eq!(session.snapshot()["revision"], revision + 1);
+    assert_eq!(session.snapshot()["history"]["count"], 1);
+    let view = physics3_read(&mut session);
+    assert_eq!(view["groups"][0]["inputs"][0]["type"], "Y");
+    assert_eq!(view["groups"][0]["inputs"][0]["typeToken"], "SRC_TO_Y");
+    assert_eq!(view["groups"][0]["inputs"][0]["editable"], true);
+    assert_eq!(view["groups"][1]["inputs"][0]["type"], "X");
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(session.snapshot()["model"], before["model"]);
+    result(&request(&mut session, json!({"op":"redo"})));
+    assert_eq!(session.snapshot()["model"], expected);
+    let current = session.snapshot();
+    let revision = current["revision"].as_u64().unwrap();
+    result(&request(&mut session, edit(revision, json!("Y"))));
+    assert_eq!(session.snapshot(), current);
+    for invalid in [edit(revision - 1, json!("X")), edit(revision, json!("Z")), edit(revision, json!(1)),
+        json!({"op":"live2d.physics3.edit","expectedRevision":revision,"group":0,
+            "list":"outputs","index":0,"field":"type","value":"Y"})] {
+        physics3_refuse(&mut session, &current, &invalid);
+    }
+    let settings = directory.join("settings");
+    session.set_config_dir(settings.clone());
+    let preset = result(&request(&mut session, json!({"op":"live2d.physics3.preset.save",
+        "list":"inputs","name":"Vertical","group":0}))).clone();
+    assert_eq!(preset["preset"]["items"][0]["type"], "Y");
+    assert_eq!(session.snapshot(), current);
+    let saved = directory.join("saved.cmo3");
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    let saved_bytes = fs::read(&saved).unwrap();
+    let old = soul2d_core::caff::CaffDocument::parse(&original).unwrap();
+    let new = soul2d_core::caff::CaffDocument::parse(&saved_bytes).unwrap();
+    assert_eq!(String::from_utf8(new.main_xml()).unwrap(),
+        String::from_utf8(old.main_xml()).unwrap().replacen("SRC_TO_X", "SRC_TO_Y", 1));
+    for entry in old.entries().iter().filter(|entry| entry.name != "main.xml") {
+        assert_eq!(old.entry_data(&entry.name), new.entry_data(&entry.name));
+    }
+    let mut reopened = Session::new();
+    reopened.set_config_dir(settings);
+    result(&request(&mut reopened, json!({"op":"open","path":saved})));
+    assert_eq!(reopened.snapshot()["model"], expected);
+    assert_eq!(physics3_read(&mut reopened), view);
+    let presets = result(&request(&mut reopened, json!({"op":"live2d.physics3.preset.list"}))).clone();
+    assert_eq!(presets["inputs"]["Vertical"]["items"][0]["type"], "Y");
+    let target = directory.join("y.physics3.json");
+    let exported = result(&request(&mut reopened, json!({"op":"live2d.physics3.export","path":target}))).clone();
+    assert_eq!(exported["PhysicsSettings"][0]["Input"][0]["Type"], "Y");
+    assert!(exported["PhysicsSettings"][0]["Input"][0].get("Scale").is_none());
+    assert_eq!(serde_json::from_slice::<Value>(&fs::read(&target).unwrap()).unwrap(), exported);
+    result(&request(&mut reopened, json!({"op":"live2d.physics.attach","path":target})));
+    result(&request(&mut reopened, json!({"op":"live2d.physics.stabilize"})));
+    result(&request(&mut reopened, json!({"op":"live2d.physics.step","dt":1.0/60.0})));
+    assert_eq!(reopened.snapshot()["model"], expected);
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn physics3_edit_persists_full_precision_and_distinguishes_twin_groups() {
     let directory = temp_dir();
     let source = directory.join("sway.cmo3");
@@ -3186,7 +3253,7 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
         let group = json!({"name":"First & only", "normalization":{
             "position":{"min":-10.0,"default":0.0,"max":10.0}, "angle":{"min":-30.0,"default":0.0,"max":30.0}},
-            "inputs":[{"source":"ParamTest","type":"X"}], "outputs":[{"destination":"ParamTest","vertexIndex":1}],
+            "inputs":[{"source":"ParamTest","type":"Y"}], "outputs":[{"destination":"ParamTest","vertexIndex":1}],
             "vertices":physics3_vertices(0.800001, 6.0)});
         let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call", "params":{
             "name":"live2d_physics3_edit", "arguments":{"expectedRevision":revision,"insert":0,"value":group}}});
@@ -3210,6 +3277,8 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         assert_eq!(view["groups"][0]["name"], group["name"]);
         assert_eq!(view["groups"][0]["normalization"], group["normalization"]);
         assert_eq!(view["groups"][0]["inputs"][0]["source"], "ParamTest");
+        assert_eq!(view["groups"][0]["inputs"][0]["type"], "Y");
+        assert_eq!(view["groups"][0]["inputs"][0]["typeToken"], "SRC_TO_Y");
         assert_eq!(view["groups"][0]["outputs"][0]["vertexIndex"], 1);
         assert_eq!(view["groups"][0]["vertices"][1]["delay"], 0.800001);
         result(&request(&mut session, json!({"op":"undo"})));
@@ -3496,14 +3565,15 @@ fn physics3_presets_are_saved_from_a_group_and_applied_in_one_undo_step() {
     // The inputs of a group are another kind of preset: a second input is inserted into group 1.
     let pair = json!([
         {"source": "ParamTest", "type": "X", "weight": 50.0, "reflect": false, "scale": 10.0},
-        {"source": "ParamTest", "type": "Angle", "weight": 25.0, "reflect": true, "scale": 5.0}
+        {"source": "ParamTest", "type": "Y", "weight": 25.0, "reflect": true, "scale": 5.0}
     ]);
     physics3_save(&mut session, "inputs", "Pair", pair);
     physics3_apply(&mut session, 1, "inputs", "Pair");
     let view = physics3_read(&mut session);
     let inputs = view["groups"][1]["inputs"].as_array().unwrap();
     assert_eq!(inputs.len(), 2);
-    assert_eq!(inputs[1]["type"], "Angle");
+    assert_eq!(inputs[1]["type"], "Y");
+    assert_eq!(inputs[1]["typeToken"], "SRC_TO_Y");
     assert_eq!(inputs[1]["weight"].as_f64(), Some(25.0));
     assert_eq!(inputs[1]["reflect"], true);
     assert_eq!(inputs[1]["scale"].as_f64(), Some(5.0));
