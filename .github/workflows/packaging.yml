@@ -39,7 +39,7 @@ permissions:
 
 concurrency:
   group: packaging-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   APP_ID: io.github.geekjapan.soul2d

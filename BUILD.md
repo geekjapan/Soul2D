@@ -194,6 +194,8 @@ subsystem so its existing stdin/stdout MCP entry remains available.
 
 ### Packaging checks
 
+Packaging runs already in progress finish before the latest pending run starts.
+
 `.github/workflows/packaging.yml` runs on changes to what the packages are assembled from: `build-aux/`,
 `tools/`, `rust/Cargo.*`, the translations (`tl/`, `gentl.sh`), `res/`, the notices (`LICENSE`,
 `THIRD_PARTY.md`, `doc/licenses/`) and the workflow itself. It does not run on changes to `rust/src`;
