@@ -51,13 +51,16 @@ and the exact raw ID to edit its value. Guide requires the complete supported ow
 with consistent inline key/cache storage. `live2d_animation_key_add` and `live2d_animation_key_delete` also
 accept Image/Guide channels. Added keys use the requested type (default `LINEAR`) and controls at the anchor.
 Deleting the final key retains the immutable template's extrema and base value. Image channels reject
-`partOpacityMapKey`; Guide channels reject it too. Image handle and existing interpolation-type edits, and integer-channel edits, remain unsupported.
-Guide scalar handles/types use the existing tools without a Part selector and require complete supported
-ownership. Only requested control frame/value leaves or stored type change, with cache invalidation.
+`partOpacityMapKey`; Guide channels reject it too. Integer-channel edits remain unsupported.
+Image/Guide scalar handles/types use the existing tools without a Part selector. Image requires owned
+list/map/named-field and sequence references; Guide requires complete supported ownership.
+Only requested control frame/value leaves or stored type change, with cache invalidation.
 Integer positions, optimization/corner flags, anchors/extrema and other channels stay unchanged.
 Recreated and new keys retain canonical protected fields after later handle/type edits. This is stored-field
 authoring; the four vendor inputs have one scalar key per channel and do not prove multi-key interpolation
-or Guide playback equivalence.
+or Image/Guide playback equivalence. New float scalar writes must fit finite 32-bit storage;
+the existing raw decimal handling is otherwise unchanged. Dedicated Image/Guide handle/type editor
+controls remain unverified.
 Read back, undo/redo and save/reopen.
 
 Image and Guide `pointChannels` list readable `xy` and `anchor` channels with `id` and
@@ -185,8 +188,8 @@ other open creation drafts remain intact and become stale when the document revi
 | `live2d_animation_track_add` | `{sceneGuid, resourceGuid, name, expectedRevision}` adds an empty model track. |
 | `live2d_animation_track_duplicate` | `{sceneGuid, trackGuid, name, expectedRevision}` copies an owned Image, supported Guide or supported Sound track, preserving its stored keys, caches and linked resource. Returns the new `trackGuid`. |
 | `live2d_animation_track_delete` | `{sceneGuid, trackGuid, expectedRevision}` deletes an owned Model, Image, supported Sound or supported GuideImage track, retaining linked resources and shared identities. Read IDs from `tracks`, `imageTracks`, `soundTracks` or `guideTracks`. Local FormEdit data supports distinct shared keyforms and frames with matching time-remapping links and caches; empty inline keyforms with exclusively owned dummy remapping attributes and sparse maps are also supported. Foreign parameter-group frame-step attributes are preserved; same-owner attributes use ordinary ownership checks. Global maps, nonempty inline keyforms and outside references into deleted storage are refused. Sound requires one SoundDefault effect and one fixed volume attribute. GuideImage requires VisualDefault and GuideImageDefault with eleven owned attributes, including separate list and named image-number attributes. Guide directories are never opened. Sound/Guide creation and playback, Sound key/volume edits remain unsupported. |
-| `live2d_animation_handle_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, side, expectedRevision}` plus at least one of `frame`, `value`; Model or supported Guide scalar only. Guide rejects the Part selector. |
-| `live2d_animation_curve_type_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, type, expectedRevision}`; Model or supported Guide scalar only. Guide rejects the Part selector. |
+| `live2d_animation_handle_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, side, expectedRevision}` plus at least one of `frame`, `value`; Model or supported Image/Guide scalar. Image/Guide reject the Part selector. |
+| `live2d_animation_curve_type_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, type, expectedRevision}`; Model or supported Image/Guide scalar. Image/Guide reject the Part selector. |
 | `live2d_animation_scene_set` | `{sceneGuid, expectedRevision}` plus at least one of `name`, `fps`, `durationFrames`, `loop`, `tag` |
 | `live2d_animation_scene_delete` | `{sceneGuid, expectedRevision}` deletes an owned scene with supported Model, Image, Sound and Guide tracks, including parameter curves, all three PartOpacity families and supported shared-keyform FormEdit data. Unsupported raw members and shared, aliased, nested shared or externally referenced target storage are refused; inline unshared Part inheritance is supported. Unrelated surviving scenes are preserved. The last scene may be deleted when no stored `currentScene` needs a surviving target; otherwise deletion is refused. Linked model, image, sound and guide-directory resources remain. Guide tracks use the same strict layout checks as track deletion. |
 | `live2d_animation_scene_add` | `{name, fps, durationFrames, expectedRevision}`; where the last scene shows `scene.tag`, the new scene shows a copy of it. |

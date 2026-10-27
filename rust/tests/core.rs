@@ -5837,6 +5837,12 @@ fn can3_keys_are_edited_with_float_handle_frames_and_caches_as_cubism_files_stor
         .replace(r#"</d><d xs.n="doubleValue">"#, r#"</f><d xs.n="doubleValue">"#)
         .replace(r#"<d xs.n="curMin">0</d><d xs.n="curMax">1</d>"#, cache);
     let (mut session, _) = can3_key_fixture_session(&directory, &xml);
+    let before = session.snapshot();
+    let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+    let edit = can3_key_edit(&session, "live2d.animation.handle.set", json!({"anchorFrame":20, "side":"next", "frame":1e300}));
+    assert_eq!(request(&mut session, edit)["succeeded"], false);
+    assert_eq!(session.snapshot(), before);
+    assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
     let edit = can3_key_edit(&session, "live2d.animation.handle.set", json!({"anchorFrame":0, "side":"next", "frame":4.5}));
     result(&request(&mut session, edit));
     let saved = directory.join("handle.can3");
@@ -12091,10 +12097,18 @@ fn can3_image_points_and_scalar_edits_keep_copy_time_values() {
     let revision = session.snapshot()["revision"].clone();
     result(&request(&mut session, json!({"op":"live2d.animation.key.set","sceneGuid":"scene-guid",
         "trackGuid":"image-track-guid","curveId":"opacity","anchorFrame":0,"value":11.0,"expectedRevision":revision})));
+    let control = |session: &mut Session, track: &str, value| {
+        let body = can3_key_edit(session, "live2d.animation.handle.set", json!({"trackGuid":track,
+            "curveId":"opacity","anchorFrame":0,"side":"previous","value":value}));
+        result(&request(session, body)).clone()
+    };
+    control(&mut session, "image-track-guid", 7.25);
     let first = copy(&mut session, "image-track-guid");
     set(&mut session, "image-track-guid", 25.0);
+    control(&mut session, "image-track-guid", 99.0);
     let second = copy(&mut session, &first);
     set(&mut session, &first, 30.0);
+    control(&mut session, &first, 17.0);
     let revision = session.snapshot()["revision"].clone();
     result(&request(&mut session, json!({"op":"live2d.animation.track.delete","sceneGuid":"scene-guid",
         "trackGuid":"image-track-guid","expectedRevision":revision})));
@@ -12105,12 +12119,13 @@ fn can3_image_points_and_scalar_edits_keep_copy_time_values() {
         let track = tracks.iter().find(|track| track["guid"] == *guid).unwrap();
         assert_eq!(track["pointChannels"][0]["points"][0]["x"], x);
         assert_eq!(track["visualCurves"][0]["points"][0]["anchor"]["value"], 11.0);
+        assert_eq!(track["visualCurves"][0]["points"][0]["previous"]["value"], if guid == &first { 17.0 } else { 7.25 });
     }
-    for _ in 0..7 { result(&request(&mut session, json!({"op":"undo"}))); }
+    for _ in 0..10 { result(&request(&mut session, json!({"op":"undo"}))); }
     let undone = directory.join("undone.can3");
     result(&request(&mut session, json!({"op":"save","path":undone,"mark_saved":false})));
     assert_eq!(fs::read(undone).unwrap(), original);
-    for _ in 0..7 { result(&request(&mut session, json!({"op":"redo"}))); }
+    for _ in 0..10 { result(&request(&mut session, json!({"op":"redo"}))); }
     let saved = directory.join("copies.can3");
     result(&request(&mut session, json!({"op":"save","path":saved})));
     result(&request(&mut session, json!({"op":"open","path":saved})));
@@ -12119,7 +12134,7 @@ fn can3_image_points_and_scalar_edits_keep_copy_time_values() {
 }
 
 #[test]
-fn can3_image_scalar_keys_set_values_without_enabling_other_curve_edits() {
+fn can3_image_scalar_keys_set_values_preserve_native_data() {
     for (id, named) in [("scalex", "attrScaleX"), ("scaley", "attrScaleY"), ("rotate", "attrRotate"),
         ("shear", "attrShear"), ("opacity", "attrOpacity"), ("artPathWidth", "attrArtPathWidth")] {
         let directory = temp_dir();
@@ -12136,16 +12151,6 @@ fn can3_image_scalar_keys_set_values_without_enabling_other_curve_edits() {
         let unchanged = session.snapshot();
         result(&request(&mut session, call(unchanged["revision"].clone())));
         assert_eq!(session.snapshot(), unchanged);
-        for (op, extra) in [
-            ("live2d.animation.handle.set", json!({"side":"next","value":26})),
-            ("live2d.animation.curve_type.set", json!({"type":"BEZIER"})),
-        ] {
-            let mut request_body = call(unchanged["revision"].clone());
-            request_body["op"] = json!(op);
-            request_body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            assert_eq!(request(&mut session, request_body)["succeeded"], false);
-            assert_eq!(session.snapshot(), unchanged);
-        }
         result(&request(&mut session, json!({"op":"undo"})));
         let restored = directory.join("restored.can3");
         result(&request(&mut session, json!({"op":"save","path":restored,"mark_saved":false})));
@@ -12320,10 +12325,15 @@ fn can3_image_scalar_keys_refuse_unowned_storage_atomically() {
         let before = session.snapshot();
         let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
         for (op, frame) in [("live2d.animation.key.set", 0), ("live2d.animation.key.add", 10),
-            ("live2d.animation.key.delete", 0)] {
+            ("live2d.animation.key.delete", 0), ("live2d.animation.handle.set", 0), ("live2d.animation.curve_type.set", 0)] {
             let mut body = json!({"op":op,"sceneGuid":"scene-guid","trackGuid":"image-track-guid",
                 "curveId":"opacity","anchorFrame":frame,"expectedRevision":before["revision"]});
-            if op != "live2d.animation.key.delete" { body["value"] = json!(25); }
+            match op {
+                "live2d.animation.handle.set" => { body["side"] = json!("next"); body["value"] = json!(25); }
+                "live2d.animation.curve_type.set" => body["type"] = json!("STEP"),
+                "live2d.animation.key.delete" => {}
+                _ => body["value"] = json!(25),
+            }
             let reply = request(&mut session, body);
             assert_eq!(reply["succeeded"], false, "{reply}");
             assert_eq!(session.snapshot(), before);
@@ -12353,10 +12363,22 @@ fn can3_image_key_structure_composes_with_pending_copies_and_donor_deletion() {
             "name":"Key copy","expectedRevision":session.snapshot()["revision"]});
         result(&request(session, body))["trackGuid"].as_str().unwrap().to_owned()
     };
+    let controls = |session: &mut Session, track: &str, frame, value, kind| {
+        for (op, extra) in [("live2d.animation.handle.set", json!({"side":"next","value":value})),
+            ("live2d.animation.curve_type.set", json!({"type":kind}))] {
+            let mut body = can3_key_edit(session, op, json!({"trackGuid":track,"curveId":"opacity","anchorFrame":frame}));
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            result(&request(session, body));
+        }
+    };
     edit(&mut session, "image-track-guid", 10, Some(30.0));
+    controls(&mut session, "image-track-guid", 10, 31.0, "STEP");
     let first = copy(&mut session, "image-track-guid");
     edit(&mut session, "image-track-guid", 0, None);
+    edit(&mut session, "image-track-guid", 0, Some(15.0));
+    controls(&mut session, "image-track-guid", 0, 16.0, "BEZIER");
     edit(&mut session, &first, 5, Some(25.0));
+    controls(&mut session, &first, 5, 26.0, "BEZIER");
     let second = copy(&mut session, &first);
     edit(&mut session, &first, 10, None);
     let body = json!({"op":"live2d.animation.track.delete","sceneGuid":"scene-guid","trackGuid":"image-track-guid",
@@ -12369,12 +12391,18 @@ fn can3_image_key_structure_composes_with_pending_copies_and_donor_deletion() {
         let track = tracks.iter().find(|t| t["guid"] == *guid).unwrap();
         assert_eq!(track["visualCurves"][0]["points"].as_array().unwrap().iter()
             .map(|p| p["anchor"]["frame"].as_i64().unwrap()).collect::<Vec<_>>(), frames);
+        assert_eq!(track["visualCurves"][0]["points"][1]["next"]["value"], 26.0);
+        assert_eq!(track["visualCurves"][0]["curveTypes"][1], "BEZIER");
+        if guid == &second {
+            assert_eq!(track["visualCurves"][0]["points"][2]["next"]["value"], 31.0);
+            assert_eq!(track["visualCurves"][0]["curveTypes"][2], "STEP");
+        }
     }
-    for _ in 0..7 { result(&request(&mut session, json!({"op":"undo"}))); }
+    for _ in 0..14 { result(&request(&mut session, json!({"op":"undo"}))); }
     let restored = directory.join("restored.can3");
     result(&request(&mut session, json!({"op":"save","path":restored,"mark_saved":false})));
     assert_eq!(fs::read(restored).unwrap(), original);
-    for _ in 0..7 { result(&request(&mut session, json!({"op":"redo"}))); }
+    for _ in 0..14 { result(&request(&mut session, json!({"op":"redo"}))); }
     let saved = directory.join("copies.can3");
     result(&request(&mut session, json!({"op":"save","path":saved})));
     result(&request(&mut session, json!({"op":"open","path":saved})));
@@ -13358,129 +13386,145 @@ fn can3_guide_points_and_scalar_edits_keep_copy_time_values() {
 }
 
 #[test]
-fn can3_guide_controls_preserve_native_fields_and_history() {
-    for (index, id) in ["scalex", "scaley", "rotate", "shear", "opacity", "artPathWidth"].into_iter().enumerate() {
-        let directory = temp_dir();
-        let xml = can3_guide_key_xml(1);
-        let (mut session, source) = can3_key_fixture_session(&directory, &xml);
-        let original = fs::read(&source).unwrap();
-        let mut expected = session.snapshot()["model"].clone();
-        let edit = |session: &mut Session, op: &str, extra: Value| {
-            let mut body = can3_key_edit(session, op, json!({"trackGuid":"guide-guid-0","curveId":id,"anchorFrame":-3}));
-            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            result(&request(session, body)).clone()
-        };
-        edit(&mut session, "live2d.animation.handle.set", json!({"side":"previous","frame":-4.5,"value":7.25}));
-        edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":-1.5,"value":null}));
-        edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":null,"value":13.5}));
-        for kind in ["SMOOTH", "BEZIER", "LINEAR", "STEP"] {
-            edit(&mut session, "live2d.animation.curve_type.set", json!({"type":kind}));
+fn can3_visual_controls_preserve_native_fields_and_history() {
+    for (family, track_guid, anchor) in [("guideTracks", "guide-guid-0", -3), ("imageTracks", "image-track-guid", 0)] {
+        for (index, (id, named)) in [("scalex", "attrScaleX"), ("scaley", "attrScaleY"), ("rotate", "attrRotate"),
+            ("shear", "attrShear"), ("opacity", "attrOpacity"), ("artPathWidth", "attrArtPathWidth")].into_iter().enumerate() {
+            let directory = temp_dir();
+            let xml = if family == "guideTracks" { can3_guide_key_xml(1) } else { can3_visual_key_xml(id, named) };
+            let attribute_id = if family == "guideTracks" { format!("guide-{id}-0") } else { "image-opacity".into() };
+            let previous = f64::from(anchor) - 1.5;
+            let next = f64::from(anchor) + 1.5;
+            let (mut session, source) = can3_key_fixture_session(&directory, &xml);
+            let original = fs::read(&source).unwrap();
+            let before = session.snapshot();
+            let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+            let body = can3_key_edit(&session, "live2d.animation.handle.set", json!({"trackGuid":track_guid,
+                "curveId":id,"anchorFrame":anchor,"side":"next","frame":1e300}));
+            assert_eq!(request(&mut session, body)["succeeded"], false);
+            assert_eq!(session.snapshot(), before);
+            assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
+            let mut expected = session.snapshot()["model"].clone();
+            let edit = |session: &mut Session, op: &str, extra: Value| {
+                let mut body = can3_key_edit(session, op, json!({"trackGuid":track_guid,"curveId":id,"anchorFrame":anchor}));
+                body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                result(&request(session, body)).clone()
+            };
+            edit(&mut session, "live2d.animation.handle.set", json!({"side":"previous","frame":previous,"value":7.25}));
+            edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":next,"value":null}));
+            edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":null,"value":13.5}));
+            for kind in ["SMOOTH", "BEZIER", "LINEAR", "STEP"] {
+                edit(&mut session, "live2d.animation.curve_type.set", json!({"type":kind}));
+            }
+            let curve = &mut expected["scenes"][0][family][0]["visualCurves"][if family == "guideTracks" { index } else { 0 }];
+            curve["points"][0]["previous"]["frame"] = json!(previous);
+            curve["points"][0]["previous"]["value"] = json!(7.25);
+            curve["points"][0]["next"]["frame"] = json!(next);
+            curve["points"][0]["next"]["value"] = json!(13.5);
+            curve["curveTypes"][0] = json!("STEP");
+            assert_eq!(session.snapshot()["model"], expected);
+            let before_noop = session.snapshot();
+            let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+            edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":next,"value":13.5}));
+            edit(&mut session, "live2d.animation.curve_type.set", json!({"type":"STEP"}));
+            assert_eq!(session.snapshot(), before_noop);
+            assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
+            let saved = directory.join("controls.can3");
+            result(&request(&mut session, json!({"op":"save","path":saved,"mark_saved":false})));
+            let parsed = roxmltree::Document::parse(&xml).unwrap();
+            let attribute = parsed.descendants().find(|n| n.attribute("xs.id") == Some(attribute_id.as_str())).unwrap();
+            let old = &xml[attribute.range()];
+            let mut changed = old.to_owned();
+            for (side, frame, value) in [("prev", previous, "7.25"), ("next", next, "13.5")] {
+                let control = attribute.descendants().find(|n| n.has_tag_name("CBezierCtrlPt") && n.attribute("xs.n") == Some(side)).unwrap();
+                let raw = &xml[control.range()];
+                changed = changed.replace(raw, &raw.replace(&format!("<f xs.n=\"posF\">{anchor}.0</f>"), &format!("<f xs.n=\"posF\">{frame}</f>"))
+                    .replace("<d xs.n=\"doubleValue\">10.0</d>", &format!("<d xs.n=\"doubleValue\">{value}</d>")));
+            }
+            changed = changed.replace("<CCurveType v=\"LINEAR\"/>", "<CCurveType v=\"STEP\"/>")
+                .replace("<int-array xs.n=\"keyPts2\" count=\"1\">0</int-array>", "<null xs.n=\"keyPts2\" />")
+                .replace("<d xs.n=\"lastValue\">10.0</d>", "<d xs.n=\"lastValue\">NaN</d>")
+                .replace("<i xs.n=\"lastPos\">0</i>", "<i xs.n=\"lastPos\">-1</i>");
+            assert_eq!(saved_main_xml(&saved), xml.replace(old, &changed));
+            let final_bytes = fs::read(&saved).unwrap();
+            for _ in 0..7 { result(&request(&mut session, json!({"op":"undo"}))); }
+            let undone = directory.join("undone.can3");
+            result(&request(&mut session, json!({"op":"save","path":undone,"mark_saved":false})));
+            assert_eq!(fs::read(undone).unwrap(), original);
+            for _ in 0..7 { result(&request(&mut session, json!({"op":"redo"}))); }
+            let repeated = directory.join("repeated.can3");
+            result(&request(&mut session, json!({"op":"save","path":repeated,"mark_saved":false})));
+            assert_eq!(fs::read(repeated).unwrap(), final_bytes);
+            result(&request(&mut session, json!({"op":"open","path":saved})));
+            assert_eq!(session.snapshot()["model"], expected);
+            assert_eq!(fs::read(source).unwrap(), original);
+            fs::remove_dir_all(directory).unwrap();
         }
-        let curve = &mut expected["scenes"][0]["guideTracks"][0]["visualCurves"][index];
-        curve["points"][0]["previous"]["frame"] = json!(-4.5);
-        curve["points"][0]["previous"]["value"] = json!(7.25);
-        curve["points"][0]["next"]["frame"] = json!(-1.5);
-        curve["points"][0]["next"]["value"] = json!(13.5);
-        curve["curveTypes"][0] = json!("STEP");
-        assert_eq!(session.snapshot()["model"], expected);
-        let before_noop = session.snapshot();
-        let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
-        edit(&mut session, "live2d.animation.handle.set", json!({"side":"next","frame":-1.5,"value":13.5}));
-        edit(&mut session, "live2d.animation.curve_type.set", json!({"type":"STEP"}));
-        assert_eq!(session.snapshot(), before_noop);
-        assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
-        let saved = directory.join("controls.can3");
-        result(&request(&mut session, json!({"op":"save","path":saved,"mark_saved":false})));
-        let parsed = roxmltree::Document::parse(&xml).unwrap();
-        let attribute = parsed.descendants().find(|n| n.attribute("xs.id") == Some(format!("guide-{id}-0").as_str())).unwrap();
-        let old = &xml[attribute.range()];
-        let mut changed = old.to_owned();
-        for (side, frame, value) in [("prev", "-4.5", "7.25"), ("next", "-1.5", "13.5")] {
-            let control = attribute.descendants().find(|n| n.has_tag_name("CBezierCtrlPt") && n.attribute("xs.n") == Some(side)).unwrap();
-            let raw = &xml[control.range()];
-            changed = changed.replace(raw, &raw.replace("<f xs.n=\"posF\">-3.0</f>", &format!("<f xs.n=\"posF\">{frame}</f>"))
-                .replace("<d xs.n=\"doubleValue\">10.0</d>", &format!("<d xs.n=\"doubleValue\">{value}</d>")));
-        }
-        changed = changed.replace("<CCurveType v=\"LINEAR\"/>", "<CCurveType v=\"STEP\"/>")
-            .replace("<int-array xs.n=\"keyPts2\" count=\"1\">0</int-array>", "<null xs.n=\"keyPts2\" />")
-            .replace("<d xs.n=\"lastValue\">10.0</d>", "<d xs.n=\"lastValue\">NaN</d>")
-            .replace("<i xs.n=\"lastPos\">0</i>", "<i xs.n=\"lastPos\">-1</i>");
-        assert_eq!(saved_main_xml(&saved), xml.replace(old, &changed));
-        let final_bytes = fs::read(&saved).unwrap();
-        for _ in 0..7 { result(&request(&mut session, json!({"op":"undo"}))); }
-        let undone = directory.join("undone.can3");
-        result(&request(&mut session, json!({"op":"save","path":undone,"mark_saved":false})));
-        assert_eq!(fs::read(undone).unwrap(), original);
-        for _ in 0..7 { result(&request(&mut session, json!({"op":"redo"}))); }
-        let repeated = directory.join("repeated.can3");
-        result(&request(&mut session, json!({"op":"save","path":repeated,"mark_saved":false})));
-        assert_eq!(fs::read(repeated).unwrap(), final_bytes);
-        result(&request(&mut session, json!({"op":"open","path":saved})));
-        assert_eq!(session.snapshot()["model"], expected);
-        assert_eq!(fs::read(source).unwrap(), original);
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
 #[test]
-fn can3_guide_controls_preserve_segment_policy_and_atomic_refusals() {
-    let mut xml = can3_guide_key_xml(1);
-    let shaped = shaped_can3_xml();
-    let parsed = roxmltree::Document::parse(&shaped).unwrap();
-    let sequence = parsed.descendants().find(|n| n.has_tag_name("CMutableSequence")).unwrap();
-    let replacement = shaped[sequence.range()].replace("xs.ref=\"attr\"", "xs.ref=\"guide-opacity-0\"");
-    let parsed = roxmltree::Document::parse(&xml).unwrap();
-    let attribute = parsed.descendants().find(|n| n.attribute("xs.id") == Some("guide-opacity-0")).unwrap();
-    let range = attribute.children().find(|n| n.has_tag_name("CMutableSequence")).unwrap().range();
-    xml.replace_range(range, &replacement);
-    let directory = temp_dir();
-    let (mut session, source) = can3_key_fixture_session(&directory, &xml);
-    let before = session.snapshot();
-    let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
-    let original = fs::read(&source).unwrap();
-    for (op, frame, extra) in [
-        ("live2d.animation.handle.set", 0, json!({"side":"next","frame":11})),
-        ("live2d.animation.handle.set", 10, json!({"side":"previous","frame":2})),
-        ("live2d.animation.curve_type.set", 10, json!({"type":"BEZIER"})),
-        ("live2d.animation.handle.set", 0, json!({"side":"next","frame":null,"value":null})),
-        ("live2d.animation.handle.set", 0, json!({"side":"invalid","value":1})),
-        ("live2d.animation.handle.set", 0, json!({"side":"next","value":"NaN"})),
-        ("live2d.animation.handle.set", 4, json!({"side":"next","value":1})),
-        ("live2d.animation.handle.set", 0, json!({"side":"next","value":1,"partOpacityMapKey":null})),
-        ("live2d.animation.handle.set", 0, json!({"side":"next","value":1,"expectedRevision":999})),
-        ("live2d.animation.curve_type.set", 0, json!({"type":"CUBIC"})),
-        ("live2d.animation.handle.set", 0, json!({"trackGuid":"image-track-guid","side":"next","value":1})),
-        ("live2d.animation.curve_type.set", 0, json!({"trackGuid":"sound-guid-0","type":"STEP"})),
-    ] {
-        let mut body = can3_key_edit(&session, op, json!({"trackGuid":"guide-guid-0","curveId":"opacity","anchorFrame":frame}));
-        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        assert_eq!(request(&mut session, body)["succeeded"], false, "{op} {frame} {extra}");
-        assert_eq!(session.snapshot(), before);
-        assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
-    }
-    for (op, frame, extra) in [
-        ("live2d.animation.handle.set", 0, json!({"side":"next","frame":4.5})),
-        ("live2d.animation.handle.set", 0, json!({"side":"previous","frame":-5.5})),
-        ("live2d.animation.handle.set", 20, json!({"side":"next","frame":25.5})),
-        ("live2d.animation.curve_type.set", 20, json!({"type":"SMOOTH"})),
-    ] {
-        let mut body = can3_key_edit(&session, op, json!({"trackGuid":"guide-guid-0","curveId":"opacity","anchorFrame":frame}));
-        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+fn can3_visual_controls_preserve_segment_policy_and_atomic_refusals() {
+    for (family, track_guid, attribute_id) in [("Guide", "guide-guid-0", "guide-opacity-0"),
+        ("Image", "image-track-guid", "image-opacity")] {
+        let mut xml = if family == "Guide" { can3_guide_key_xml(1) } else { can3_visual_key_xml("opacity", "attrOpacity") };
+        let shaped = shaped_can3_xml();
+        let parsed = roxmltree::Document::parse(&shaped).unwrap();
+        let sequence = parsed.descendants().find(|n| n.has_tag_name("CMutableSequence")).unwrap();
+        let replacement = shaped[sequence.range()].replace("xs.ref=\"attr\"", &format!("xs.ref=\"{attribute_id}\""));
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let attribute = parsed.descendants().find(|n| n.attribute("xs.id") == Some(attribute_id)).unwrap();
+        let range = attribute.children().find(|n| n.has_tag_name("CMutableSequence")).unwrap().range();
+        xml.replace_range(range, &replacement);
+        let directory = temp_dir();
+        let (mut session, source) = can3_key_fixture_session(&directory, &xml);
+        let before = session.snapshot();
+        let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+        let original = fs::read(&source).unwrap();
+        for (op, frame, extra) in [
+            ("live2d.animation.handle.set", 0, json!({"side":"next","frame":11})),
+            ("live2d.animation.handle.set", 10, json!({"side":"previous","frame":2})),
+            ("live2d.animation.curve_type.set", 10, json!({"type":"BEZIER"})),
+            ("live2d.animation.handle.set", 0, json!({"side":"next","frame":null,"value":null})),
+            ("live2d.animation.handle.set", 0, json!({"side":"invalid","value":1})),
+            ("live2d.animation.handle.set", 0, json!({"side":"next","value":"NaN"})),
+            ("live2d.animation.handle.set", 4, json!({"side":"next","value":1})),
+            ("live2d.animation.handle.set", 0, json!({"side":"next","value":1,"partOpacityMapKey":null})),
+            ("live2d.animation.handle.set", 0, json!({"side":"next","value":1,"expectedRevision":999})),
+            ("live2d.animation.curve_type.set", 0, json!({"type":"CUBIC"})),
+            ("live2d.animation.handle.set", 0, json!({"trackGuid":"sound-guid-0","side":"next","value":1})),
+            ("live2d.animation.curve_type.set", 0, json!({"trackGuid":"sound-guid-0","type":"STEP"})),
+        ] {
+            let mut body = can3_key_edit(&session, op, json!({"trackGuid":track_guid,"curveId":"opacity","anchorFrame":frame}));
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            assert_eq!(request(&mut session, body)["succeeded"], false, "{op} {frame} {extra}");
+            assert_eq!(session.snapshot(), before);
+            assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
+        }
+        for (op, frame, extra) in [
+            ("live2d.animation.handle.set", 0, json!({"side":"next","frame":4.5})),
+            ("live2d.animation.handle.set", 0, json!({"side":"previous","frame":-5.5})),
+            ("live2d.animation.handle.set", 20, json!({"side":"next","frame":25.5})),
+            ("live2d.animation.curve_type.set", 20, json!({"type":"SMOOTH"})),
+        ] {
+            let mut body = can3_key_edit(&session, op, json!({"trackGuid":track_guid,"curveId":"opacity","anchorFrame":frame}));
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            result(&request(&mut session, body));
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let stale = xml.replace("<CCurveType v=\"LINEAR\"/>", "<CCurveType v=\"SMOOTH\"/>")
+            .replace("<d xs.n=\"curMax\">1</d>", "<d xs.n=\"curMax\">2</d>");
+        let stale_path = directory.join("stale.can3");
+        fs::write(&stale_path, authoring_bytes(&stale)).unwrap();
+        result(&request(&mut session, json!({"op":"open","path":stale_path})));
+        let body = can3_key_edit(&session, "live2d.animation.handle.set", json!({"trackGuid":track_guid,
+            "curveId":"opacity","anchorFrame":10,"side":"next","value":0.9}));
         result(&request(&mut session, body));
+        let saved = directory.join("stale-edited.can3");
+        result(&request(&mut session, json!({"op":"save","path":saved})));
+        assert!(saved_main_xml(&saved).contains("<d xs.n=\"curMax\">2</d>"));
+        fs::remove_dir_all(directory).unwrap();
     }
-    assert_eq!(fs::read(&source).unwrap(), original);
-    let stale = xml.replace("<CCurveType v=\"LINEAR\"/>", "<CCurveType v=\"SMOOTH\"/>")
-        .replace("<d xs.n=\"curMax\">1</d>", "<d xs.n=\"curMax\">2</d>");
-    let stale_path = directory.join("stale.can3");
-    fs::write(&stale_path, authoring_bytes(&stale)).unwrap();
-    result(&request(&mut session, json!({"op":"open","path":stale_path})));
-    let body = can3_key_edit(&session, "live2d.animation.handle.set", json!({"trackGuid":"guide-guid-0",
-        "curveId":"opacity","anchorFrame":10,"side":"next","value":0.9}));
-    result(&request(&mut session, body));
-    let saved = directory.join("stale-edited.can3");
-    result(&request(&mut session, json!({"op":"save","path":saved})));
-    assert!(saved_main_xml(&saved).contains("<d xs.n=\"curMax\">2</d>"));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

@@ -131,8 +131,9 @@ Deleting the last key retains the immutable template's extrema and base value an
 invalidates stored evaluation caches. Adding then deleting a key before saving can
 restore the original bytes; saving and reopening between these edits establishes a
 new template, so inverse edits need not restore the earlier extrema.
-Image handle and existing interpolation-type edits, and integer-channel edits, remain
-unsupported. Unrelated native data is preserved. No Image playback equivalence is claimed.
+Image and Guide scalar channels also accept existing handle and interpolation-type edits.
+Integer-channel edits remain unsupported. Unrelated native data is preserved.
+No Image playback equivalence is claimed.
 
 Image and Guide `pointChannels` list readable `xy` and `anchor` channels, each with `id` and
 `points: [{frame, x, y, corner}]`. Unsupported or malformed siblings are omitted;
@@ -286,13 +287,21 @@ scenes of the four supplied projects do: 15 with text, 34 empty) and refused els
 clears it. `live2d_animation_scene_add` shows a copy of the document's last scene's tag on the new
 scene, since save copies a stored scene, tag included; no measured rule resets it.
 `live2d_animation_handle_set` and `live2d_animation_curve_type_set` move one control handle and set
-one segment's curve type (ANI08). Guide visualCurves also accept these operations for the six
-supported scalar IDs, without a Part selector. Complete Guide ownership is required. Only the
+one segment's curve type (ANI08). Image and Guide visualCurves also accept these operations for the six
+supported scalar IDs, without a Part selector. Image requires consistent owned list/map/named-field
+and sequence references; Guide requires complete supported track ownership. Only the
 requested control frame/value leaves or stored type change, with evaluation-cache invalidation;
 anchor values/extrema, integer control positions, optimization/corner flags and other channels stay.
 The existing segment check runs when the prior affected segment was valid. Endpoint controls and
 the final stored type are editable without an interval. Same-frame canonical recreation and new
-keys can receive later handle/type edits before saving. Image and Sound controls remain unsupported.
+keys can receive later handle/type edits before saving. New float scalar writes that overflow finite
+32-bit storage are refused; existing raw scalar units and decimal tokens otherwise retain their current
+handling. Sound controls remain unsupported. Dedicated Image/Guide handle/type editor controls and
+Cubism playback equivalence remain unverified.
+`python3 -I tools/verify-can3-image-controls.py --core ./out/rust/debug/soul2d-core --njc ./out/rust/debug/njc`
+checks an owned Image fixture over HTTP MCP on Linux/macOS. It verifies key insertion, handle/type edits,
+no-op, stale/Part-selector/float-overflow refusals, Undo/Redo and save/reopen, preserving source and non-main
+CAFF payloads. Rust CI runs this probe on Linux and retains its commands, responses and owned fixture files.
 The four retained vendor inputs have one scalar key per channel; authored multi-key fixtures and
 key-add composition provide separate evidence. This does not establish vendor multi-key interpolation
 or Guide playback equivalence.

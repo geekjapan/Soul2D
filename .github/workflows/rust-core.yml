@@ -106,6 +106,19 @@ jobs:
           path: ${{ runner.temp }}/scripted-mcp/run-*.json
           if-no-files-found: warn
           retention-days: 3
+      - name: Verify Image scalar controls over HTTP MCP
+        if: runner.os == 'Linux'
+        env:
+          INOCHI_CONFIG_PATH: ${{ runner.temp }}/image-controls-config
+        run: python -I tools/verify-can3-image-controls.py --core ./out/rust/debug/soul2d-core --njc ./out/rust/debug/njc
+      - name: Upload Image scalar control evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: can3-image-controls
+          path: build/verification/can3-image-controls/mcp-*
+          if-no-files-found: warn
+          retention-days: 3
       - name: Verify physics source edits and first-group creation over HTTP MCP
         if: runner.os == 'Linux'
         env:

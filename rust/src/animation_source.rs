@@ -10,7 +10,7 @@ use std::ops::Range;
 
 pub(crate) fn set_key(model: &Value, request: &Value) -> Result<Value, String> {
     let value = finite(&request["value"])?;
-    edit_point(model, request, CurveAccess::AnchorValue, |curve, index| {
+    edit_point(model, request, |curve, index| {
         curve["points"][index]["anchor"]["value"] = json!(value);
         Ok(None)
     })
@@ -99,7 +99,7 @@ pub(crate) fn set_handle(model: &Value, request: &Value) -> Result<Value, String
     if changes.is_empty() {
         return Err("live2d.animation.handle.set requires frame or value".into());
     }
-    edit_point(model, request, CurveAccess::ScalarControls, |curve, index| {
+    edit_point(model, request, |curve, index| {
         for (key, value) in &changes {
             curve["points"][index][side][*key] = json!(value);
         }
@@ -119,7 +119,7 @@ pub(crate) fn set_curve_type(model: &Value, request: &Value) -> Result<Value, St
         .as_str()
         .filter(|kind| CURVE_TYPES.contains(kind))
         .ok_or("type must be SMOOTH, BEZIER, LINEAR or STEP")?;
-    edit_point(model, request, CurveAccess::ScalarControls, |curve, index| {
+    edit_point(model, request, |curve, index| {
         let types = curve["curveTypes"].as_array_mut().ok_or("animation curve lacks curve types")?;
         *types.get_mut(index).ok_or("animation point and curve-type counts differ")? = json!(kind);
         Ok(Some(index))
@@ -174,7 +174,7 @@ fn key_structure(model: &Value, request: &Value, edit: KeyEdit) -> Result<Value,
         .ok_or("anchorFrame must be a signed integer")?;
     let mut candidate = model.clone();
     let scene = select_json(&mut candidate["scenes"], "guid", request, "sceneGuid")?;
-    let curve = track_key_curve(scene, request, CurveAccess::KeyStructure)?;
+    let curve = track_key_curve(scene, request)?;
     let before = curve.clone();
     {
         let points = before["points"].as_array().ok_or("animation curve lacks points")?;
@@ -449,14 +449,7 @@ fn model_parts(model: &Value) -> Result<ModelParts<'_>, String> {
     Ok(parts)
 }
 
-#[derive(Clone, Copy)]
-enum CurveAccess {
-    AnchorValue,
-    KeyStructure,
-    ScalarControls,
-}
-
-fn track_key_curve<'a>(scene: &'a mut Value, request: &Value, access: CurveAccess) -> Result<&'a mut Value, String> {
+fn track_key_curve<'a>(scene: &'a mut Value, request: &Value) -> Result<&'a mut Value, String> {
     let guid = request["trackGuid"].as_str().filter(|id| !id.is_empty()).ok_or("trackGuid must be a nonempty string")?;
     let families: Vec<_> = TRACK_FIELDS.into_iter().flat_map(|field| {
         scene[field].as_array().into_iter().flatten()
@@ -465,9 +458,7 @@ fn track_key_curve<'a>(scene: &'a mut Value, request: &Value, access: CurveAcces
     if families.is_empty() { return Err("animation trackGuid was not found".into()); }
     if families.len() != 1 { return Err("animation trackGuid is ambiguous".into()); }
     let family = families[0];
-    if !matches!((access, family), (_, "tracks") | (CurveAccess::AnchorValue, "imageTracks" | "guideTracks")
-        | (CurveAccess::KeyStructure, "imageTracks" | "guideTracks")
-        | (CurveAccess::ScalarControls, "guideTracks")) {
+    if !matches!(family, "tracks" | "imageTracks" | "guideTracks") {
         return Err("animation operation does not support this track family".into());
     }
     let track = select_json(&mut scene[family], "guid", request, "trackGuid")?;
@@ -485,7 +476,6 @@ fn track_key_curve<'a>(scene: &'a mut Value, request: &Value, access: CurveAcces
 fn edit_point(
     model: &Value,
     request: &Value,
-    access: CurveAccess,
     change: impl FnOnce(&mut Value, usize) -> Result<Option<usize>, String>,
 ) -> Result<Value, String> {
     if model["format"] != "live2d.animation.source.v1" {
@@ -496,7 +486,7 @@ fn edit_point(
         .ok_or("anchorFrame must be a signed integer")?;
     let mut candidate = model.clone();
     let scene = select_json(&mut candidate["scenes"], "guid", request, "sceneGuid")?;
-    let curve = track_key_curve(scene, request, access)?;
+    let curve = track_key_curve(scene, request)?;
     let index = curve["points"]
         .as_array()
         .ok_or("animation curve lacks points")?
@@ -1713,7 +1703,7 @@ fn guide_curve_changes(
     let owned = track_definition_ownership(graph, owners[0], scene, shared, old, budget)?;
     for (old_curve, new_curve) in before.iter().zip(after) {
         if old_curve == new_curve { continue; }
-        visual_key_changes(old_curve, new_curve, "Guide", VisualKeyEdits::AnchorsLifecycleAndControls)?;
+        visual_key_changes(old_curve, new_curve, "Guide")?;
         let id = old_curve["id"].as_str().ok_or("Guide scalar ID is missing")?;
         if !VISUAL_SCALAR_CHANNELS.iter().any(|(key, _)| *key == id) {
             return Err("unsupported Guide scalar channel".into());
@@ -1764,7 +1754,7 @@ fn image_curve_changes(
     if before.len() != after.len() { return Err("Image scalar curve structure changes are unsupported".into()); }
     for (old, new) in before.iter().zip(after) {
         if old == new { continue; }
-        visual_key_changes(old, new, "Image", VisualKeyEdits::AnchorsAndLifecycle)?;
+        visual_key_changes(old, new, "Image")?;
         let attribute = image_visual_attribute(graph, track, old["id"].as_str().ok_or("Image scalar ID is missing")?, budget)?;
         curve_patches(text, graph, attribute, old, new, patches, budget)?;
     }
@@ -1772,13 +1762,7 @@ fn image_curve_changes(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum VisualKeyEdits {
-    AnchorsAndLifecycle,
-    AnchorsLifecycleAndControls,
-}
-
-fn visual_key_changes(old: &Value, new: &Value, family: &str, edits: VisualKeyEdits) -> Result<(), String> {
+fn visual_key_changes(old: &Value, new: &Value, family: &str) -> Result<(), String> {
     let points = old["points"].as_array().ok_or_else(|| format!("{family} scalar points are missing"))?;
     let target = new["points"].as_array().ok_or_else(|| format!("{family} scalar points are missing"))?;
     let types = old["curveTypes"].as_array().ok_or_else(|| format!("{family} scalar curve types are missing"))?;
@@ -1791,52 +1775,36 @@ fn visual_key_changes(old: &Value, new: &Value, family: &str, edits: VisualKeyEd
     allowed["curveTypes"] = new["curveTypes"].clone();
     if allowed != *new { return Err(format!("{family} scalar curve metadata changes are unsupported")); }
     for slot in curve_plan(points, target)?.ordered {
-        if let VisualKeyEdits::AnchorsLifecycleAndControls = edits {
-            let (candidate, original) = match slot {
-                KeySlot::Existing { original, candidate } => (candidate, Some(original)),
-                KeySlot::Insert { candidate } => (candidate, None),
-            };
-            let point = &target[candidate];
-            finite(&point["anchor"]["value"])?;
-            for side in ["previous", "next"] {
-                for key in ["frame", "value"] { finite(&point[side][key])?; }
-            }
-            if original.is_none_or(|index| types[index] != target_types[candidate])
-                && !target_types[candidate].as_str().is_some_and(|kind| CURVE_TYPES.contains(&kind)) {
-                return Err("Guide scalar curve type is unsupported".into());
-            }
-            if let Some(original) = original {
-                let mut retained = point.clone();
-                retained["anchor"]["value"] = points[original]["anchor"]["value"].clone();
-                for side in ["previous", "next"] {
-                    for key in ["frame", "value"] { retained[side][key] = points[original][side][key].clone(); }
-                }
-                if retained == points[original] { continue; }
-            }
-            if !target_types[candidate].as_str().is_some_and(|kind| CURVE_TYPES.contains(&kind)) {
-                return Err("Guide scalar curve type is unsupported".into());
-            }
-            let frame = point["anchor"]["frame"].as_i64().ok_or("animation anchor frame missing")?;
-            let mut replacement = new_key_point(frame, finite(&point["anchor"]["value"])?);
-            for side in ["previous", "next"] {
-                for key in ["frame", "value"] { replacement[side][key] = point[side][key].clone(); }
-            }
-            if *point != replacement { return Err("Guide scalar changes require retained or canonical protected fields".into()); }
-            continue;
+        let (candidate, original) = match slot {
+            KeySlot::Existing { original, candidate } => (candidate, Some(original)),
+            KeySlot::Insert { candidate } => (candidate, None),
+        };
+        let point = &target[candidate];
+        finite(&point["anchor"]["value"])?;
+        for side in ["previous", "next"] {
+            for key in ["frame", "value"] { finite(&point[side][key])?; }
         }
-        if let KeySlot::Existing { original, candidate } = slot {
-            let mut retained = target[candidate].clone();
+        if original.is_none_or(|index| types[index] != target_types[candidate])
+            && !target_types[candidate].as_str().is_some_and(|kind| CURVE_TYPES.contains(&kind)) {
+            return Err(format!("{family} scalar curve type is unsupported"));
+        }
+        if let Some(original) = original {
+            let mut retained = point.clone();
             retained["anchor"]["value"] = points[original]["anchor"]["value"].clone();
-            if retained != points[original] || types[original] != target_types[candidate] {
-                let point = &target[candidate];
-                let frame = point["anchor"]["frame"].as_i64().ok_or("animation anchor frame missing")?;
-                let mut replacement = new_key_point(frame, finite(&point["next"]["value"])?);
-                replacement["anchor"]["value"] = point["anchor"]["value"].clone();
-                if *point != replacement {
-                    return Err(format!("{family} scalar changes require retained fields or a canonical replacement key"));
-                }
+            for side in ["previous", "next"] {
+                for key in ["frame", "value"] { retained[side][key] = points[original][side][key].clone(); }
             }
+            if retained == points[original] { continue; }
         }
+        if !target_types[candidate].as_str().is_some_and(|kind| CURVE_TYPES.contains(&kind)) {
+            return Err(format!("{family} scalar curve type is unsupported"));
+        }
+        let frame = point["anchor"]["frame"].as_i64().ok_or("animation anchor frame missing")?;
+        let mut replacement = new_key_point(frame, finite(&point["anchor"]["value"])?);
+        for side in ["previous", "next"] {
+            for key in ["frame", "value"] { replacement[side][key] = point[side][key].clone(); }
+        }
+        if *point != replacement { return Err(format!("{family} scalar changes require retained or canonical protected fields")); }
     }
     Ok(())
 }
@@ -2367,6 +2335,9 @@ fn native_scalar_patch(
         return Err("animation scalar differs from source or is not finite".into());
     }
     match new {
+        NativeScalar::Float(value) if !(value as f32).is_finite() => {
+            return Err("animation float does not fit finite 32-bit storage".into());
+        }
         NativeScalar::Integer(value) if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
             return Err("animation integer does not fit a signed 32-bit integer".into());
         }
@@ -2873,6 +2844,9 @@ pub(crate) fn serialize_point(point: &Value, float_frames: bool) -> Result<Strin
             return Err("animation integer does not fit a signed 32-bit integer".into());
         }
         let pos_f = finite(&control["frame"])?;
+        if float_frames && !(pos_f as f32).is_finite() {
+            return Err("animation float does not fit finite 32-bit storage".into());
+        }
         let double = finite(&control["value"])?;
         let optimized = control["positionOptimized"]
             .as_bool()
@@ -6871,14 +6845,16 @@ mod tests {
         point["previous"]["integerFrame"] = json!(-2);
         point["previous"]["positionOptimized"] = json!(true);
         let old = json!({"id":"opacity","points":[point],"curveTypes":["LINEAR"]});
-        let check = |new: &Value| visual_key_changes(&old, new, "Guide", VisualKeyEdits::AnchorsLifecycleAndControls);
+        let check = |new: &Value| {
+            visual_key_changes(&old, new, "Guide")?;
+            visual_key_changes(&old, new, "Image")
+        };
         let mut retained = old.clone();
         retained["points"][0]["anchor"]["value"] = json!(11.0);
         retained["points"][0]["previous"]["frame"] = json!(-3.5);
         retained["points"][0]["next"]["value"] = json!(12.0);
         retained["curveTypes"][0] = json!("BEZIER");
         check(&retained).unwrap();
-        assert!(visual_key_changes(&old, &retained, "Image", VisualKeyEdits::AnchorsAndLifecycle).is_err());
         let mut recreated = retained.clone();
         recreated["points"][0] = new_key_point(0, 11.0);
         recreated["points"][0]["previous"]["frame"] = json!(-3.5);
@@ -6915,10 +6891,10 @@ mod tests {
         future["curveTypes"][0] = json!("FUTURE");
         let mut future_edit = future.clone();
         future_edit["points"][0]["next"]["value"] = json!(12.0);
-        visual_key_changes(&future, &future_edit, "Guide", VisualKeyEdits::AnchorsLifecycleAndControls).unwrap();
+        for family in ["Guide", "Image"] { visual_key_changes(&future, &future_edit, family).unwrap(); }
         let mut bad_count = retained.clone();
         bad_count["curveTypes"] = json!([]);
-        assert_eq!(visual_key_changes(&old, &bad_count, "Image", VisualKeyEdits::AnchorsAndLifecycle).unwrap_err(),
+        assert_eq!(visual_key_changes(&old, &bad_count, "Image").unwrap_err(),
             "Image scalar point and curve-type counts differ");
     }
 
@@ -7058,35 +7034,21 @@ mod tests {
         for family in TRACK_FIELDS {
             let mut scene = json!({"tracks":[],"imageTracks":[],"soundTracks":[],"guideTracks":[]});
             scene[family] = json!([{"guid":"selected","visualCurves":[curve.clone()],"parameterCurves":[curve.clone()]}]);
-            for (access, supported) in [
-                (CurveAccess::AnchorValue, family != "soundTracks"),
-                (CurveAccess::KeyStructure, family != "soundTracks"),
-                (CurveAccess::ScalarControls, matches!(family, "tracks" | "guideTracks")),
-            ] {
-                assert_eq!(track_key_curve(&mut scene.clone(), &request, access).is_ok(), supported, "{family}");
-            }
+            assert_eq!(track_key_curve(&mut scene.clone(), &request).is_ok(), family != "soundTracks", "{family}");
             for other in TRACK_FIELDS {
                 let mut ambiguous = scene.clone();
                 ambiguous[other].as_array_mut().unwrap().push(scene[family][0].clone());
-                for access in [CurveAccess::AnchorValue, CurveAccess::KeyStructure, CurveAccess::ScalarControls] {
-                    assert!(track_key_curve(&mut ambiguous.clone(), &request, access).is_err());
-                }
+                assert!(track_key_curve(&mut ambiguous.clone(), &request).is_err());
             }
             if matches!(family, "imageTracks" | "guideTracks") {
                 let mut selected = request.clone();
                 selected["partOpacityMapKey"] = Value::Null;
-                for access in [CurveAccess::AnchorValue, CurveAccess::KeyStructure, CurveAccess::ScalarControls] {
-                    assert!(track_key_curve(&mut scene.clone(), &selected, access).is_err());
-                }
+                assert!(track_key_curve(&mut scene.clone(), &selected).is_err());
                 selected = request.clone();
                 selected["curveId"] = json!("missing");
-                for access in [CurveAccess::AnchorValue, CurveAccess::KeyStructure, CurveAccess::ScalarControls] {
-                    assert!(track_key_curve(&mut scene.clone(), &selected, access).is_err());
-                }
+                assert!(track_key_curve(&mut scene.clone(), &selected).is_err());
                 scene[family][0]["visualCurves"].as_array_mut().unwrap().push(curve.clone());
-                for access in [CurveAccess::AnchorValue, CurveAccess::KeyStructure, CurveAccess::ScalarControls] {
-                    assert!(track_key_curve(&mut scene.clone(), &request, access).is_err());
-                }
+                assert!(track_key_curve(&mut scene.clone(), &request).is_err());
             }
         }
     }
