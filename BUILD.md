@@ -194,7 +194,8 @@ subsystem so its existing stdin/stdout MCP entry remains available.
 
 ### Packaging checks
 
-Packaging runs already in progress finish before the latest pending run starts.
+Flatpak and Windows packaging jobs run independently. Each platform and Git ref has one active
+job and one replaceable pending job; a new run does not interrupt an active job.
 
 `.github/workflows/packaging.yml` runs on changes to what the packages are assembled from: `build-aux/`,
 `tools/`, `rust/Cargo.*`, the translations (`tl/`, `gentl.sh`), `res/`, the notices (`LICENSE`,
@@ -205,6 +206,16 @@ release binaries and the MSI, extracts it with `msiexec /a`, checks that the exe
 `soul2d.exe` and the catalogues in `i18n` under it, and runs the extracted `soul2d-core.exe --mcp`.
 It then performs a real quiet installation on the disposable Windows runner with
 `tools/verify-windows-install.ps1`. The verifier checks installed x64 executables and resources,
+then opens Windows file Properties separately for `soul2d.exe`, `soul2d-core.exe` and `njc.exe`.
+Each fresh helper binds its own new dialog and Shell owner, validates the General filename/type/location,
+requires the source-defined copyright and `0409/1252` translation, and associates the Details Copyright
+label with its immediate value cell. Bounded parent-linked UIA snapshots and hashed BMP/PNG captures
+retain the row, visible geometry and full text for rendered-glyph review. Helpers must close normally,
+exit zero and preserve the executable hash. These checks precede either graphics classification.
+All three executables currently share the icon, product/version/copyright block and
+`Original filename=soul2d.exe` from `version.h`; that metadata field does not identify the displayed file.
+The CLI tools and editor retain the console subsystem and supported stdin/stdout MCP operation.
+The verifier then
 resolves and attempts to launch the advertised Start Menu shortcut, then opens an owned INX through
 its file association if startup succeeds. Acceptance checks the installed process, its owned MCP
 listener, document identity, console membership and actual client pixels before uninstalling.
@@ -216,7 +227,7 @@ A missing window or listener
 fails native acceptance. On a hosted runner, the exact observed OpenGL-below-2.0 startup
 error is recorded as `UNSUPPORTED`, with association launch `NOT_RUN`. The verifier returns
 2 only after installation checks and cleanup pass. Packaging CI reports that case with a
-warning and summary; it does not count as native acceptance or complete Issue #17.
+warning and summary; that system-GL receipt alone does not establish GUI acceptance.
 Other startup errors and installation or cleanup failures fail CI.
 
 A separate invocation installs the same MSI with a test-only x64 llvmpipe fixture pinned in

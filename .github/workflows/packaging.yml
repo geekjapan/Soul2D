@@ -164,6 +164,7 @@ jobs:
         run: |
           ./tools/test-windows-install-outcome.ps1
           ./tools/test-windows-editor-observation.ps1
+          ./tools/test-windows-properties.ps1
           python tools/test-mcp-initialize.py
           if ($LASTEXITCODE -ne 0) { throw 'MCP probe checks failed.' }
       - name: Compile Windows resources
@@ -251,7 +252,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           pwsh -NoProfile -File ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
             -Fixture out/rust-verification/fixture.inx `
-            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install" -DiscoverProperties
+            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install"
           $code = $LASTEXITCODE
           if ($code -notin @(0, 2)) { throw "Windows installation verification failed with exit code $code." }
           $receipt = Get-Content -Raw "$env:RUNNER_TEMP/windows-install/result.json" | ConvertFrom-Json
@@ -260,12 +261,10 @@ jobs:
               -or $receipt.msiSha256 -ine (Get-FileHash out/Soul2D.msi).Hash `
               -or $receipt.installation -ne 'PASS' -or $receipt.cleanup.errors.Count -ne 0 `
               -or $receipt.cleanup.uninstallExitCode -ne 0) { throw 'Inconsistent installation verification receipt.' }
-          if ($receipt.propertiesDiscovery.status -ne 'OBSERVED' -or $receipt.propertiesDiscovery.helperExited -ne $true `
-              -or $receipt.propertiesDiscovery.cleanupErrors.Count -ne 0 `
-              -or $receipt.propertiesDiscovery.sha256Before -cne $receipt.propertiesDiscovery.sha256After) {
-            throw 'Windows Properties prototype did not produce a complete observation.'
+          if ($receipt.properties.status -ne 'PASS' -or $receipt.properties.files.Count -ne 3) {
+            throw 'Three-file Windows Properties verification is incomplete.'
           }
-          '### Windows Properties discovery observed one installed editor. This is a throwaway topology/UIA experiment; three-file Properties acceptance is NOT_EVALUATED.' >> $env:GITHUB_STEP_SUMMARY
+          '### Three-file Windows Properties checks passed. Per-file General/Details trees and copyright captures are retained for rendered-glyph review.' >> $env:GITHUB_STEP_SUMMARY
           foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
             if ($receipt.cleanup.$field -ne $true) { throw "Incomplete installation cleanup: $field" }
           }
@@ -274,7 +273,7 @@ jobs:
                 -or $receipt.association -ne 'NOT_RUN') { throw 'Missing unsupported-native receipt.' }
             Write-Output '::warning::Windows installation checks passed. Native GUI acceptance is UNSUPPORTED because hosted OpenGL is below 2.0; INX association launch was not run.'
             'native=UNSUPPORTED' >> $env:GITHUB_OUTPUT
-            '### Windows installation checks passed. Native GUI acceptance is UNSUPPORTED; INX association launch is NOT_RUN. See windows-install evidence. Issue #17 remains open.' >> $env:GITHUB_STEP_SUMMARY
+            '### Windows installation checks passed. System-GL GUI acceptance is UNSUPPORTED; INX association launch is NOT_RUN in this context. See the separate software-GL receipt.' >> $env:GITHUB_STEP_SUMMARY
           } else {
             if ($receipt.native -ne 'PASS' -or $receipt.shortcut -ne 'PASS' -or $receipt.association -ne 'PASS') {
               throw 'Missing native acceptance receipt.'

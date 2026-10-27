@@ -23,6 +23,16 @@ $known = @{
         stderr = 'Error: OpenGL(PainterError("egui_glow requires opengl 2.0+. "))'
     } })
 }
+$copyright = "Copyright $([char]0x00a9) 2021 nijigenerate Project"
+$known.properties = @{ status = 'PASS'; installDirectory = 'C:\Program Files\Soul2D'; expectedCopyright = $copyright; files = @(
+    @('soul2d.exe', 'soul2d-core.exe', 'njc.exe') | ForEach-Object {
+        @{ name = $_; file = ('C:\Program Files\Soul2D\' + $_); status = 'PASS'; helperPid = 17; helperExited = $true; helperExitCode = 0; forcedTermination = $false; cleanupErrors = @();
+            sha256Before = ('a' * 64); sha256After = ('a' * 64); observation = @{ status = 'PASS'; path = ('C:\Program Files\Soul2D\' + $_); pid = 17; dialogClosed = $true; detailsSelected = $true;
+                generalTarget = @{ expectedFilename = $_; expectedDirectory = 'C:\Program Files\Soul2D' }; resource = @{ translations = @('0409/1252'); copyright = $copyright };
+                copyrightRow = @{ value = $copyright }; capturedCopyrightRow = @{ value = $copyright };
+                capture = @{ bmp = 'properties-details.bmp'; png = 'properties-details.png'; bmpSha256 = ('b' * 64); pngSha256 = ('c' * 64) } } }
+    }
+) }
 function Set-PassingLaunches($Receipt) {
     $Receipt.failure = $null; $Receipt.shortcut = 'PASS'; $Receipt.association = 'PASS'; $Receipt.editorStdio = 'PASS'
     $Receipt.launches = @('start-menu', 'association') | ForEach-Object {
@@ -63,6 +73,24 @@ $cases = @(
     @{ name = 'unverified loaded DLL'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.launches[1].softwareModule.verified = $false } }
     @{ name = 'fixture remains'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.cleanup.fixtureRemoved = $false } }
     @{ name = 'installed inventory changed'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.cleanup.inventoryRestored = $false } }
+    @{ name = 'missing Properties'; expected = 1; change = { param($r) [void]$r.Remove('properties') } }
+    @{ name = 'prototype Properties is not acceptance'; expected = 1; change = { param($r) $r.properties.status = 'OBSERVED' } }
+    @{ name = 'missing Properties file'; expected = 1; change = { param($r) $r.properties.files = $r.properties.files[0..1] } }
+    @{ name = 'duplicate Properties file'; expected = 1; change = { param($r) $r.properties.files[1].name = 'soul2d.exe' } }
+    @{ name = 'wrong Properties file'; expected = 1; change = { param($r) $r.properties.files[2].name = 'other.exe' } }
+    @{ name = 'failed Properties helper'; expected = 1; change = { param($r) $r.properties.files[1].helperExitCode = 1 } }
+    @{ name = 'forced Properties cleanup'; expected = 1; change = { param($r) $r.properties.files[1].forcedTermination = $true } }
+    @{ name = 'Properties cleanup error'; expected = 1; change = { param($r) $r.properties.files[1].cleanupErrors = @('failure') } }
+    @{ name = 'Properties changed executable'; expected = 1; change = { param($r) $r.properties.files[1].sha256After = ('f' * 64) } }
+    @{ name = 'wrong Properties target'; expected = 1; change = { param($r) $r.properties.files[1].observation.generalTarget.expectedFilename = 'soul2d.exe' } }
+    @{ name = 'wrong native codepage'; expected = 1; change = { param($r) $r.properties.files[1].observation.resource.translations[0] = '0409/1200' } }
+    @{ name = 'wrong associated copyright'; expected = 1; change = { param($r) $r.properties.files[1].observation.copyrightRow.value = 'wrong' } }
+    @{ name = 'missing Properties capture hash'; expected = 1; change = { param($r) $r.properties.files[1].observation.capture.pngSha256 = $null } }
+    @{ name = 'wrong Properties helper identity'; expected = 1; change = { param($r) $r.properties.files[1].observation.pid = 99 } }
+    @{ name = 'wrong Properties file identity'; expected = 1; change = { param($r) $r.properties.files[1].observation.path = 'C:\other.exe' } }
+    @{ name = 'missing intended copyright'; expected = 1; change = { param($r) $r.properties.expectedCopyright = $null } }
+    @{ name = 'passing launches cannot bypass Properties'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.properties.files[2].status = 'FAIL' } }
+    @{ name = 'software launches cannot bypass Properties'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.properties = $null } }
 )
 foreach ($case in $cases) {
     $receipt = $known | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable

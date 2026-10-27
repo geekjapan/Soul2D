@@ -3,7 +3,6 @@ param(
     [Parameter(Mandatory)][string]$Fixture,
     [Parameter(Mandatory)][string]$EvidenceDirectory,
     [string]$SoftwareGlArchive,
-    [switch]$DiscoverProperties,
     [ValidateRange(10, 120)][int]$TimeoutSeconds = 60
 )
 
@@ -16,6 +15,32 @@ function Get-VerificationExitCode($Receipt) {
     foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
         if ($Receipt.cleanup[$field] -ne $true) { return 1 }
     }
+    try {
+        if (-not $Receipt.Contains('properties') -or $null -eq $Receipt.properties) { return 1 }
+        $properties = $Receipt.properties
+        if ($properties.status -ne 'PASS' -or $properties.files.Count -ne 3 `
+            -or [String]::IsNullOrWhiteSpace($properties.expectedCopyright) -or -not $properties.expectedCopyright.Contains([char]0x00a9)) { return 1 }
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($file in $properties.files) {
+            if (@('soul2d.exe', 'soul2d-core.exe', 'njc.exe') -cnotcontains $file.name -or -not $names.Add($file.name) `
+                -or $file.status -ne 'PASS' -or $file.helperExited -ne $true -or $file.helperExitCode -ne 0 `
+                -or $file.forcedTermination -ne $false -or $file.cleanupErrors.Count -ne 0 -or $file.helperPid -le 0 `
+                -or $file.file -cne ($properties.installDirectory.TrimEnd('\') + '\' + $file.name) `
+                -or $file.sha256Before -cnotmatch '^[A-Fa-f0-9]{64}$' -or $file.sha256Before -cne $file.sha256After) { return 1 }
+            $observed = $file.observation
+            if ($null -eq $observed -or $observed.status -ne 'PASS' -or $observed.dialogClosed -ne $true `
+                -or $observed.detailsSelected -ne $true -or $observed.generalTarget.expectedFilename -cne $file.name `
+                -or $observed.pid -ne $file.helperPid -or $observed.path -cne $file.file `
+                -or $observed.generalTarget.expectedDirectory -cne $properties.installDirectory `
+                -or $observed.resource.translations.Count -ne 1 -or $observed.resource.translations[0] -cne '0409/1252' `
+                -or $observed.resource.copyright -cne $properties.expectedCopyright `
+                -or $observed.copyrightRow.value -cne $properties.expectedCopyright `
+                -or $observed.capturedCopyrightRow.value -cne $properties.expectedCopyright `
+                -or $observed.capture.bmp -cne 'properties-details.bmp' -or $observed.capture.png -cne 'properties-details.png' `
+                -or $observed.capture.bmpSha256 -cnotmatch '^[A-Fa-f0-9]{64}$' `
+                -or $observed.capture.pngSha256 -cnotmatch '^[A-Fa-f0-9]{64}$') { return 1 }
+        }
+    } catch { return 1 }
     if ($null -eq $Receipt.failure -and $Receipt.shortcut -eq 'PASS' -and $Receipt.association -eq 'PASS' `
         -and $Receipt.launches.Count -eq 2 -and $Receipt.launches[0].kind -eq 'start-menu' `
         -and $Receipt.launches[1].kind -eq 'association' -and $Receipt.launches[0].accepted -eq $true `
@@ -166,7 +191,7 @@ $result = [ordered]@{ productCode = $productCode; files = @(); binaries = @(); l
     sourceRevision = $env:GITHUB_SHA; msiSha256 = (Get-FileHash -LiteralPath $msiPath).Hash;
     graphicsContext = $(if ($SoftwareGlArchive) { 'test-software-wgl' } else { 'system' }); graphicsFixture = $null;
     installation = 'NOT_RUN'; shortcut = 'NOT_RUN'; association = 'NOT_RUN'; editorStdio = 'NOT_RUN';
-    native = 'NOT_RUN'; softwareGl = 'NOT_RUN'; propertiesDiscovery = $null; failure = $null }
+    native = 'NOT_RUN'; softwareGl = 'NOT_RUN'; properties = $null; failure = $null }
 $ownedEditors = [Collections.Generic.List[int]]::new()
 $ownedConfigs = [Collections.Generic.List[string]]::new()
 $cleanupFailures = [Collections.Generic.List[string]]::new()
@@ -423,21 +448,18 @@ try {
     }
     $result.files = @(Get-ChildItem -LiteralPath $installDirectory -Recurse -File | ForEach-Object { $_.FullName.Substring($installDirectory.Length + 1) })
     $originalInventory = Get-InstalledInventory
-    if ($DiscoverProperties) {
-        $propertiesEvidence = Join-Path $evidence 'properties-discovery'
-        $result.propertiesDiscovery = @{ status = 'FAIL'; evidence = $propertiesEvidence;
-            scope = 'Properties discovery only; Issue acceptance NOT_EVALUATED' }
-        try {
-            & (Join-Path $PSScriptRoot 'prototypes/windows-properties/probe.ps1') -FilePath $editorPath `
-                -EvidenceDirectory $propertiesEvidence -CaptureSource (Join-Path $PSScriptRoot 'windows-editor-observation.cs')
-        } finally {
-            $propertiesReceipt = Join-Path $propertiesEvidence 'result.json'
-            if (Test-Path -LiteralPath $propertiesReceipt) {
-                $result.propertiesDiscovery = Get-Content -Raw -LiteralPath $propertiesReceipt | ConvertFrom-Json
-            }
+    $propertiesEvidence = Join-Path $evidence 'properties'
+    $result.properties = @{ status = 'FAIL'; evidence = $propertiesEvidence }
+    try {
+        & (Join-Path $PSScriptRoot 'verify-windows-properties.ps1') -InstallDirectory $installDirectory `
+            -EvidenceDirectory $propertiesEvidence -ExpectedCopyright $expectedResources.LegalCopyright
+    } finally {
+        $propertiesReceipt = Join-Path $propertiesEvidence 'result.json'
+        if (Test-Path -LiteralPath $propertiesReceipt) {
+            $result.properties = Get-Content -Raw -LiteralPath $propertiesReceipt | ConvertFrom-Json
         }
-        if ($result.propertiesDiscovery.status -ne 'OBSERVED') { throw 'Windows Properties discovery failed.' }
     }
+    if ($result.properties.status -ne 'PASS') { throw 'Windows Properties verification failed.' }
     python tools/verify-mcp-initialize.py (Join-Path $installDirectory 'soul2d-core.exe') --mcp
     if ($LASTEXITCODE -ne 0) { throw 'Installed core MCP initialization failed.' }
     $shortcuts = @(@([Environment]::GetFolderPath('CommonPrograms'), [Environment]::GetFolderPath('Programs')) |

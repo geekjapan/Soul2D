@@ -1,15 +1,18 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
 
-public static class PropertiesDiscovery {
+public static class PropertiesObservation {
     private delegate bool WindowCallback(IntPtr window, IntPtr parameter);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern bool SHObjectProperties(IntPtr owner, uint kind, string path, string page);
@@ -151,14 +154,15 @@ public static class PropertiesDiscovery {
         return (text ?? "").Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\r", "\\r").Replace("\n", "\\n");
     }
 
-    private static List<Dictionary<string, object>> Tree(AutomationElement root, out AutomationElement details, string evidence) {
-        var rows = new List<Dictionary<string, object>>();
-        var queue = new Queue<Tuple<AutomationElement, int>>();
+    private static List<FilePropertyNode> Tree(AutomationElement root, out AutomationElement general, out AutomationElement details, string evidence) {
+        var rows = new List<FilePropertyNode>();
+        var queue = new Queue<Tuple<AutomationElement, int, int>>();
         var walker = TreeWalker.RawViewWalker;
-        queue.Enqueue(Tuple.Create(root, 0));
-        File.WriteAllText(evidence, "depth\tname\ttype\tautomationId\tpid\thwnd\toffscreen\tbounds\tvalue\tpatterns\n");
+        queue.Enqueue(Tuple.Create(root, 0, -1));
+        File.WriteAllText(evidence, "id\tparentId\tdepth\tname\ttype\tautomationId\tpid\thwnd\toffscreen\tbounds\tvalue\tpatterns\n");
+        general = null;
         details = null;
-        int detailsCount = 0;
+        int generalCount = 0, detailsCount = 0;
         while (queue.Count > 0) {
             if (rows.Count >= 200) throw new Exception("Properties tree exceeded 200 elements");
             var item = queue.Dequeue();
@@ -166,40 +170,90 @@ public static class PropertiesDiscovery {
             var current = element.Current;
             var patterns = new List<string>();
             foreach (var pattern in element.GetSupportedPatterns()) patterns.Add(pattern.ProgrammaticName);
-            var row = new Dictionary<string, object> { {"depth", item.Item2}, {"name", current.Name},
-                {"type", current.ControlType.ProgrammaticName}, {"automationId", current.AutomationId},
-                {"pid", current.ProcessId}, {"hwnd", current.NativeWindowHandle},
-                {"offscreen", current.IsOffscreen}, {"bounds", current.BoundingRectangle.ToString(CultureInfo.InvariantCulture)},
-                {"patterns", patterns} };
+            var bounds = current.BoundingRectangle;
+            var row = new FilePropertyNode { Id = rows.Count, ParentId = item.Item3, Depth = item.Item2, Name = current.Name,
+                Type = current.ControlType.ProgrammaticName, AutomationId = current.AutomationId,
+                Pid = current.ProcessId, Hwnd = current.NativeWindowHandle, Offscreen = current.IsOffscreen,
+                Bounds = new[] { bounds.Left, bounds.Top, bounds.Width, bounds.Height }, Patterns = patterns.ToArray() };
             object supported;
             if (element.TryGetCurrentPattern(ValuePattern.Pattern, out supported))
-                row["value"] = ((ValuePattern)supported).Current.Value;
-            File.AppendAllText(evidence, item.Item2 + "\t" + Cell(current.Name) + "\t" + current.ControlType.ProgrammaticName + "\t" +
+                row.Value = ((ValuePattern)supported).Current.Value;
+            File.AppendAllText(evidence, row.Id + "\t" + row.ParentId + "\t" + item.Item2 + "\t" + Cell(current.Name) + "\t" + current.ControlType.ProgrammaticName + "\t" +
                 Cell(current.AutomationId) + "\t" + current.ProcessId + "\t" + current.NativeWindowHandle + "\t" + current.IsOffscreen + "\t" +
-                Cell((string)row["bounds"]) + "\t" + Cell(row.ContainsKey("value") ? (string)row["value"] : "") + "\t" +
+                Cell(bounds.ToString(CultureInfo.InvariantCulture)) + "\t" + Cell(row.Value) + "\t" +
                 Cell(String.Join(",", patterns)) + "\n");
             rows.Add(row);
+            if (current.ControlType == ControlType.TabItem && current.Name == "General") {
+                general = element;
+                generalCount++;
+            }
             if (current.ControlType == ControlType.TabItem && current.Name == "Details") {
                 details = element;
                 detailsCount++;
             }
-            if (item.Item2 >= 8) continue;
-            for (var child = walker.GetFirstChild(element); child != null; child = walker.GetNextSibling(child)) {
+            var first = walker.GetFirstChild(element);
+            if (item.Item2 >= 8 && first != null) throw new Exception("Properties tree exceeded depth 8");
+            for (var child = first; child != null; child = walker.GetNextSibling(child)) {
                 if (queue.Count + rows.Count >= 200) throw new Exception("Properties tree exceeded 200 elements");
-                queue.Enqueue(Tuple.Create(child, item.Item2 + 1));
+                queue.Enqueue(Tuple.Create(child, item.Item2 + 1, row.Id));
             }
         }
-        if (detailsCount != 1) throw new Exception("Properties does not expose exactly one English Details tab");
+        if (generalCount != 1 || detailsCount != 1) throw new Exception("Properties lacks unique English General and Details tabs");
         return rows;
     }
 
-    public static Dictionary<string, object> Run(string path, string evidence) {
-        var report = new Dictionary<string, object> { {"status", "FAIL"}, {"scope", "Properties discovery only; Issue acceptance NOT_EVALUATED"},
+    private static void SelectTab(AutomationElement tab) {
+        object pattern;
+        if (!tab.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern)) throw new Exception("Properties tab lacks selection pattern");
+        ((SelectionItemPattern)pattern).Select();
+    }
+
+    private static void RequireSelected(AutomationElement tab) {
+        object pattern;
+        if (!tab.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern) || !((SelectionItemPattern)pattern).Current.IsSelected)
+            throw new Exception("Properties tab selection was not confirmed");
+    }
+
+    private static string Hash(string path) {
+        using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(path))).Replace("-", "");
+    }
+
+    private static void SavePng(EditorFrame frame, string path) {
+        using (var bitmap = new Bitmap(frame.Width, frame.Height, PixelFormat.Format24bppRgb)) {
+            var data = bitmap.LockBits(new Rectangle(0, 0, frame.Width, frame.Height), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+            try {
+                var row = new byte[frame.Width * 3];
+                for (int y = 0; y < frame.Height; y++) {
+                    for (int x = 0; x < frame.Width; x++)
+                        Buffer.BlockCopy(frame.Pixels, (y * frame.Width + x) * 4, row, x * 3, 3);
+                    Marshal.Copy(row, 0, IntPtr.Add(data.Scan0, y * data.Stride), row.Length);
+                }
+            } finally { bitmap.UnlockBits(data); }
+            bitmap.Save(path, ImageFormat.Png);
+        }
+    }
+
+    public static void VerifyPngEncoding(string evidence) {
+        string path = Path.Combine(evidence, "png-selfcheck.png");
+        var frame = new EditorFrame { Width = 2, Height = 1, Pixels = new byte[] { 0, 0, 255, 0, 0, 255, 0, 127 } };
+        SavePng(frame, path);
+        using (var image = new Bitmap(path)) {
+            if (image.Width != 2 || image.Height != 1 || image.GetPixel(0, 0).ToArgb() != Color.Red.ToArgb()
+                || image.GetPixel(1, 0).ToArgb() != Color.Lime.ToArgb()) throw new Exception("BGRX PNG conversion changed pixels");
+        }
+    }
+
+    public static Dictionary<string, object> Run(string path, string evidence, string expectedCopyright) {
+        var resource = Resource(path);
+        var translations = (List<string>)resource["translations"];
+        if (translations.Count != 1 || translations[0] != "0409/1252" || (string)resource["copyright"] != expectedCopyright)
+            throw new Exception("Installed version translation/copyright differs from source policy");
+        var report = new Dictionary<string, object> { {"status", "FAIL"}, {"scope", "Installed file Properties target, resources and associated copyright row; rendered glyph requires capture review"},
             {"path", path}, {"pid", Process.GetCurrentProcess().Id}, {"uiLanguage", CultureInfo.CurrentUICulture.Name},
-            {"resource", Resource(path)}, {"dialogClosed", false} };
+            {"resource", resource}, {"dialogClosed", false} };
         uint pid = (uint)Process.GetCurrentProcess().Id;
         using (var owner = new Form()) {
-            owner.Text = "Soul2D Properties discovery " + Guid.NewGuid().ToString("N");
+            owner.Text = "Soul2D Properties verification " + Guid.NewGuid().ToString("N");
             owner.ShowInTaskbar = false;
             IntPtr ownerHwnd = owner.Handle;
             report["ownerHwnd"] = ownerHwnd.ToInt64();
@@ -252,35 +306,53 @@ public static class PropertiesDiscovery {
                     report["stubOwnerTitle"] = identity.Stub.Title;
                     report["stubOwnerOwnerHwnd"] = identity.Stub.Owner.ToInt64();
                     report["stableSnapshots"] = 2;
-                    report["identityScope"] = "Fresh helper-owned dialog/stub pair; exact displayed file path NOT_EVALUATED";
+                    report["identityScope"] = "Fresh helper-owned dialog/stub pair";
                     RequireIdentity(identity, baseline, pid, expectedTitle);
                     EditorDesktop.ShowWindow(dialog, 9);
                     RequireIdentity(identity, baseline, pid, expectedTitle);
                     report["placement"] = EditorDesktop.PlaceForCapture(dialog, pid);
-                    AutomationElement details;
+                    AutomationElement general, details;
                     var root = RootFor(identity, baseline, pid, expectedTitle);
-                    report["beforeTree"] = Tree(root, out details, Path.Combine(evidence, "before-tree.tsv"));
-                    object selection;
-                    if (!details.TryGetCurrentPattern(SelectionItemPattern.Pattern, out selection))
-                        throw new Exception("Details tab lacks selection pattern");
+                    report["initialTree"] = Tree(root, out general, out details, Path.Combine(evidence, "initial-tree.tsv"));
                     RequireIdentity(identity, baseline, pid, expectedTitle);
-                    ((SelectionItemPattern)selection).Select();
+                    SelectTab(general);
+                    Thread.Sleep(100);
+                    root = RootFor(identity, baseline, pid, expectedTitle);
+                    var generalTree = Tree(root, out general, out details, Path.Combine(evidence, "general-tree.tsv"));
+                    RequireSelected(general);
+                    report["generalTree"] = generalTree;
+                    report["generalTarget"] = FilePropertiesPolicy.General(generalTree, (int)pid, Path.GetDirectoryName(path), Path.GetFileName(path));
+                    RequireIdentity(identity, baseline, pid, expectedTitle);
+                    SelectTab(details);
                     Thread.Sleep(300);
                     RequireIdentity(identity, baseline, pid, expectedTitle);
                     root = RootFor(identity, baseline, pid, expectedTitle);
-                    report["detailsTree"] = Tree(root, out details, Path.Combine(evidence, "details-tree.tsv"));
-                    if (!details.TryGetCurrentPattern(SelectionItemPattern.Pattern, out selection) ||
-                        !((SelectionItemPattern)selection).Current.IsSelected) throw new Exception("Details is not selected");
+                    var detailsTree = Tree(root, out general, out details, Path.Combine(evidence, "details-tree.tsv"));
+                    RequireSelected(details);
+                    var bounds = root.Current.BoundingRectangle;
+                    FilePropertiesPolicy.Copyright(detailsTree, (int)pid, expectedCopyright, new[] { bounds.Left, bounds.Top, bounds.Width, bounds.Height });
+                    report["detailsTree"] = detailsTree;
                     report["detailsSelected"] = true;
                     RequireIdentity(identity, baseline, pid, expectedTitle);
                     EditorDesktop.SetForegroundWindow(dialog);
                     Thread.Sleep(200);
                     RequireIdentity(identity, baseline, pid, expectedTitle);
                     var frame = EditorDesktop.Capture(dialog, pid);
-                    frame.Save(Path.Combine(evidence, "properties-details.bmp"));
+                    var capture = new double[] { frame.Left, frame.Top, frame.Width, frame.Height };
+                    report["copyrightRow"] = FilePropertiesPolicy.Copyright(detailsTree, (int)pid, expectedCopyright, capture);
+                    string bmp = Path.Combine(evidence, "properties-details.bmp"), png = Path.Combine(evidence, "properties-details.png");
+                    frame.Save(bmp);
+                    SavePng(frame, png);
                     RequireIdentity(identity, baseline, pid, expectedTitle);
-                    report["capture"] = "properties-details.bmp";
-                    report["status"] = "OBSERVED";
+                    root = RootFor(identity, baseline, pid, expectedTitle);
+                    var capturedTree = Tree(root, out general, out details, Path.Combine(evidence, "captured-tree.tsv"));
+                    RequireSelected(details);
+                    report["capturedTree"] = capturedTree;
+                    report["capturedCopyrightRow"] = FilePropertiesPolicy.Copyright(capturedTree, (int)pid, expectedCopyright, capture);
+                    RequireIdentity(identity, baseline, pid, expectedTitle);
+                    report["capture"] = new Dictionary<string, object> { {"bmp", "properties-details.bmp"}, {"bmpSha256", Hash(bmp)},
+                        {"png", "properties-details.png"}, {"pngSha256", Hash(png)}, {"bounds", capture} };
+                    report["status"] = "PASS";
                 } catch (Exception error) { report["failure"] = error.ToString(); }
                 finally {
                     try {
