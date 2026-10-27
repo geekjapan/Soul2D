@@ -1,5 +1,156 @@
+param([string]$ProgressChildDirectory)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$source = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'windows-properties-observation.cs')
+$parts = foreach ($pattern in @(
+    '(?m)^    private enum ProgressActor \{[^\r\n]+\}',
+    '(?ms)^    private sealed class CallProgress : IDisposable \{.*?^    \}',
+    '(?ms)^    private static string Cell\(string text\) \{.*?^    \}'
+)) {
+    $found = [regex]::Matches($source, $pattern)
+    if ($found.Count -ne 1) { throw 'Expected one production progress member.' }
+    $found[0].Value
+}
+Add-Type -TypeDefinition (@'
+using System;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading;
+public static class PropertiesProgressTests {
+'@ + ($parts -join "`n") + @'
+    private static string[][] Read(string path) {
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (var reader = new StreamReader(stream)) {
+            string text = reader.ReadToEnd();
+            int complete = text.LastIndexOf('\n');
+            if (complete < 0) return new string[0][];
+            var rows = text.Substring(0, complete).Split('\n').Select(line => line.TrimEnd('\r').Split('\t')).ToArray();
+            if (rows[0].Length != 13 || rows[0][0] != "sequence") throw new Exception("Missing progress header");
+            foreach (var row in rows.Skip(1)) if (row.Length != 13) throw new Exception("Incomplete progress record");
+            return rows.Skip(1).ToArray();
+        }
+    }
+
+    public static bool Entered(string directory, string operation) {
+        string path = Path.Combine(directory, "progress-observer.tsv");
+        if (!File.Exists(path)) return false;
+        try { return Read(path).Any(row => row[8] == operation && row[9] == "entered"); }
+        catch (IOException) { return false; }
+    }
+
+    public static void Pending(string directory) {
+        using (var progress = new CallProgress(directory, ProgressActor.Observer, 333))
+            progress.Call("child.pending", new IntPtr(9), () => Thread.Sleep(Timeout.Infinite));
+    }
+
+    public static void VerifyPending(string directory) {
+        var rows = Read(Path.Combine(directory, "progress-observer.tsv"));
+        if (rows.Last()[8] != "child.pending" || rows.Last()[9] != "entered"
+            || rows.Any(row => row[8] == "child.pending" && row[9] != "entered"))
+            throw new Exception("Terminated helper lost its outstanding entry");
+    }
+
+    public static void Verify(string directory) {
+        string path = Path.Combine(directory, "progress-sta.tsv");
+        var sentinel = new InvalidOperationException("sentinel");
+        int calls = 0;
+        using (var progress = new CallProgress(directory, ProgressActor.Sta, 111)) {
+            if (progress.Call("normal", new IntPtr(7), () => { calls++; return 42; }) != 42 || calls != 1)
+                throw new Exception("Progress changed the invocation or return value");
+            if (progress.Call("false", IntPtr.Zero, () => false)
+                || progress.Call<object>("null", IntPtr.Zero, () => null) != null)
+                throw new Exception("Progress changed false or null return semantics");
+            bool caught = false;
+            try { progress.Call("throws", IntPtr.Zero, () => { throw sentinel; }); }
+            catch (Exception error) { if (!Object.ReferenceEquals(error, sentinel)) throw; caught = true; }
+            if (!caught) throw new Exception("Progress swallowed the original exception");
+            progress.Call("outer", IntPtr.Zero, () => progress.Call("inner", IntPtr.Zero, () => 5));
+            progress.Call("pending.read", IntPtr.Zero, () => {
+                var current = Read(path);
+                if (current.Last()[8] != "pending.read" || current.Last()[9] != "entered")
+                    throw new Exception("Entry was unavailable while the delegate was pending");
+            });
+            progress.Call("after.throw", IntPtr.Zero, () => { });
+        }
+        var rows = Read(path);
+        long sequence = 0, ticks = 0;
+        foreach (var row in rows) {
+            long observed = Int64.Parse(row[2], CultureInfo.InvariantCulture);
+            if (Int64.Parse(row[0], CultureInfo.InvariantCulture) != ++sequence || observed < ticks
+                || row[5] != "111") throw new Exception("Progress ordering or actor metadata differs");
+            ticks = observed;
+        }
+        foreach (var entry in rows.Where(row => row[9] == "entered")) {
+            var terminal = rows.Where(row => row[6] == entry[6] && (row[9] == "returned" || row[9] == "threw")).ToArray();
+            if (terminal.Length != 1 || terminal[0][7] != entry[7] || terminal[0][8] != entry[8]
+                || terminal[0][10] != entry[10] || terminal[0][9] != (entry[8] == "throws" ? "threw" : "returned"))
+                throw new Exception("Progress call pairing differs");
+        }
+        var outer = rows.Single(row => row[8] == "outer" && row[9] == "entered");
+        var inner = rows.Single(row => row[8] == "inner" && row[9] == "entered");
+        if (inner[7] != outer[6] || rows.Single(row => row[8] == "after.throw" && row[9] == "entered")[7] != "0")
+            throw new Exception("Progress nesting or parent restoration differs");
+        Exception workerError = null;
+        var observer = new Thread(() => {
+            try {
+                using (var progress = new CallProgress(directory, ProgressActor.Observer, 222))
+                    progress.Call("observer", IntPtr.Zero, () => { });
+            } catch (Exception error) { workerError = error; }
+        });
+        observer.IsBackground = true;
+        observer.Start();
+        if (!observer.Join(5000)) throw new Exception("Progress actor test did not finish");
+        if (workerError != null) throw workerError;
+        var other = Read(Path.Combine(directory, "progress-observer.tsv"));
+        if (other.Any(row => row[5] != "222") || other[0][4] == rows[0][4] || Read(path).Length != rows.Length)
+            throw new Exception("Actor journals interfered");
+        string blocked = Path.Combine(directory, "not-a-directory");
+        File.WriteAllText(blocked, "owned fixture");
+        using (var progress = new CallProgress(blocked, ProgressActor.Sta, 0)) {
+            if (progress.Call("unavailable", IntPtr.Zero, () => ++calls) != 2)
+                throw new Exception("Unavailable diagnostics skipped the delegate");
+            bool caught = false;
+            try { progress.Call("unavailable.throw", IntPtr.Zero, () => { throw sentinel; }); }
+            catch (Exception error) { if (!Object.ReferenceEquals(error, sentinel)) throw; caught = true; }
+            if (!caught) throw new Exception("Unavailable diagnostics swallowed the exception");
+        }
+    }
+}
+'@)
+if ($ProgressChildDirectory) {
+    [PropertiesProgressTests]::Pending($ProgressChildDirectory)
+    throw 'Pending progress child unexpectedly returned.'
+}
+$progressDirectory = Join-Path ([IO.Path]::GetTempPath()) ('soul2d-properties-progress-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory $progressDirectory | Out-Null
+$child = $null
+try {
+    [PropertiesProgressTests]::Verify($progressDirectory)
+    $childDirectory = Join-Path $progressDirectory 'child'
+    New-Item -ItemType Directory $childDirectory | Out-Null
+    $child = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -ArgumentList @('-NoProfile', '-File',
+        "`"$PSCommandPath`"", '-ProgressChildDirectory', "`"$childDirectory`"") `
+        -RedirectStandardOutput (Join-Path $progressDirectory 'child.stdout') -RedirectStandardError (Join-Path $progressDirectory 'child.stderr')
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while (-not [PropertiesProgressTests]::Entered($childDirectory, 'child.pending')) {
+        if ($child.HasExited) { throw 'Progress child exited before its flushed entry.' }
+        if ($wait.ElapsedMilliseconds -ge 15000) { throw 'Progress child did not reach its pending delegate.' }
+        Start-Sleep -Milliseconds 50
+    }
+    $child.Kill()
+    if (-not $child.WaitForExit(5000)) { throw 'Owned progress child termination was not confirmed.' }
+    [PropertiesProgressTests]::VerifyPending($childDirectory)
+    Write-Output 'PASS: production progress writer preserves returns, exceptions, nesting, actor isolation, live entries, unavailable-I/O semantics and an entry after owned child termination.'
+} finally {
+    if ($null -ne $child) {
+        if (-not $child.HasExited) { $child.Kill(); if (-not $child.WaitForExit(5000)) { throw 'Progress child cleanup failed.' } }
+        $child.Dispose()
+    }
+    Remove-Item -LiteralPath $progressDirectory -Recurse -Force
+}
 Add-Type -Path (Join-Path $PSScriptRoot 'windows-properties-policy.cs')
 $copyright = "Copyright $([char]0x00a9) 2021 nijigenerate Project"
 function Node($Id, $Parent, $Depth, $Type, $Name, $Bounds) {
