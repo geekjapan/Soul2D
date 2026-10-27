@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
@@ -17,6 +18,8 @@ public static class PropertiesDiscovery {
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFileVersionInfoSize(string path, out uint handle);
@@ -118,13 +121,20 @@ public static class PropertiesDiscovery {
                     DateTime deadline = DateTime.UtcNow.AddSeconds(10);
                     do {
                         var candidates = new List<IntPtr>();
-                        var topology = new List<string> { "hwnd\tpid\towner\tvisible" };
+                        var topology = new List<string> { "hwnd\tpid\towner\tvisible\tbaseline\tthread\tclass\ttitle" };
                         EnumWindows((window, unused) => {
                             uint observedPid;
-                            GetWindowThreadProcessId(window, out observedPid);
+                            uint thread = GetWindowThreadProcessId(window, out observedPid);
                             if (!baseline.Contains(window) || observedPid == pid) {
-                                if (topology.Count < 50) topology.Add(window.ToInt64() + "\t" + observedPid + "\t" +
-                                    GetWindow(window, 4).ToInt64() + "\t" + IsWindowVisible(window));
+                                if (topology.Count < 50) {
+                                    var title = new StringBuilder(512);
+                                    var name = new StringBuilder(256);
+                                    GetWindowText(window, title, title.Capacity);
+                                    GetClassName(window, name, name.Capacity);
+                                    topology.Add(window.ToInt64() + "\t" + observedPid + "\t" +
+                                        GetWindow(window, 4).ToInt64() + "\t" + IsWindowVisible(window) + "\t" +
+                                        baseline.Contains(window) + "\t" + thread + "\t" + Cell(name.ToString()) + "\t" + Cell(title.ToString()));
+                                }
                             }
                             if (Owned(window, ownerHwnd, pid) && IsWindowVisible(window)) candidates.Add(window);
                             return true;
