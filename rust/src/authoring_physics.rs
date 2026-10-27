@@ -1636,6 +1636,7 @@ enum OwnedRole {
     Leaf(&'static str),
     Rate,
     PhysicsGuid(&'static str),
+    Selection,
     Parameter,
 }
 
@@ -1651,6 +1652,7 @@ impl OwnedRole {
             Self::Position => "GVector2",
             Self::Leaf(tag) | Self::PhysicsGuid(tag) => tag,
             Self::Rate => return node.has_tag_name("i") || node.has_tag_name("null"),
+            Self::Selection => return node.has_tag_name("CPhysicsSettingsGuid") || node.has_tag_name("null"),
             Self::Parameter => "CParameterGuid",
         };
         node.has_tag_name(tag)
@@ -1659,7 +1661,7 @@ impl OwnedRole {
     fn fields(self) -> &'static [(&'static str, OwnedRole)] {
         use OwnedRole::*;
         match self {
-            Set => &[("settingFPS", Rate), ("_sourceCubismPhysics", Groups)],
+            Set => &[("settingFPS", Rate), ("_sourceCubismPhysics", Groups), ("selectedCubismPhysics", Selection)],
             Group => &[
                 ("guid", PhysicsGuid("CPhysicsSettingsGuid")), ("id", Leaf("CPhysicsSettingId")),
                 ("name", Leaf("s")), ("inputs", Inputs), ("outputs", Outputs), ("vertices", Vertices),
@@ -1695,6 +1697,7 @@ struct OwnedPhysics<'d, 'i> {
     role: OwnedRole,
     children: Vec<OwnedPhysics<'d, 'i>>,
     shared: bool,
+    fresh_guid: Option<String>,
 }
 
 const MAX_DETACH_BYTES: usize = 16 * 1024 * 1024;
@@ -1711,7 +1714,12 @@ fn owned_physics<'d, 'i>(
     if !role.tag(node) {
         return Err(format!("authoring physics detach does not support {} in this ownership role", node.tag_name().name()));
     }
-    if slot.attribute("xs.ref").is_some_and(|id| node.attribute("xs.id") != Some(id)) {
+    if role == OwnedRole::Selection && !node.has_tag_name("null")
+        && node.attribute("uuid").is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("authoring physics detach refuses a selected group without identity".into());
+    }
+    if role != OwnedRole::Parameter && slot.attribute("xs.ref").is_some_and(|id| node.attribute("xs.id") != Some(id)) {
         return Err("authoring physics detach refuses alias chains".into());
     }
     if slot.id() != node.id() && (slot.children().any(|child| !child.is_text() || !child.text().unwrap_or("").trim().is_empty())
@@ -1720,7 +1728,7 @@ fn owned_physics<'d, 'i>(
         return Err("authoring physics detach refuses alias metadata".into());
     }
     let shared = if role == OwnedRole::Parameter {
-        slot.id() == node.id() && slot.attribute("xs.id").is_some()
+        slot.attribute("xs.id").is_some()
     } else {
         slot.id() != node.id() || referenced(slot, inbound) || referenced(node, inbound)
     };
@@ -1756,7 +1764,7 @@ fn owned_physics<'d, 'i>(
     *bytes = bytes.checked_add(node.range().len() - children.iter().map(|child| child.slot.range().len()).sum::<usize>())
         .filter(|count| *count <= MAX_DETACH_BYTES).ok_or("authoring physics detach exceeds byte budget")?;
     active.remove(&node.id());
-    Ok(OwnedPhysics { slot, node, role, children, shared })
+    Ok(OwnedPhysics { slot, node, role, children, shared, fresh_guid: None })
 }
 
 impl OwnedPhysics<'_, '_> {
@@ -1769,10 +1777,53 @@ impl OwnedPhysics<'_, '_> {
         for child in &self.children { child.copied_ids(ids); }
     }
 
-    fn render(&self, text: &str, copied: &HashSet<String>, used: &mut HashSet<String>, next_idx: &mut u64) -> Result<String, String> {
+    fn parameter_ids(&self, ids: &mut HashSet<String>) {
+        if self.role == OwnedRole::Parameter {
+            if let Some(id) = self.node.attribute("xs.id") { ids.insert(id.to_owned()); }
+        }
+        for child in &self.children { child.parameter_ids(ids); }
+    }
+
+    fn assign_guids(&mut self, used: &mut HashSet<String>, groups: &mut HashMap<String, Vec<String>>) -> Result<(), String> {
+        if let OwnedRole::PhysicsGuid(tag) = self.role {
+            if let Some(old) = self.node.attribute("uuid") {
+                let fresh = crate::animation_source::new_guid()?;
+                if !used.insert(fresh.clone()) { return Err("authoring physics identity collision".into()); }
+                if tag == "CPhysicsSettingsGuid" { groups.entry(old.to_owned()).or_default().push(fresh.clone()); }
+                self.fresh_guid = Some(fresh);
+            }
+        }
+        for child in &mut self.children { child.assign_guids(used, groups)?; }
+        Ok(())
+    }
+
+    fn guid_ownership(&self, nodes: &mut HashSet<roxmltree::NodeId>, values: &mut HashMap<String, HashSet<String>>) {
+        if matches!(self.role, OwnedRole::PhysicsGuid(_) | OwnedRole::Selection) {
+            nodes.insert(self.node.id());
+            nodes.insert(self.slot.id());
+            if matches!(self.role, OwnedRole::PhysicsGuid(_)) {
+                if let Some(uuid) = self.node.attribute("uuid") {
+                    values.entry(self.node.tag_name().name().to_owned()).or_default().insert(uuid.to_owned());
+                }
+            }
+        }
+        for child in &self.children { child.guid_ownership(nodes, values); }
+    }
+
+    fn render(&self, text: &str, copied: &HashSet<String>, used: &mut HashSet<String>, next_idx: &mut u64,
+        groups: &HashMap<String, Vec<String>>,
+    ) -> Result<String, String> {
+        if self.role == OwnedRole::Parameter {
+            return Ok(if self.slot.attribute("xs.ref").is_some() || self.node.attribute("xs.id").is_none() {
+                text[self.slot.range()].to_owned()
+            } else {
+                format!("<CParameterGuid xs.n='{}' xs.ref='{}'/>", escape_attribute(self.slot.attribute("xs.n").unwrap_or("")),
+                    escape_attribute(self.node.attribute("xs.id").unwrap()))
+            });
+        }
         let mut patches = Vec::new();
         for child in &self.children {
-            patches.push(Patch { range: child.slot.range(), value: child.render(text, copied, used, next_idx)? });
+            patches.push(Patch { range: child.slot.range(), value: child.render(text, copied, used, next_idx, groups)? });
         }
         let local = |node: Node<'_, '_>| !self.children.iter().any(|child| {
             let range = child.slot.range();
@@ -1808,9 +1859,14 @@ impl OwnedPhysics<'_, '_> {
                         Some(next_idx.to_string())
                     },
                     "uuid" if node.id() == self.node.id() && matches!(self.role, OwnedRole::PhysicsGuid(_)) => {
-                        let fresh = crate::animation_source::new_guid()?;
-                        if !used.insert(fresh.clone()) { return Err("authoring physics identity collision".into()); }
-                        Some(fresh)
+                        self.fresh_guid.clone()
+                    },
+                    "uuid" if node.id() == self.node.id() && self.role == OwnedRole::Selection => {
+                        match groups.get(attribute.value()).map(Vec::as_slice) {
+                            Some([guid]) => Some(guid.clone()),
+                            Some(_) => return Err("authoring physics selected group is ambiguous after copying".into()),
+                            None => return Err("authoring physics selected GUID does not name a copied group".into()),
+                        }
                     },
                     "xs.n" if node.id() == self.node.id() => match self.slot.attribute("xs.n") {
                         Some(name) => Some(escape_attribute(name)),
@@ -1867,19 +1923,33 @@ fn detach_text(text: &str, model: &Value) -> Result<(Value, String), String> {
     let inbound = inbound_refs(&document);
     let owner = graph.model()?.ok_or("authoring source contains no model")?;
     let slot = direct_field(owner, "physicsSettingsSourceSet").ok_or("authoring physics detach requires a direct settings field")?;
-    let plan = owned_physics(&graph, slot, OwnedRole::Set, &inbound, &mut HashSet::new(), &mut 0, &mut 0)?;
+    let mut plan = owned_physics(&graph, slot, OwnedRole::Set, &inbound, &mut HashSet::new(), &mut 0, &mut 0)?;
     let (by_guid, _) = parameter_maps(model)?;
     let before = view_document(&graph, &inbound, &by_guid)?;
     if !plan.needs_detach() { return Ok((model.clone(), text.to_owned())); }
     let mut copied = HashSet::new();
     plan.copied_ids(&mut copied);
+    let mut parameters = HashSet::new();
+    plan.parameter_ids(&mut parameters);
+    copied.retain(|id| !parameters.contains(id));
     let mut used: HashSet<String> = document.descendants().flat_map(|node| [node.attribute("xs.id"), node.attribute("uuid")])
         .flatten().map(str::to_owned).collect();
     let mut next_idx = 0;
     for value in document.descendants().filter_map(|node| node.attribute("xs.idx")) {
         next_idx = next_idx.max(value.parse::<u64>().map_err(|_| "authoring physics has an invalid serial")?);
     }
-    let body = plan.render(text, &copied, &mut used, &mut next_idx)?;
+    let mut groups = HashMap::new();
+    let mut guid_nodes = HashSet::new();
+    let mut guid_values = HashMap::new();
+    plan.guid_ownership(&mut guid_nodes, &mut guid_values);
+    for node in document.descendants().filter(|node| node.is_element() && !guid_nodes.contains(&node.id())) {
+        let target = graph.resolve(node)?;
+        if target.attribute("uuid").is_some_and(|uuid| guid_values.get(target.tag_name().name()).is_some_and(|values| values.contains(uuid))) {
+            return Err("authoring physics detach refuses an opaque physics GUID link".into());
+        }
+    }
+    plan.assign_guids(&mut used, &mut groups)?;
+    let body = plan.render(text, &copied, &mut used, &mut next_idx, &groups)?;
     let mut candidate = model.clone();
     candidate["physicsSource"] = json!(body);
     let rewritten = splice_source(text, &text[plan.node.range()], candidate["physicsSource"].as_str().unwrap())?;

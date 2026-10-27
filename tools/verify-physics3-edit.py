@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,18 @@ def verify_detach(host, source):
     assert xml.count(b"<CPhysicsSettingsSourceSet ") == 1 and xml.count(b"</root>") == 1
     shared_xml = xml.replace(b"<CPhysicsSettingsSourceSet ",
                              b"<CPhysicsSettingsSourceSet xs.id='shared-physics-set' ", 1)
+    guid = b"8c743936-cf77-421d-a3b4-81ca16b80880"
+    assert shared_xml.count(b"<CPhysicsSettingsSource>") == 1
+    shared_xml = shared_xml.replace(b"<CPhysicsSettingsSource>",
+        b"<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' uuid='" + guid + b"'/>", 1)
+    shared_xml = shared_xml.replace(b"</CPhysicsSettingsSourceSet>",
+        b"<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid='" + guid + b"'/></CPhysicsSettingsSourceSet>", 1)
+    for field in [b"source", b"destination"]:
+        old = b"xs.n='" + field + b"' uuid='parameter-guid'"
+        assert shared_xml.count(old) == 1
+        shared_xml = shared_xml.replace(old, b"xs.n='" + field + b"' xs.ref='shared-parameter-guid'")
+    shared_xml = shared_xml.replace(b"</root>",
+        b"<CParameterGuid xs.id='shared-parameter-guid' uuid='parameter-guid'/></root>")
     shared_xml = shared_xml.replace(b"</root>", b"<CPhysicsSettingsSourceSet xs.ref='shared-physics-set'/></root>")
     updated = [(*entry[:-1], SOURCE.zip_main_xml(entry[-1], shared_xml))
                if entry[0][0] == "main.xml" else entry for entry in entries]
@@ -218,6 +231,13 @@ def verify_detach(host, source):
     assert detached["revision"] == before["revision"] + 1
     assert detached["model"]["parameters"] == before["model"]["parameters"]
     assert detached_view["editable"] is True
+    detached_xml = ET.fromstring(detached["model"]["physicsSource"])
+    selected = next(node for node in detached_xml if node.get("xs.n") == "selectedCubismPhysics")
+    group = next(detached_xml.iter("CPhysicsSettingsSource"))
+    group_guid = next(node.get("uuid") for node in group if node.get("xs.n") == "guid")
+    assert group_guid != guid.decode() and selected.get("uuid") == group_guid
+    assert all(node.get("xs.ref") == "shared-parameter-guid" and node.get("uuid") is None
+               for node in detached_xml.iter("CParameterGuid"))
     assert detached_view["groups"][0]["vertices"][1]["delay"] == 0.6
     edit(host, "detach-again", detach=True)
     assert host.call("detached-again-snapshot", "snapshot", {}) == detached

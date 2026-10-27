@@ -1611,8 +1611,13 @@ shared definitions remain available to outside references. Parameter UUIDs,
 unknown markup and numeric spelling are preserved. Repeating the operation on
 private settings changes no state or history. Ordinary edits still refuse shared
 storage and never detach it implicitly.
+Existing parameter-GUID references remain references. The selected-group GUID
+follows the copied group; ambiguous or missing selected-group identity refuses
+the copy atomically.
 
-Detachment supports direct fields and one-hop references of the known physics classes. Alias chains, inherited fields,
+Mutable ownership supports direct fields and one-hop references of the known physics classes.
+Parameter-GUID references are borrowed and their chains remain unchanged.
+Alias chains in mutable ownership, inherited fields,
 conflicting alias metadata, ambiguous opaque references into copied identities,
 ownership cycles and serial overflow refuse atomically. The copy is limited to
 16 MiB and 500,000 emitted XML nodes, in addition to the existing group/item

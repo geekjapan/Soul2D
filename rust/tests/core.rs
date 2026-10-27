@@ -3631,6 +3631,88 @@ fn physics3_edit_rejects_shared_storage_containers_and_leaf_comments() {
 }
 
 #[test]
+fn physics3_detach_refuses_ambiguous_or_missing_selected_group_identity() {
+    for selection in ["<CPhysicsSettingsGuid xs.n='selectedCubismPhysics'/>",
+        "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid=''/>"] {
+        let xml = native_physics_xml()
+            .replacen("<i xs.n='settingFPS'>", &format!("{selection}<i xs.n='settingFPS'>"), 1);
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "missing-selection-guid.cmo3");
+        let message = physics3_refuse(&mut session, &before,
+            &json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+        assert!(message.contains("selected"), "{message}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    for selected in ["duplicate-selection", "missing-selection"] {
+        let xml = native_physics_xml()
+            .replace("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' uuid='duplicate-selection'/>")
+            .replacen("<i xs.n='settingFPS'>", &format!("<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid='{selected}'/><i xs.n='settingFPS'>"), 1);
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "ambiguous-selection.cmo3");
+        let message = physics3_refuse(&mut session, &before,
+            &json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+        assert!(message.contains("selected"), "{message}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    for outside in ["<CPhysicsSettingsGuid xs.n='futureLink' uuid='outside-guid'/>",
+        "<CPhysicsSettingsGuid xs.ref='outside-guid-object'/>"] {
+        let xml = native_physics_xml()
+            .replacen("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' xs.id='outside-guid-object' uuid='outside-guid'/>", 1)
+            .replace("<Opaque xs.id='future-data'>", &format!("{outside}<Opaque xs.id='future-data'>"));
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "opaque-guid.cmo3");
+        let message = physics3_refuse(&mut session, &before,
+            &json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+        assert!(message.contains("opaque physics GUID link"), "{message}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_detach_keeps_the_selected_group_linked_to_its_new_guid() {
+    let xml = native_physics_xml()
+        .replacen("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource><CPhysicsSettingsGuid xs.n='guid' uuid='selected-group-guid' note='keep'/>", 1)
+        .replacen("<i xs.n='settingFPS'>", "<CPhysicsSettingsGuid xs.n='selectedCubismPhysics' uuid='selected-group-guid' note='selection-note'/><i xs.n='settingFPS'>", 1);
+    let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "selection.cmo3");
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true})));
+    let snapshot = session.snapshot();
+    let body = snapshot["model"]["physicsSource"].as_str().unwrap();
+    let parsed = roxmltree::Document::parse(body).unwrap();
+    let selected = parsed.root_element().children().find(|node| node.attribute("xs.n") == Some("selectedCubismPhysics")).unwrap();
+    let group = parsed.descendants().find(|node| node.has_tag_name("CPhysicsSettingsSource")).unwrap();
+    let guid = group.children().find(|node| node.attribute("xs.n") == Some("guid")).unwrap().attribute("uuid").unwrap();
+    assert_ne!(guid, "selected-group-guid");
+    assert_eq!(selected.attribute("uuid"), Some(guid), "selection must follow the copied active group");
+    assert_eq!(selected.attribute("note"), Some("selection-note"));
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(session.snapshot()["model"], before["model"]);
+    result(&request(&mut session, json!({"op":"redo"})));
+    assert_eq!(session.snapshot()["model"], snapshot["model"]);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn physics3_detach_preserves_shared_parameter_guid_references() {
+    let xml = native_physics_xml()
+        .replace("<Opaque xs.id='future-data'>", "<CParameterGuid xs.id='parameter-object' uuid='parameter-guid' note='keep'/><Opaque xs.id='future-data'>")
+        .replace("xs.n='source' uuid='parameter-guid'", "xs.n='source' xs.ref='parameter-object'")
+        .replace("xs.n='destination' uuid='parameter-guid'", "xs.n='destination' xs.ref='parameter-object'");
+    let (mut session, revision, _, directory) = physics3_session(authoring_bytes(&xml), "shared-parameter.cmo3");
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true})));
+    let snapshot = session.snapshot();
+    let body = snapshot["model"]["physicsSource"].as_str().unwrap();
+    let parsed = roxmltree::Document::parse(body).unwrap();
+    let parameters: Vec<_> = parsed.descendants().filter(|node| node.has_tag_name("CParameterGuid")).collect();
+    assert_eq!(parameters.len(), 4);
+    assert!(parameters.iter().all(|node| node.attribute("xs.ref") == Some("parameter-object") && node.attribute("uuid").is_none()),
+        "shared parameter identity must keep its existing serialized reference: {body}");
+    fs::remove_dir_all(directory).unwrap();
+    let alias = xml.replacen("xs.n='source' xs.ref='parameter-object'", "xs.n='source' xs.id='parameter-alias' xs.ref='parameter-object'", 1);
+    let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&alias), "shared-parameter-alias.cmo3");
+    let message = physics3_refuse(&mut session, &before,
+        &json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+    assert!(message.contains("retained shared ownership"), "{message}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn physics3_detach_makes_aliased_items_private_and_roundtrips() {
     let (mut session, revision, before, directory) = physics3_session(native_physics_bytes(), "detach.cmo3");
     let original = physics3_read(&mut session);
