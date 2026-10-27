@@ -3095,15 +3095,16 @@ fn physics3_read(session: &mut Session) -> Value {
 
 #[test]
 fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step() {
-    for list in ["<carray_list xs.n='_sourceCubismPhysics' count='0'/>",
-        "<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>"] {
+    for (list, selection) in [("<carray_list xs.n='_sourceCubismPhysics' count='0'/>", ""),
+        ("<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>",
+            "<null xs.n='selectedCubismPhysics' xs.id='selection-private'/>")] {
         let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
             <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet?>\r\n\
             <?version CModelSource:15?>\r\n\
             <!--keep-prolog <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource?> -->\r\n\
             {}<?import com.live2d.graphics3d.type.GVector2?>", native_artmesh_xml("")).replace("<CDrawableSourceSet", &format!(
             "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><i xs.n='settingFPS'>60</i>\
-             {list}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
+             {list}{selection}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
         let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
         let group = json!({"name":"First & only", "normalization":{
             "position":{"min":-10.0,"default":0.0,"max":10.0}, "angle":{"min":-30.0,"default":0.0,"max":30.0}},
@@ -3115,6 +3116,17 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(session.snapshot()["revision"], revision + 1);
         let created = session.snapshot()["model"].clone();
+        let source = created["physicsSource"].as_str().unwrap();
+        let parsed = roxmltree::Document::parse(source).unwrap();
+        let guid = parsed.descendants().find(|node| node.has_tag_name("CPhysicsSettingsGuid")
+            && node.attribute("xs.n") == Some("guid")).unwrap();
+        let selected = parsed.descendants().find(|node| node.attribute("xs.n") == Some("selectedCubismPhysics")).unwrap();
+        assert!(selected.has_tag_name("CPhysicsSettingsGuid"));
+        assert!(!guid.attribute("uuid").unwrap().is_empty());
+        assert_eq!(guid.attribute("uuid"), selected.attribute("uuid"));
+        assert_eq!(guid.attribute("note"), Some("(no debug info)"));
+        assert_eq!(selected.attribute("note"), Some("(no debug info)"));
+        if !selection.is_empty() { assert_eq!(selected.attribute("xs.id"), Some("selection-private")); }
         let view = physics3_read(&mut session);
         assert_eq!(view["groups"].as_array().unwrap().len(), 1);
         assert_eq!(view["groups"][0]["name"], group["name"]);
@@ -3146,6 +3158,7 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
             "com.live2d.cubism.doc.model.id.CPhysicsSettingId",
             "com.live2d.graphics3d.type.GVector2",
             "com.live2d.type.CParameterGuid",
+            "com.live2d.type.CPhysicsSettingsGuid",
         ] {
             assert_eq!(imports.iter().filter(|import| **import == class).count(), 1,
                 "saved physics class must resolve through exactly one import: {class}");
