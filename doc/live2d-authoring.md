@@ -1586,6 +1586,20 @@ cause is not known, and the export writes the pairs. Keys are written in
 alphabetical order, not in the order of the vendor file. No Cubism Viewer or
 SDK has loaded an exported file, so vendor acceptance is NOT_RUN.
 
+The first physics group can be created with `live2d.physics3.edit` in an existing
+empty inline settings list. Omit `group`, `list`, `index` and `field`, and pass
+`insert: 0`, the current `expectedRevision`, and
+`value: {name, normalization: {position: {min, default, max}, angle: {min, default, max}}, inputs: [], outputs: [], vertices: []}`.
+All five group fields are required. Populated arrays use the existing item shapes
+and parameter IDs. The writer allocates the next unused `PhysicsSetting<n>` ID;
+it preserves the surrounding XML and container entries. Missing, null, shared or
+nonempty settings lists refuse this operation. Existing group duplication remains
+available. Creation is one Undo step and uses the same save/reopen checks as edits.
+The Physics groups panel exposes **Create first group** with empty input, output
+and vertex lists, position normalization `-10, 0, 10` and angle normalization
+`-30, 0, 30`. This creates storage; simulation and Cubism acceptance require
+separate verification.
+
 The physics settings are exported with `live2d.physics3.export {path?}`
 (`live2d_physics3_export`), in the layout of `.physics3.json`. Each physics
 setting of the CMO3 becomes one entry of `PhysicsSettings` with its inputs,

@@ -5,8 +5,8 @@
 //! `commit_model`. `rewrite` splices the stored string back at the element's byte range, so unknown markup and
 //! full-precision numbers survive and the strict `read(reopened) == candidate` gate still holds. Groups have no
 //! stable identity: callers address them by document order under `expectedRevision`. A new group is a copy of a
-//! stored one (`duplicate`) with new GUIDs and the next free `PhysicsSetting<n>` ID, the form the supplied Cubism files
-//! use; a file with no group gets none, since the layout of a first group is unproven.
+//! stored one (`duplicate`), or the first group can be constructed in an existing empty inline settings list.
+//! Missing, null and shared settings sets remain outside the construction boundary.
 
 use crate::authoring_graph::Graph;
 use crate::authoring_values::{self as values, Budget};
@@ -511,7 +511,7 @@ fn view_document(
     if slots.len() > MAX_GROUPS {
         return Err("authoring physics exceeds 256 settings".into());
     }
-    let list_inline = direct_field(set, "_sourceCubismPhysics")
+    let list_inline = list.has_tag_name("carray_list") && direct_field(set, "_sourceCubismPhysics")
         .is_some_and(|field| {
             field.id() == list.id() && field.attribute("xs.ref").is_none()
         })
@@ -717,10 +717,7 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
     let duplicate = optional_bool(object, "duplicate", false)?;
     let field = request_string(object, "field")?;
     let value = object.get("value");
-    if insert_at.is_some() && group_index.is_none() {
-        return Err("creating a physics group is not supported".into());
-    }
-    if insert_at.is_some() && list_name.is_none() {
+    if insert_at.is_some() && group_index.is_some() && list_name.is_none() {
         return Err("authoring physics insert requires a list".into());
     }
 
@@ -743,6 +740,25 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
 
     let mut patches = Vec::new();
     let check: Verify = match (group_index, list_name, item_index, insert_at, remove, field, value) {
+        (None, None, None, Some(0), false, None, Some(value)) if !duplicate => {
+            if !list.has_tag_name("carray_list") {
+                return Err("donor-free physics creation requires an inline settings list".into());
+            }
+            if !slots.is_empty() {
+                return Err("donor-free physics creation requires an empty settings list".into());
+            }
+            let used: HashSet<_> = document.descendants().filter_map(|node| node.attribute("idstr")).collect();
+            let id = (1..=used.len() + 1).map(|number| format!("PhysicsSetting{number}"))
+                .find(|id| !used.contains(id.as_str())).ok_or("no free physics setting ID")?;
+            let element = first_group(&by_id, &guid_objects, &id, value)?;
+            if item_insert_offset(text, list, &slots, 0, &mut patches, &element)? {
+                count_patch(text, list, 1, &mut patches)?;
+            }
+            Verify::Value {
+                path: vec![json!("groups"), json!(0), json!("name")],
+                expected: value["name"].clone(),
+            }
+        }
         // A new group: a copy of one the file stores, at the end, with new GUIDs and the next free
         // `PhysicsSetting<n>` ID.
         (Some(group), None, None, None, false, None, None) if duplicate => {
@@ -1193,7 +1209,57 @@ fn renumber_outputs(
     Ok(())
 }
 
-/// The element text for an inserted list item, with every authored field validated.
+fn first_group(
+    by_id: &HashMap<String, String>,
+    guid_objects: &HashMap<&str, &str>,
+    id: &str,
+    value: &Value,
+) -> Result<String, String> {
+    let object = value.as_object().ok_or("new physics group must be an object")?;
+    if object.keys().any(|key| !matches!(key.as_str(), "name" | "normalization" | "inputs" | "outputs" | "vertices")) {
+        return Err("new physics group carries an unknown field".into());
+    }
+    let name = object.get("name").and_then(Value::as_str).ok_or("new physics group requires a name")?;
+    if name.len() > MAX_NAME_BYTES {
+        return Err("authoring physics name exceeds 1024 bytes".into());
+    }
+    let normalization = object.get("normalization").and_then(Value::as_object)
+        .ok_or("new physics group requires normalization")?;
+    if normalization.len() != 2 || !normalization.contains_key("position") || !normalization.contains_key("angle") {
+        return Err("normalization requires exactly position and angle".into());
+    }
+    let mut ranges = String::new();
+    for (key, native) in [("position", "Position"), ("angle", "Angle")] {
+        let range = normalization[key].as_object().ok_or("normalization range must be an object")?;
+        if range.len() != 3 || !["min", "default", "max"].iter().all(|key| range.contains_key(*key)) {
+            return Err("normalization range requires exactly min, default and max".into());
+        }
+        let min = native_finite(&range["min"], "min")?;
+        let default = native_finite(&range["default"], "default")?;
+        let max = native_finite(&range["max"], "max")?;
+        if min > default || default > max {
+            return Err("authoring physics normalization must keep min <= default <= max".into());
+        }
+        ranges.push_str(&format!(
+            "<f xs.n='normalized{native}ValueMin'>{}</f><f xs.n='normalized{native}DefaultValue'>{}</f>\
+             <f xs.n='normalized{native}ValueMax'>{}</f>", number_text(min), number_text(default), number_text(max),
+        ));
+    }
+    let mut lists = String::new();
+    let vertices = object.get("vertices").and_then(Value::as_array).ok_or("new physics group requires vertices")?;
+    for list in ["inputs", "outputs", "vertices"] {
+        let items = object.get(list).and_then(Value::as_array).ok_or_else(|| format!("new physics group requires {list}"))?;
+        if items.len() > MAX_ITEMS_PER_LIST { return Err("authoring physics list exceeds 1024 entries".into()); }
+        lists.push_str(&format!("<carray_list xs.n='{list}' count='{}'>", items.len()));
+        for (index, item) in items.iter().enumerate() {
+            lists.push_str(&item_insert(by_id, guid_objects, list, vertices.len(), index, item)?);
+        }
+        lists.push_str("</carray_list>");
+    }
+    Ok(format!("<CPhysicsSettingsSource><CPhysicsSettingId xs.n='id' idstr='{id}'/>\
+        <s xs.n='name'>{}</s>{lists}{ranges}</CPhysicsSettingsSource>", escape_text(name)))
+}
+
 fn item_insert(
     by_id: &HashMap<String, String>,
     guid_objects: &HashMap<&str, &str>,

@@ -2,7 +2,7 @@
 //! returns, rendered as editable rows. Every commit is one `live2d.physics3.edit` request guarded by
 //! `expectedRevision`, so a document changed elsewhere is refused instead of overwritten. A DragValue keeps a
 //! draft in `drag` until it is let go, as the timeline's value fields do, so a drag stays one undo step.
-//! Group creation has no UI because the backend refuses it: a vendor file's `idstr` grammar is unproven.
+//! The first group can be created only in an existing editable empty settings list.
 //! Each group also has a Presets section for the per-user presets of its inputs or pendulum vertices: Save and
 //! Delete write the settings directory (not the document, so no `expectedRevision` and no undo step); Apply is a
 //! guarded `live2d.physics3.edit` with `preset`.
@@ -171,6 +171,16 @@ impl PhysicsGroups {
             .collect();
         let mut pending = None;
         self.set_row(ui, &view, &mut pending);
+        if view["groups"].as_array().is_some_and(Vec::is_empty)
+            && ui.add_enabled(view["editable"] == true, egui::Button::new("Create first group")).clicked()
+            && pending.is_none()
+        {
+            pending = Some(json!({"op":"live2d.physics3.edit", "insert":0, "value":{
+                "name":"Physics", "normalization":{
+                    "position":{"min":-10.0,"default":0.0,"max":10.0},
+                    "angle":{"min":-30.0,"default":0.0,"max":30.0}},
+                "inputs":[], "outputs":[], "vertices":[]}}));
+        }
         for (g, group) in view["groups"].as_array().into_iter().flatten().enumerate() {
             self.group_ui(ui, g, group, &view, &parameters, &mut pending);
         }
@@ -641,6 +651,29 @@ mod tests {
         fn revision(&self) -> u64 {
             self.controller.snapshot()["revision"].as_u64().unwrap()
         }
+    }
+
+    #[test]
+    fn the_panel_creates_the_first_group_with_shared_history() {
+        let mut rig = Rig::new("physics-first-group", cmo3_physics_bytes());
+        let revision = rig.revision();
+        let removed = rig.controller.core_request(&json!({"op":"live2d.physics3.edit",
+            "expectedRevision":revision,"group":0,"remove":true}));
+        assert_eq!(removed["succeeded"], true, "{removed}");
+        let before = rig.controller.snapshot()["model"].clone();
+        let revision = rig.revision();
+        let output = rig.draw();
+        assert!(has(&output, Role::Button, "Create first group"));
+        rig.click(Role::Button, "Create first group");
+        assert_eq!(rig.revision(), revision + 1);
+        assert_eq!(rig.view()["groups"][0]["name"], "Physics");
+        rig.controller.core_request(&json!({"op":"undo"}));
+        assert_eq!(rig.controller.snapshot()["model"], before);
+        rig.draw();
+        assert_eq!(rig.view()["groups"], json!([]));
+        rig.controller.core_request(&json!({"op":"redo"}));
+        rig.draw();
+        assert_eq!(rig.view()["groups"][0]["name"], "Physics");
     }
 
     #[test]

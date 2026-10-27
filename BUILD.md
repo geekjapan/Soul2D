@@ -93,6 +93,8 @@ undo, saved state and reopening without starting an AI agent or using provider c
 Linux additionally runs the four real FFmpeg export tests that the default suite ignores,
 including decoding, audio duration and audio placement. The two licensed-corpus tests
 still require separately acquired inputs.
+Linux also runs the synthetic physics-source HTTP proof, including first-group
+creation, Undo/Redo and save/reopen. Its result JSON is retained for three days.
 File-format checks that use external models require separately acquired
 inputs and their licenses. Keep those inputs under the ignored `build/` directory.
 

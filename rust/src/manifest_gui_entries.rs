@@ -346,6 +346,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("live2d_parameter_set", &[
         "Live2D runtime panels",
     ]),
+    ("live2d_physics3_edit", &[
+        "Live2D panels",
+    ]),
     ("live2d_physics3_preset_delete", &[
         "Live2D panels",
     ]),
@@ -353,6 +356,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "Live2D panels",
     ]),
     ("live2d_physics3_preset_save", &[
+        "Live2D panels",
+    ]),
+    ("live2d_physics3_read", &[
         "Live2D panels",
     ]),
     ("live2d_physics_attach", &[

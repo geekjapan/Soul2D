@@ -164,6 +164,32 @@ def verify(host, source):
     host.call("reopen", "open", {"path": str(saved)})
     assert view(host, "reopened") == precise
 
+    edit(host, "remove-last-group", group=0, remove=True)
+    empty = host.call("empty-snapshot", "snapshot", {})
+    assert view(host, "empty-view")["groups"] == []
+    created_group = {"name": "First & only", "normalization": {
+        "position": {"min": -10, "default": 0, "max": 10},
+        "angle": {"min": -30, "default": 0, "max": 30}},
+        "inputs": [{"source": "ParamTest", "type": "X"}],
+        "outputs": [{"destination": "ParamTest", "vertexIndex": 1}],
+        "vertices": [{key: vertex[key] for key in ("x", "y", "mobility", "delay", "acceleration", "radius")}
+                     for vertex in precise["groups"][0]["vertices"]]}
+    edit(host, "create-first-group", insert=0, value=created_group)
+    created = host.call("created-snapshot", "snapshot", {})
+    assert created["revision"] == empty["revision"] + 1
+    first = view(host, "first-group-view")
+    assert first["groups"][0]["name"] == created_group["name"]
+    assert first["groups"][0]["normalization"] == created_group["normalization"]
+    assert first["groups"][0]["vertices"][1]["delay"] == 0.800001
+    host.call("undo-first-group", "undo", {})
+    assert host.call("undone-first-snapshot", "snapshot", {})["model"] == empty["model"]
+    host.call("redo-first-group", "redo", {})
+    assert host.call("redone-first-snapshot", "snapshot", {})["model"] == created["model"]
+    first_path = host.run / "first-group.cmo3"
+    host.call("save-first-group", "save", {"path": str(first_path)})
+    host.call("reopen-first-group", "open", {"path": str(first_path)})
+    assert view(host, "first-group-reopened") == first
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

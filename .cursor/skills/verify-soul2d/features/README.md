@@ -98,6 +98,12 @@ saved/reopened view. Proof scope ends there: the six `editor_physics_groups` egu
 tests cover the panel code path but are not native GUI acceptance, and no vendor
 CMO3 or native window run is part of it (native GUI/vendor parity: NOT_RUN).
 
+The proof also removes the last group and creates a populated first group without
+a donor, checks one-step Undo/Redo and saves/reopens the created group. Linux Rust
+CI runs this synthetic proof with isolated settings and retains only its result
+JSON. Missing, null and shared storage refusals are covered by Rust tests; this
+does not establish vendor interoperability or acceptance of every physics control.
+
 For panel inspection in a real editor window, expand the collapsed-by-default
 headers first: **Physics groups**, then the **Sway (group 0)** group header and the
 **input inputs (1)**, **output outputs (1)** and **vertex vertices (2)** list

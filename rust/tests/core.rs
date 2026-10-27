@@ -2743,7 +2743,7 @@ fn physics3_edit_refusals_and_item_insert_remove() {
         (json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,"group":0,"field":"name","value":"x"}),
             "revision conflict"),
         (json!({"op":"live2d.physics3.edit","expectedRevision":revision,"insert":0,"value":{"name":"new"}}),
-            "creating a physics group"),
+            "requires an empty settings list"),
         (json!({"op":"live2d.physics3.edit","expectedRevision":revision,"group":9,"field":"name","value":"x"}),
             "outside the list"),
         (json!({"op":"live2d.physics3.edit","expectedRevision":revision,"group":0,"field":"name","value":"x","bogus":1}),
@@ -2858,6 +2858,90 @@ fn physics3_refuse(session: &mut Session, before: &Value, edit: &Value) -> Strin
 
 fn physics3_read(session: &mut Session) -> Value {
     result(&request(session, json!({"op":"live2d.physics3.read"}))).clone()
+}
+
+#[test]
+fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step() {
+    for list in ["<carray_list xs.n='_sourceCubismPhysics' count='0'/>",
+        "<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>"] {
+        let xml = native_artmesh_xml("").replace("<CDrawableSourceSet", &format!(
+            "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><i xs.n='settingFPS'>60</i>\
+             {list}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
+        let group = json!({"name":"First & only", "normalization":{
+            "position":{"min":-10.0,"default":0.0,"max":10.0}, "angle":{"min":-30.0,"default":0.0,"max":30.0}},
+            "inputs":[{"source":"ParamTest","type":"X"}], "outputs":[{"destination":"ParamTest","vertexIndex":1}],
+            "vertices":physics3_vertices(0.800001, 6.0)});
+        let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call", "params":{
+            "name":"live2d_physics3_edit", "arguments":{"expectedRevision":revision,"insert":0,"value":group}}});
+        let reply = session.handle_mcp(&call).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(session.snapshot()["revision"], revision + 1);
+        let created = session.snapshot()["model"].clone();
+        let view = physics3_read(&mut session);
+        assert_eq!(view["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(view["groups"][0]["name"], group["name"]);
+        assert_eq!(view["groups"][0]["normalization"], group["normalization"]);
+        assert_eq!(view["groups"][0]["inputs"][0]["source"], "ParamTest");
+        assert_eq!(view["groups"][0]["outputs"][0]["vertexIndex"], 1);
+        assert_eq!(view["groups"][0]["vertices"][1]["delay"], 0.800001);
+        result(&request(&mut session, json!({"op":"undo"})));
+        assert_eq!(session.snapshot()["model"], before["model"]);
+        result(&request(&mut session, json!({"op":"redo"})));
+        assert_eq!(session.snapshot()["model"], created);
+        let saved = directory.join("created.cmo3");
+        result(&request(&mut session, json!({"op":"save","path":saved})));
+        let mut reopened = Session::new();
+        result(&request(&mut reopened, json!({"op":"open","path":saved})));
+        assert_eq!(reopened.snapshot()["model"], created);
+        assert_eq!(physics3_read(&mut reopened), view);
+        assert!(created["physicsSource"].as_str().unwrap().contains("PhysicsSetting1"));
+        if list.contains("<!--keep-->") { assert!(created["physicsSource"].as_str().unwrap().contains("<!--keep-->")); }
+        let revision = reopened.snapshot()["revision"].clone();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+            "group":0,"list":"vertices","index":1,"field":"delay","value":0.25})));
+        assert_eq!(physics3_read(&mut reopened)["groups"][0]["vertices"][1]["delay"], 0.25);
+        assert_eq!(fs::read(directory.join("empty.cmo3")).unwrap(), authoring_bytes(&xml));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_first_group_refusals_preserve_the_document() {
+    let group = json!({"name":"First", "normalization":{
+        "position":{"min":-10,"default":0,"max":10}, "angle":{"min":-30,"default":0,"max":30}},
+        "inputs":[], "outputs":[], "vertices":[]});
+    let empty = "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'>\
+        <carray_list xs.n='_sourceCubismPhysics' count='0'/></CPhysicsSettingsSourceSet>";
+    for set in [empty.to_owned(), "<null xs.n='physicsSettingsSourceSet'/>".into(), String::new(),
+        empty.replace("<carray_list xs.n='_sourceCubismPhysics' count='0'/>", "<null xs.n='_sourceCubismPhysics'/>"),
+        empty.replace("count='0'", "count='1'"),
+        format!("{}<i xs.ref='shared-set'/>", empty.replace("xs.n='physicsSettingsSourceSet'", "xs.n='physicsSettingsSourceSet' xs.id='shared-set'"))] {
+        let xml = native_artmesh_xml("").replace("<CDrawableSourceSet", &format!("{set}<CDrawableSourceSet"));
+        let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "refuse.cmo3");
+        if set.contains("<null xs.n='_sourceCubismPhysics'") {
+            assert_eq!(physics3_read(&mut session)["editable"], false);
+        }
+        if set != empty {
+            physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+                "insert":0,"value":group}));
+        }
+        let mut values = vec![json!({}), group.clone()];
+        values[1]["normalization"]["angle"]["max"] = json!(-1);
+        let mut bad = group.clone(); bad["vertices"] = json!([{"x":0,"y":0,"mobility":2,"delay":0,"acceleration":0,"radius":0}]);
+        values.push(bad);
+        let mut bad = group.clone(); bad["inputs"] = json!([{"source":"missing","type":"X"}]); values.push(bad);
+        let mut bad = group.clone(); bad["unknown"] = json!(true); values.push(bad);
+        let mut bad = group.clone(); bad["name"] = json!("changed\rname"); values.push(bad);
+        for value in values {
+            physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit","expectedRevision":revision,
+                "insert":0,"value":value}));
+        }
+        physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit","expectedRevision":revision+1,
+            "insert":0,"value":group}));
+        assert_eq!(fs::read(directory.join("refuse.cmo3")).unwrap(), authoring_bytes(&xml));
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 /// Three vertices like the ones of group 0 of `native_physics_xml`, the second with the delay `delay` and the

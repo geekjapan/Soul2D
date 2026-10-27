@@ -65,7 +65,7 @@ jobs:
           # Use Ubuntu's primary mirror after slow Azure mirror downloads in CI.
           sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston imagemagick ffmpeg libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston imagemagick ffmpeg lsof libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
       - name: Check documentation and package metadata
         run: |
           python tools/verify-doc-twins.py
@@ -104,6 +104,19 @@ jobs:
         with:
           name: scripted-mcp-${{ matrix.os }}
           path: ${{ runner.temp }}/scripted-mcp/run-*.json
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Verify physics source edits and first-group creation over HTTP MCP
+        if: runner.os == 'Linux'
+        env:
+          INOCHI_CONFIG_PATH: ${{ runner.temp }}/physics-source-config
+        run: python -I tools/verify-physics3-edit.py --core ./out/rust/debug/soul2d-core --njc ./out/rust/debug/njc
+      - name: Upload physics source verification result
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: physics-source
+          path: build/verification/ani236/mcp-*/result.json
           if-no-files-found: warn
           retention-days: 3
       - name: Launch the editor on X11 and Wayland
