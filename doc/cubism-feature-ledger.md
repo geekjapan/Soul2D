@@ -226,3 +226,34 @@ Viewer, Photoshop helpers, AE plugin and verification tools are classified in
 REL01-REL06 (**ACCEPTED_MAPPING**), no longer BOUNDARY_UNRESOLVED, and are not
 silently excluded: each has a recorded position. This ledger does not close
 phase 1. No all-features percentage may be computed from its current row count.
+
+## Definition checks on 2026-10-27
+
+The official [release history](https://docs.live2d.com/en/cubism-editor-manual/new-feature-introduction-title/)
+lists 5.3.04 on 2026-09-03 and 5.3.05 beta1 on 2026-10-13. The
+[5.4 alpha announcement](https://www.live2d.com/en/information/cubism-5_4-alpha/)
+states that downloading and using the alpha ended on 2026-10-18 at 23:59 JST.
+An installed alpha is therefore not a usable reference for a new run. The target
+above remains unchanged. Public Issue [#1](https://github.com/geekjapan/Soul2D/issues/1)
+tracks successor features; prerelease descriptions do not establish implemented
+or accepted Soul2D behavior.
+
+- GEO19, [Issue #13](https://github.com/geekjapan/Soul2D/issues/13). The official
+  [Deform Paths manual](https://docs.live2d.com/en/cubism-editor-manual/deformpath/)
+  defines control paths on ArtMeshes. Editing path points and deforming the mesh
+  are different modes. The remaining definition work is the source representation
+  and deformation calculation, with a legitimate minimal example. An INX
+  PathDeformer or an ArtPath is not a substitute.
+- PAR06/PAR07, [Issue #14](https://github.com/geekjapan/Soul2D/issues/14). The
+  [interpolation-type manual](https://docs.live2d.com/en/cubism-editor-manual/extended-type/)
+  describes controls and trajectories but supplies no complete construction
+  algorithm. The inspected official sources do not satisfy the published-formula
+  prerequisite. This is not proof that no specification exists elsewhere.
+  Unsupported evaluation stays refused.
+- PAR20, [Issue #15](https://github.com/geekjapan/Soul2D/issues/15). The official
+  [Motion Mirroring manual](https://docs.live2d.com/en/cubism-editor-manual/motion-mirroring/)
+  describes baking opposite-side keyforms around the parameter default, rejecting
+  the default source form, selectable ArtMesh axes, and parent-first processing.
+  It does not settle asymmetric/even key pairing or the exact nested-space
+  transformation. A three-key, single-deformer observation is the next bounded
+  definition check; these notes are not implementation or vendor acceptance.
