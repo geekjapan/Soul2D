@@ -2864,7 +2864,9 @@ fn physics3_read(session: &mut Session) -> Value {
 fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step() {
     for list in ["<carray_list xs.n='_sourceCubismPhysics' count='0'/>",
         "<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>"] {
-        let xml = native_artmesh_xml("").replace("<CDrawableSourceSet", &format!(
+        let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+            <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet?>\r\n\
+            <?version CModelSource:15?>\r\n<!--keep-prolog-->\r\n{}", native_artmesh_xml("")).replace("<CDrawableSourceSet", &format!(
             "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><i xs.n='settingFPS'>60</i>\
              {list}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
         let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
@@ -2891,10 +2893,32 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         assert_eq!(session.snapshot()["model"], created);
         let saved = directory.join("created.cmo3");
         result(&request(&mut session, json!({"op":"save","path":saved})));
+        let saved_xml = saved_main_xml(&saved);
+        let parsed = roxmltree::Document::parse(&saved_xml).unwrap();
+        let imports: Vec<_> = parsed.root().children().filter_map(|node| node.pi())
+            .filter(|pi| pi.target == "import").filter_map(|pi| pi.value).collect();
+        for class in [
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource",
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet",
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsInput",
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsOutput",
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsVertex",
+            "com.live2d.cubism.doc.gameData.physics.CPhysicsController$CPhysicsSourceType",
+            "com.live2d.cubism.doc.model.id.CPhysicsSettingId",
+            "com.live2d.graphics3d.type.GVector2",
+            "com.live2d.type.CParameterGuid",
+        ] {
+            assert_eq!(imports.iter().filter(|import| **import == class).count(), 1,
+                "saved physics class must resolve through exactly one import: {class}");
+        }
+        assert!(saved_xml.starts_with(xml.split("<root").next().unwrap()), "existing prolog changed");
         let mut reopened = Session::new();
         result(&request(&mut reopened, json!({"op":"open","path":saved})));
         assert_eq!(reopened.snapshot()["model"], created);
         assert_eq!(physics3_read(&mut reopened), view);
+        let saved_again = directory.join("created-again.cmo3");
+        result(&request(&mut reopened, json!({"op":"save","path":saved_again})));
+        assert_eq!(saved_main_xml(&saved_again), saved_xml, "imports must not accumulate on save");
         assert!(created["physicsSource"].as_str().unwrap().contains("PhysicsSetting1"));
         if list.contains("<!--keep-->") { assert!(created["physicsSource"].as_str().unwrap().contains("<!--keep-->")); }
         let revision = reopened.snapshot()["revision"].clone();
