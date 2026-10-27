@@ -1402,8 +1402,13 @@ Undo in the same Session restores original bytes. Reversing a selection after
 reopening restores its meaning, without promising the original reference spelling.
 This adds no brush creation, image-input retargeting, editor control or rendering.
 Line generation and vendor acceptance remain separate work under #159.
-Other scalar fields the file does not store are copied from the same field
-elsewhere in the file, and is refused where the file stores it nowhere. A
+Other missing scalar fields require a compatible inline layout for the same field
+elsewhere in the file. Without that donor, insertion is refused. Session regression
+`native_form_settings_save_reopen_and_undo` covers ArtMesh screen-colour insertion,
+absent donors and multiply-colour storage shared by two forms. It checks atomic refusal
+with an existing Redo branch, equal-value no-ops, stale revisions, single-step Undo/Redo,
+fresh-session reopen and exact preservation of unrelated XML and container payloads.
+These synthetic storage checks establish no native control or vendor-rendering acceptance. A
 missing mask list is copied, emptied, from another source of the same kind. In
 the two samples whose fileFormatVersion starts with 40 no Part stores one, so a
 Part mask stays refused there. The

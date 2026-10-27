@@ -529,35 +529,107 @@ fn a_capacity_native_texture_limits_refuse_without_state_changes() {
 
 #[test]
 fn native_form_settings_save_reopen_and_undo() {
+    use soul2d_core::caff::CaffDocument;
     let directory = temp_dir();
-    let source = directory.join("source.cmo3");
-    let saved = directory.join("settings.cmo3");
-    fs::write(&source, native_artmesh_bytes("<i xs.n='drawOrder'>500</i><f xs.n='opacity'>0.75</f>")).unwrap();
-    let mut session = Session::new();
-    let opened = result(&request(&mut session, json!({"op":"open","path":source}))).clone();
-    let revision = opened["revision"].as_u64().unwrap();
-    let form = json!({"op":"live2d.form.set","sourceGuid":"mesh-guid","formGuid":"form-guid","coordinateType":"Canvas"});
-    let mut absent = form.clone();
-    absent["screenColor"] = json!([0.5, 0.5, 0.5]);
-    absent["expectedRevision"] = json!(revision);
-    let refused = request(&mut session, absent);
-    assert!(refused["message"].as_str().unwrap().contains("stores no screenColor"), "{refused}");
-    assert_eq!(session.snapshot(), opened);
-    let mut order = form.clone();
-    order["drawOrder"] = json!(620);
-    order["expectedRevision"] = json!(revision);
-    let edited = result(&request(&mut session, order)).clone();
-    assert_eq!(edited["model"]["sources"][0]["forms"][0]["drawOrder"], 620);
-    result(&request(&mut session, json!({"op":"save","path":saved})));
-    let reopened = result(&request(&mut session, json!({"op":"open","path":saved}))).clone();
-    assert_eq!(reopened["model"]["sources"][0]["forms"][0]["drawOrder"], 620);
-    let again = result(&request(&mut session, json!({"op":"open","path":source}))).clone();
-    let mut order = form.clone();
-    order["drawOrder"] = json!(10);
-    order["expectedRevision"] = again["revision"].clone();
-    result(&request(&mut session, order));
-    let undone = result(&request(&mut session, json!({"op":"undo"}))).clone();
-    assert_eq!(undone["model"]["sources"][0]["forms"][0]["drawOrder"], 500);
+    for storage in ["absent", "donor", "shared"] {
+        let source = directory.join(format!("{storage}.cmo3"));
+        let saved = directory.join(format!("{storage}-settings.cmo3"));
+        let undo_saved = directory.join(format!("{storage}-undo.cmo3"));
+        let color = "<CFloatColor xs.n='multiplyColor' red='1' green='1' blue='1' alpha='1'/>";
+        let mut xml = native_artmesh_xml("<i xs.n='drawOrder'>500</i><f xs.n='opacity'>0.75</f>");
+        if storage != "absent" {
+            let start = xml.find("<CArtMeshSource xs.id='mesh'>").unwrap();
+            let end = start + xml[start..].find("</CArtMeshSource>").unwrap() + "</CArtMeshSource>".len();
+            let mut donor = xml[start..end].replace("xs.id='mesh'", "xs.id='donor'")
+                .replace("xs.ref='mesh'", "xs.ref='donor'")
+                .replace("mesh-guid", "donor-mesh-guid").replace("form-guid", "donor-form-guid");
+            if storage == "donor" {
+                donor = donor.replace(color, &format!("{color}<CFloatColor xs.n='screenColor' red='0.1' green='0.2' blue='0.3' alpha='0.9'/>"));
+            } else {
+                xml = xml.replace(color, "<CFloatColor xs.n='multiplyColor' xs.id='shared-color' red='1' green='1' blue='1' alpha='1'/>");
+                donor = donor.replace(color, "<CFloatColor xs.n='multiplyColor' xs.ref='shared-color'/>");
+            }
+            xml = xml.replace("<CDrawableSourceSet xs.n='drawableSourceSet'><carray_list xs.n='_sources' count='1'><CArtMeshSource xs.ref='mesh'/>",
+                "<CDrawableSourceSet xs.n='drawableSourceSet'><carray_list xs.n='_sources' count='2'><CArtMeshSource xs.ref='mesh'/><CArtMeshSource xs.ref='donor'/>");
+            xml = xml.replace("<CPartSource xs.id='part'>", &format!("{donor}<CPartSource xs.id='part'>"));
+        }
+        let bytes = authoring_bytes(&xml);
+        fs::write(&source, &bytes).unwrap();
+        let mut session = Session::new();
+        let opened = result(&request(&mut session, json!({"op":"open","path":source}))).clone();
+        assert_eq!(opened["model"]["sources"].as_array().unwrap().iter()
+            .filter(|source| source["data"]["type"] == "ArtMesh").count(), if storage == "absent" { 1 } else { 2 });
+        let form = json!({"op":"live2d.form.set","sourceGuid":"mesh-guid","formGuid":"form-guid","coordinateType":"Canvas"});
+        let mut order = form.clone();
+        order["drawOrder"] = json!(620);
+        order["expectedRevision"] = opened["revision"].clone();
+        let edited = result(&request(&mut session, order.clone())).clone();
+        let mut expected = opened["model"].clone();
+        expected["sources"][0]["forms"][0]["drawOrder"] = json!(620);
+        assert_eq!(edited["model"], expected, "{storage}");
+        assert_eq!(edited["revision"].as_u64(), Some(opened["revision"].as_u64().unwrap() + 1));
+        let mut same = order.clone();
+        same["expectedRevision"] = edited["revision"].clone();
+        assert_eq!(result(&request(&mut session, same)), &edited, "equal-value edit must be a no-op");
+        order["drawOrder"] = json!(10);
+        let refused = request(&mut session, order);
+        assert!(refused["message"].as_str().unwrap().contains("revision conflict"), "{refused}");
+        assert_eq!(session.snapshot(), edited);
+        let undone = result(&request(&mut session, json!({"op":"undo"}))).clone();
+        assert_eq!(undone["model"], opened["model"]);
+        assert_eq!(undone["canUndo"], false, "one edit must add one undo step");
+        assert_eq!(undone["canRedo"], true);
+        let mut color_edit = form.clone();
+        color_edit["expectedRevision"] = undone["revision"].clone();
+        color_edit[if storage == "shared" { "multiplyColor" } else { "screenColor" }] = json!([0.5, 0.25, 0.0, 1.0]);
+        let final_model = if storage == "donor" {
+            let colored = result(&request(&mut session, color_edit)).clone();
+            let mut expected = opened["model"].clone();
+            expected["sources"][0]["forms"][0]["screenColor"] = json!([0.5, 0.25, 0.0, 1.0]);
+            assert_eq!(colored["model"], expected);
+            assert_eq!(colored["canRedo"], false);
+            assert_eq!(colored["revision"].as_u64(), Some(undone["revision"].as_u64().unwrap() + 1));
+            let undo = result(&request(&mut session, json!({"op":"undo"}))).clone();
+            assert_eq!(undo["model"], opened["model"]);
+            assert_eq!(undo["canUndo"], false);
+            colored["model"].clone()
+        } else {
+            let refused = request(&mut session, color_edit);
+            assert_eq!(refused["succeeded"], false, "{storage}: {refused}");
+            if storage == "absent" {
+                assert!(refused["message"].as_str().unwrap().contains("stores no screenColor"), "{refused}");
+            }
+            assert_eq!(session.snapshot(), undone, "refusal must preserve the redo branch");
+            edited["model"].clone()
+        };
+        assert_eq!(session.snapshot()["model"], opened["model"]);
+        result(&request(&mut session, json!({"op":"save","path":undo_saved})));
+        assert_eq!(session.snapshot()["canRedo"], true);
+        let redone = result(&request(&mut session, json!({"op":"redo"}))).clone();
+        assert_eq!(redone["model"], final_model);
+        result(&request(&mut session, json!({"op":"save","path":saved})));
+        let reopened = result(&request(&mut Session::new(), json!({"op":"open","path":saved}))).clone();
+        assert_eq!(reopened["model"], final_model);
+        assert_eq!(reopened["canUndo"], false);
+        assert_eq!(reopened["canRedo"], false);
+        let original = CaffDocument::parse(&bytes).unwrap();
+        let expected_xml = if storage == "donor" {
+            xml.replacen(color, &format!("{color}<CFloatColor xs.n='screenColor' red='0.5' green='0.25' blue='0' alpha='1'/>"), 1)
+        } else {
+            xml.replacen("<i xs.n='drawOrder'>500</i>", "<i xs.n='drawOrder'>620</i>", 1)
+        };
+        for (path, expected_xml) in [(&undo_saved, &xml), (&saved, &expected_xml)] {
+            let written = CaffDocument::parse(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(written.main_xml(), expected_xml.as_bytes(), "{storage}: unrelated XML must remain exact");
+            assert_eq!(written.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+                original.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>());
+            for entry in original.entries().iter().filter(|entry| entry.name != "main.xml") {
+                assert_eq!(written.entry_data(&entry.name), original.entry_data(&entry.name), "{}", entry.name);
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+    }
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
