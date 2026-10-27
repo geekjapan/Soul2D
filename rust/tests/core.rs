@@ -364,6 +364,142 @@ fn a_pro_size_cmo3_large_textures_render_and_roundtrip() {
 }
 
 #[test]
+#[ignore = "keyed-parameter and dense-form workload runs sequentially in capacity CI"]
+fn a_pro_size_cmo3_keyed_parameters_and_dense_forms_roundtrip() {
+    const WIDE_MESHES: usize = 512;
+    let base = native_artmesh_xml("<f xs.n='opacity'>1</f>");
+    let parsed = roxmltree::Document::parse(&base).unwrap();
+    let mesh = parsed.descendants().find(|node| node.attribute("xs.id") == Some("mesh")).unwrap();
+    let mesh_text = &base[mesh.range()];
+    let grid = mesh.children().find(|node| node.has_tag_name("KeyformGridSource")).unwrap();
+    let form = mesh.descendants().find(|node| node.has_tag_name("CArtMeshForm")).unwrap();
+    let forms = mesh.children().find(|node| node.attribute("xs.n") == Some("keyforms")).unwrap();
+    let parameter = parsed.descendants().find(|node| node.has_tag_name("CParameterSource")).unwrap();
+    let parameter_list = parameter.parent().unwrap();
+    let donor = native_morph_artmesh_xml("", "");
+    let donor_tree = roxmltree::Document::parse(&donor).unwrap();
+    let binding = donor_tree.descendants().find(|node| node.attribute("xs.id") == Some("binding")).unwrap();
+    let binding_text = &donor[binding.range()];
+    let mut parameters = String::new();
+    let mut bindings = String::new();
+    let mut meshes = String::new();
+    let mut values = serde_json::Map::new();
+    for group in 0..=WIDE_MESHES {
+        let (axes, keys): (usize, usize) = if group == WIDE_MESHES { (3, 9) } else { (2, 3) };
+        let key_values: Vec<f64> = (0..keys).map(|key| -1.0 + key as f64 * 2.0 / (keys - 1) as f64).collect();
+        let mut binding_refs = String::new();
+        for axis in 0..axes {
+            let id = format!("Param{group}_{axis}");
+            let guid = format!("parameter-guid-{group}-{axis}");
+            let binding_id = format!("binding-{group}-{axis}");
+            parameters.push_str(&base[parameter.range()].replace("parameter-guid", &guid).replace("ParamTest", &id));
+            bindings.push_str(&binding_text.replace("xs.id='binding'", &format!("xs.id='{binding_id}'"))
+                .replace("parameter-guid", &guid)
+                .replace("<array_list xs.n='keys' count='2'><f>-1</f><f>1</f></array_list>",
+                    &format!("<array_list xs.n='keys' count='{keys}'>{}</array_list>",
+                        key_values.iter().map(|value| format!("<f>{value}</f>")).collect::<String>())));
+            binding_refs.push_str(&format!("<KeyformBindingSource xs.ref='{binding_id}'/>"));
+            let sample = if group == WIDE_MESHES { [0.125, 0.375, -0.625][axis] }
+                else { [if group & 1 == 0 { 0.5 } else { -0.5 }, if group & 2 == 0 { -0.5 } else { 0.5 }][axis] };
+            values.insert(id, json!(sample));
+        }
+        let cells = keys.pow(axes as u32);
+        let mut cell_text = String::new();
+        let mut form_text = String::new();
+        for cell in 0..cells {
+            let indices: Vec<usize> = (0..axes).map(|axis| cell / keys.pow(axis as u32) % keys).collect();
+            let coordinates: Vec<f64> = indices.iter().map(|index| key_values[*index]).collect();
+            let (a, b, c) = (coordinates[0], coordinates[1], coordinates.get(2).copied().unwrap_or(0.0));
+            let (x, y) = (a + 2.0 * b + 4.0 * c, 3.0 * a - b + 2.0 * c);
+            let guid = format!("keyed-form-{group}-{cell}");
+            cell_text.push_str(&format!("<KeyformOnGrid><KeyformGridAccessKey xs.n='accessKey'>\
+                <array_list xs.n='_keyOnParameterList' count='{axes}'>{}</array_list></KeyformGridAccessKey>\
+                <CFormGuid xs.n='keyformGuid' uuid='{guid}'/></KeyformOnGrid>",
+                indices.iter().enumerate().map(|(axis, index)| format!("<KeyOnParameter>\
+                    <KeyformBindingSource xs.n='binding' xs.ref='binding-{group}-{axis}'/>\
+                    <i xs.n='keyIndex'>{index}</i></KeyOnParameter>")).collect::<String>()));
+            form_text.push_str(&base[form.range()].replace("form-guid", &guid)
+                .replace("xs.ref='mesh'", &format!("xs.ref='keyed-mesh-{group}'"))
+                .replace("1 2 3 4 5 6", &format!("{x} {y} 3 4 5 6")));
+        }
+        meshes.push_str(&mesh_text.replace(&base[grid.range()], &format!("<KeyformGridSource xs.n='keyformGridSource'>\
+            <array_list xs.n='keyformBindings' count='{axes}'>{binding_refs}</array_list>\
+            <array_list xs.n='keyformsOnGrid' count='{cells}'>{cell_text}</array_list></KeyformGridSource>"))
+            .replace(&base[forms.range()], &format!("<carray_list xs.n='keyforms' count='{cells}'>{form_text}</carray_list>"))
+            .replace("'mesh'", &format!("'keyed-mesh-{group}'")).replace("mesh-guid", &format!("keyed-mesh-guid-{group}")));
+    }
+    let xml = base.replace(&base[parameter_list.range()], &format!("<carray_list xs.n='_sources' count='1027'>{parameters}</carray_list>"))
+        .replace(mesh_text, &meshes)
+        .replace("count='1'><CArtMeshSource xs.ref='mesh'/>", &format!("count='513'>{}",
+            (0..=WIDE_MESHES).map(|group| format!("<CArtMeshSource xs.ref='keyed-mesh-{group}'/>")).collect::<String>()))
+        .replace("<CPartSource xs.id='part'>", &format!("{bindings}<CPartSource xs.id='part'>"));
+    let nodes = roxmltree::Document::parse(&xml).unwrap().descendants().count();
+    assert!(xml.len() < 64 * 1024 * 1024 && nodes < 1_000_000);
+    assert_eq!(values.len(), 1027);
+    let bytes = authoring_bytes(&xml);
+    let directory = temp_dir();
+    let (source, saved) = (directory.join("keyed.cmo3"), directory.join("keyed-saved.cmo3"));
+    fs::write(&source, &bytes).unwrap();
+    let mut session = Session::new();
+    let clock = std::time::Instant::now();
+    let opened = result(&request(&mut session, json!({"op":"open","path":source}))).clone();
+    assert_eq!(opened["model"]["parameters"].as_array().unwrap().len(), 1027);
+    assert_eq!(opened["model"]["sources"].as_array().unwrap().iter()
+        .map(|source| source["forms"].as_array().unwrap().len()).sum::<usize>(), 5337);
+    let evaluate = |session: &mut Session, edited: usize| {
+        let response = request(session, json!({"op":"live2d.authoring.primary_forms","parameterValues":values}));
+        let meshes: Vec<_> = result(&response)["sources"].as_array().unwrap().iter()
+            .filter(|source| source["guid"].as_str().unwrap().starts_with("keyed-mesh-guid-")).collect();
+        assert_eq!(meshes.len(), 513);
+        for mesh in meshes {
+            let group: usize = mesh["guid"].as_str().unwrap().strip_prefix("keyed-mesh-guid-").unwrap().parse().unwrap();
+            let dense = group == WIDE_MESHES;
+            let (a, b) = (if group & 1 == 0 { 0.5 } else { -0.5 }, if group & 2 == 0 { -0.5 } else { 0.5 });
+            assert_eq!(mesh["axisValues"], if dense { json!([0.125,0.375,-0.625]) } else { json!([a,b]) });
+            let weights = mesh["weights"].as_array().unwrap();
+            assert_eq!(weights.len(), if dense { 8 } else { 4 });
+            assert!(weights.iter().all(|weight| weight["weight"] == if dense { 0.125 } else { 0.25 }));
+            let changed = (edited >= 1 && mesh["guid"] == "keyed-mesh-guid-0") || (edited == 2 && dense);
+            let (x, y) = if dense { (-1.625, -1.25) } else { (a + 2.0 * b, 3.0 * a - b) };
+            assert_eq!(mesh["evaluatedForms"][0]["data"]["positions"],
+                json!([x + if changed { 1.0 } else { 0.0 }, y + if changed { 2.0 } else { 0.0 },3.0,4.0,5.0,6.0]));
+        }
+    };
+    evaluate(&mut session, 0);
+    let mut models = vec![opened["model"].clone()];
+    for (group, cell, position) in [(0, 1, [2.0,9.0]), (WIDE_MESHES, 130, [5.5,14.25])] {
+        let revision = session.snapshot()["revision"].clone();
+        let edited = result(&request(&mut session, json!({"op":"live2d.form.set_vertex",
+            "sourceGuid":format!("keyed-mesh-guid-{group}"),"formGuid":format!("keyed-form-{group}-{cell}"),
+            "coordinateType":"Canvas","vertexIndex":0,"position":position,"expectedRevision":revision}))).clone();
+        models.push(edited["model"].clone());
+        evaluate(&mut session, models.len() - 1);
+    }
+    for (op, state) in [("undo",1), ("undo",0), ("redo",1), ("redo",2)] {
+        assert_eq!(result(&request(&mut session, json!({"op":op})))["model"], models[state]);
+        evaluate(&mut session, state);
+    }
+    let before = session.snapshot();
+    let stale = request(&mut session, json!({"op":"live2d.form.set_vertex","sourceGuid":"keyed-mesh-guid-0",
+        "formGuid":"keyed-form-0-1","coordinateType":"Canvas","vertexIndex":0,"position":[0,0],
+        "expectedRevision":opened["revision"]}));
+    assert_eq!(stale["succeeded"], false);
+    assert_eq!(session.snapshot(), before);
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    let mut reopened = Session::new();
+    assert_eq!(result(&request(&mut reopened, json!({"op":"open","path":saved})))["model"], models[2]);
+    evaluate(&mut reopened, 2);
+    let container = soul2d_core::caff::CaffDocument::parse(&fs::read(saved).unwrap()).unwrap();
+    let original = soul2d_core::caff::CaffDocument::parse(&bytes).unwrap();
+    for name in ["mesh.png", "opaque.bin"] { assert_eq!(container.entry_data(name), original.entry_data(name)); }
+    assert!(String::from_utf8(container.main_xml()).unwrap().contains("<Opaque xs.id='future-data'>keep-this-xml</Opaque>"));
+    assert_eq!(fs::read(source).unwrap(), bytes);
+    eprintln!("keyed CMO3: 1027 parameters, 512 two-axis 3-key meshes plus one three-axis 9-key mesh, 5337 forms; \
+        {} XML bytes, {nodes} XML nodes; open/evaluate/edit/history/save/reopen {:?}", xml.len(), clock.elapsed());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "decoder allocation boundary runs sequentially in capacity CI"]
 fn a_capacity_native_texture_limits_refuse_without_state_changes() {
     let directory = temp_dir();

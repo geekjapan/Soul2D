@@ -19,6 +19,7 @@ CASES = [
     "a_pro_size_cmo3_with_many_textures_and_deformers_opens_edits_saves_and_reopens",
     "a_pro_size_can3_curve_opens_edits_saves_and_reopens",
     "a_pro_size_cmo3_large_textures_render_and_roundtrip",
+    "a_pro_size_cmo3_keyed_parameters_and_dense_forms_roundtrip",
     "a_capacity_native_texture_limits_refuse_without_state_changes",
 ]
 
