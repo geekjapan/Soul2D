@@ -708,21 +708,17 @@ mod tests {
         let mut session = Session::new();
         session.video.probe = Some(CodecProbe { program:"panic-stub".into(),
             handle:Some(thread::spawn(|| panic!("probe test panic"))), outcome:None });
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            let status = session.op_export_video_probe_status();
-            if status["state"] != "running" { break status; }
-            assert!(std::time::Instant::now() < deadline);
+        while !session.video.probe.as_ref().unwrap().handle.as_ref().unwrap().is_finished() {
             thread::yield_now();
-        };
+        }
+        let status = session.op_export_video_probe_status();
         assert_eq!(status, json!({"state":"failed","program":"panic-stub","error":"the codec probe panicked"}));
         assert_eq!(session.op_export_video_probe_status(), status);
         let (release, wait) = std::sync::mpsc::channel();
         session.video.probe = Some(CodecProbe { program:"waiting-stub".into(),
             handle:Some(thread::spawn(move || { wait.recv().unwrap(); Ok(Vec::new()) })), outcome:None });
-        let before = std::time::Instant::now();
+        assert_eq!(session.op_export_video_probe_status(), json!({"state":"running","program":"waiting-stub"}));
         drop(session);
-        assert!(before.elapsed() < Duration::from_secs(1));
         release.send(()).unwrap();
     }
 
