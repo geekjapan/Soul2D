@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Msi,
     [Parameter(Mandatory)][string]$Fixture,
     [Parameter(Mandatory)][string]$EvidenceDirectory,
+    [string]$SoftwareGlArchive,
     [ValidateRange(10, 120)][int]$TimeoutSeconds = 60
 )
 
@@ -17,7 +18,19 @@ function Get-VerificationExitCode($Receipt) {
     if ($null -eq $Receipt.failure -and $Receipt.shortcut -eq 'PASS' -and $Receipt.association -eq 'PASS' `
         -and $Receipt.launches.Count -eq 2 -and $Receipt.launches[0].kind -eq 'start-menu' `
         -and $Receipt.launches[1].kind -eq 'association' -and $Receipt.launches[0].accepted -eq $true `
-        -and $Receipt.launches[1].accepted -eq $true) { return 0 }
+        -and $Receipt.launches[1].accepted -eq $true -and $Receipt.editorStdio -eq 'PASS') {
+        if ($Receipt.graphicsContext -notin @('system', 'test-software-wgl')) { return 1 }
+        foreach ($launch in $Receipt.launches) {
+            if ($launch.paint.status -ne 'PASS' -or $launch.paint.restored -ne $true `
+                -or $launch.console.attached -ne $true -or $launch.console.detached -ne $true `
+                -or $launch.console.processIds -notcontains $launch.pid) { return 1 }
+            if ($Receipt.graphicsContext -eq 'test-software-wgl' -and $launch.softwareModule.verified -ne $true) { return 1 }
+        }
+        if ($Receipt.graphicsContext -eq 'test-software-wgl' -and ($Receipt.graphicsFixture.verified -ne $true `
+            -or $Receipt.cleanup.fixtureRemoved -ne $true -or $Receipt.cleanup.inventoryRestored -ne $true)) { return 1 }
+        return 0
+    }
+    if ($Receipt.graphicsContext -ne 'system') { return 1 }
     if ($Receipt.shortcut -ne 'FAIL' -or $Receipt.association -ne 'NOT_RUN' -or $Receipt.launches.Count -ne 1) { return 1 }
     $launch = $Receipt.launches[0]
     $diagnostic = $launch.directDiagnostic
@@ -66,6 +79,7 @@ public static class InstalledSoul2D {
     }
 }
 '@
+Add-Type -Path (Join-Path $PSScriptRoot 'windows-editor-observation.cs')
 
 $msiPath = (Resolve-Path -LiteralPath $Msi).Path
 $fixturePath = (Resolve-Path -LiteralPath $Fixture).Path
@@ -93,6 +107,18 @@ $knownShortcuts = @(
     @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('DesktopDirectory')) |
         ForEach-Object { Join-Path $_ 'Soul2D.lnk' }
 )
+$ownedRegistryValues = @(
+    @{ path = 'HKCU:\Software\Soul2D contributors\Soul2D'; name = '' }
+    @{ path = 'HKCU:\Software\Microsoft\soul2d'; name = 'installed' }
+)
+function Test-OwnedRegistryValues {
+    foreach ($value in $ownedRegistryValues) {
+        $key = Get-Item -LiteralPath $value.path -ErrorAction SilentlyContinue
+        if ($null -ne $key -and $key.GetValueNames() -contains $value.name) { return $true }
+    }
+    return $false
+}
+if (Test-OwnedRegistryValues) { throw 'Pre-existing product marker values; refusing to change them.' }
 foreach ($path in @($ownedRegistryKeys) + @($knownShortcuts)) {
     if (Test-Path -LiteralPath $path) { throw "Pre-existing product registration or shortcut: $path" }
 }
@@ -107,8 +133,12 @@ foreach ($field in @($expectedResources.Keys)) {
 }
 $result = [ordered]@{ productCode = $productCode; files = @(); binaries = @(); launches = @();
     cleanup = @{ uninstallExitCode = $null; productAbsent = $false; installDirectoryAbsent = $false;
-        shortcutAbsent = $false; registrationsAbsent = $false; associationAbsent = $false; errors = @() };
-    installation = 'NOT_RUN'; shortcut = 'NOT_RUN'; association = 'NOT_RUN'; native = 'NOT_RUN'; failure = $null }
+        shortcutAbsent = $false; registrationsAbsent = $false; associationAbsent = $false;
+        fixtureRemoved = $false; inventoryRestored = $false; errors = @() };
+    sourceRevision = $env:GITHUB_SHA; msiSha256 = (Get-FileHash -LiteralPath $msiPath).Hash;
+    graphicsContext = $(if ($SoftwareGlArchive) { 'test-software-wgl' } else { 'system' }); graphicsFixture = $null;
+    installation = 'NOT_RUN'; shortcut = 'NOT_RUN'; association = 'NOT_RUN'; editorStdio = 'NOT_RUN';
+    native = 'NOT_RUN'; softwareGl = 'NOT_RUN'; failure = $null }
 $ownedEditors = [Collections.Generic.List[int]]::new()
 $ownedConfigs = [Collections.Generic.List[string]]::new()
 $cleanupFailures = [Collections.Generic.List[string]]::new()
@@ -116,6 +146,17 @@ $oldConfig = $env:INOCHI_CONFIG_PATH
 $oldBearer = $env:SOUL2D_MCP_BEARER
 $installationAttempted = $false
 $shortcutPath = $null
+$stagedDll = $null
+$originalInventory = $null
+$softwareDll = $null
+
+function Get-InstalledInventory {
+    $inventory = [ordered]@{}
+    Get-ChildItem -LiteralPath $installDirectory -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $inventory[$_.FullName.Substring($installDirectory.Length + 1)] = (Get-FileHash -LiteralPath $_.FullName).Hash
+    }
+    return ($inventory | ConvertTo-Json -Compress)
+}
 
 function Invoke-Msi([string[]]$MsiArguments, [string]$Log) {
     $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList ($MsiArguments + @('/qn', '/norestart', '/l*v', "`"$Log`""))
@@ -131,6 +172,75 @@ function Read-Resource([string]$Uri) {
     return ($response.result.contents[0].text | ConvertFrom-Json -AsHashtable)
 }
 
+function Invoke-EditorTool([string]$Name, [hashtable]$Arguments) {
+    $request = @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } |
+        ConvertTo-Json -Depth 10 -Compress
+    $response = Invoke-RestMethod -Uri $script:endpoint -Method Post -ContentType 'application/json; charset=utf-8' `
+        -Headers @{ Authorization = "Bearer $env:SOUL2D_MCP_BEARER" } -Body $request -TimeoutSec 5
+    if (($response.PSObject.Properties.Name -contains 'error') -or $response.result.isError) { throw "Editor refused $Name." }
+    return $response.result.structuredContent
+}
+
+function Observe-Paint($Editor, [string]$Kind, $Observation) {
+    $state = Read-Resource 'resource://soul2d/editor/state'
+    $snapshot = Read-Resource 'resource://vsoul/snapshot' | ConvertTo-Json -Depth 100 -Compress
+    $background = @($state.viewport.background)
+    $Observation.paint = [ordered]@{ status = 'FAIL'; restored = $false; changedPixels = 0;
+        minimumChangedPixels = 1000; rgbTolerance = 3 }
+    $a = [int[]]@(239, 31, 151); $b = [int[]]@(23, 211, 67)
+    try {
+        [void][EditorDesktop]::ShowWindow($Editor.MainWindowHandle, 9)
+        [void][EditorDesktop]::SetForegroundWindow($Editor.MainWindowHandle)
+        [void](Invoke-EditorTool 'editor_viewport_set' @{ background = $a })
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        $first = $null
+        do {
+            Start-Sleep -Milliseconds 250
+            $first = [EditorDesktop]::Capture($Editor.MainWindowHandle, [uint32]$Editor.Id)
+        } while ([EditorDesktop]::CountColor($first, $a) -lt 1000 -and [DateTime]::UtcNow -lt $deadline)
+        $firstPath = Join-Path $evidence "$Kind-background-a.bmp"
+        $first.Save($firstPath)
+        if ([EditorDesktop]::CountColor($first, $a) -lt 1000) { throw 'Desktop did not present background A.' }
+        [void](Invoke-EditorTool 'editor_viewport_set' @{ background = $b })
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            Start-Sleep -Milliseconds 250
+            $second = [EditorDesktop]::Capture($Editor.MainWindowHandle, [uint32]$Editor.Id)
+            $Observation.paint.changedPixels = [EditorDesktop]::CountTransitions($first, $second, $a, $b)
+        } while ($Observation.paint.changedPixels -lt 1000 -and [DateTime]::UtcNow -lt $deadline)
+        $secondPath = Join-Path $evidence "$Kind-background-b.bmp"
+        $second.Save($secondPath)
+        if ($Observation.paint.changedPixels -lt 1000) { throw 'The same desktop pixels did not respond to background B.' }
+        $Observation.paint.bounds = @{ left = $first.Left; top = $first.Top; width = $first.Width; height = $first.Height }
+        $Observation.paint.colors = @($a, $b)
+        $Observation.paint.frames = @($firstPath, $secondPath) | ForEach-Object {
+            @{ file = [IO.Path]::GetFileName($_); sha256 = (Get-FileHash -LiteralPath $_).Hash }
+        }
+        $Observation.paint.status = 'PASS'
+    } finally {
+        [void](Invoke-EditorTool 'editor_viewport_set' @{ background = $background })
+        $after = Read-Resource 'resource://soul2d/editor/state'
+        $afterSnapshot = Read-Resource 'resource://vsoul/snapshot' | ConvertTo-Json -Depth 100 -Compress
+        if (($after.viewport.background | ConvertTo-Json -Compress) -ne ($background | ConvertTo-Json -Compress) `
+            -or ($after.document | ConvertTo-Json -Depth 20 -Compress) -ne ($state.document | ConvertTo-Json -Depth 20 -Compress) `
+            -or $afterSnapshot -cne $snapshot) { throw 'Paint observation failed to restore view state or changed the document.' }
+        $Observation.paint.restored = $true
+    }
+}
+
+function Observe-Console($Editor, [string]$Kind) {
+    $path = Join-Path $evidence "$Kind-console.json"
+    $helper = Join-Path $PSScriptRoot 'observe-windows-console.ps1'
+    $observer = Start-Process pwsh -PassThru -NoNewWindow -ArgumentList @('-NoProfile', '-File', "`"$helper`"", `
+        '-EditorPid', $Editor.Id, '-OutputPath', "`"$path`"")
+    if (-not $observer.WaitForExit(15000)) {
+        $observer.Kill(); $observer.WaitForExit()
+        throw 'Console observer timed out.'
+    }
+    if ($observer.ExitCode -ne 0) { throw 'Console observation failed.' }
+    return (Get-Content -Raw -LiteralPath $path | ConvertFrom-Json -AsHashtable)
+}
+
 function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$ExpectedPath) {
     $config = Join-Path $env:RUNNER_TEMP "soul2d-installed-$Kind-$([guid]::NewGuid())"
     New-Item -ItemType Directory $config | Out-Null
@@ -142,7 +252,8 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $env:INOCHI_CONFIG_PATH = $config
     $env:SOUL2D_MCP_BEARER = [guid]::NewGuid().ToString('N')
     $settings = @{ firstrun_complete = $true; hasDoneQuickSetup = $true; 'MCP.Enabled' = $true;
-        'MCP.Host' = '127.0.0.1'; 'MCP.Port' = $port; 'MCP.authEnabled' = $true; AutosaveEnabled = $false }
+        'MCP.Host' = '127.0.0.1'; 'MCP.Port' = $port; 'MCP.authEnabled' = $true; AutosaveEnabled = $false;
+        WinW = 900; WinH = 600; WinMax = $false }
     [IO.File]::WriteAllText((Join-Path $config 'settings.json'), ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     $script:endpoint = "http://127.0.0.1:$port/mcp"
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -214,7 +325,6 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     if ($null -ne $ExpectedPath -and $snapshot.model.meta.name -ne $script:expectedName) {
         throw 'File association did not load the fixture identity.'
     }
-    $observation.accepted = $true
     $observation.pid = $editor.Id
     $observation.executablePath = $editor.Path
     $observation.listenerOwnerPid = $connections[0].OwningProcess
@@ -222,17 +332,44 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $observation.windowVisibleStyle = $true
     $observation.editorState = $state
     $observation.modelName = $snapshot.model.meta.name
-    $quit = @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'editor_quit'; arguments = @{} } } | ConvertTo-Json -Depth 5 -Compress
-    $reply = Invoke-RestMethod -Uri $script:endpoint -Method Post -ContentType 'application/json; charset=utf-8' `
-        -Headers @{ Authorization = "Bearer $env:SOUL2D_MCP_BEARER" } -Body $quit -TimeoutSec 5
-    if (($reply.PSObject.Properties.Name -contains 'error') -or $reply.result.isError) { throw 'Installed editor refused clean Quit.' }
+    if ($SoftwareGlArchive) {
+        $modules = @($editor.Modules | Where-Object { $_.ModuleName -ieq 'opengl32.dll' })
+        if ($modules.Count -ne 1 -or $modules[0].FileName -ine $stagedDll `
+            -or (Get-FileHash -LiteralPath $modules[0].FileName).Hash -ine $result.graphicsFixture.dllSha256) {
+            throw 'Installed editor did not load the pinned application-local software GL module.'
+        }
+        $observation.softwareModule = @{ verified = $true; path = $modules[0].FileName;
+            sha256 = (Get-FileHash -LiteralPath $modules[0].FileName).Hash }
+    }
+    $observation.console = Observe-Console $editor $Kind
+    Observe-Paint $editor $Kind $observation
+    $reply = Invoke-EditorTool 'editor_quit' @{}
+    if ($reply.quit.state -ne 'accepted') { throw 'Installed editor did not acknowledge clean Quit.' }
     if (-not $editor.WaitForExit(15000)) { throw 'Installed editor did not exit after clean Quit.' }
     $observation.exitCode = $editor.ExitCode
     if ($editor.ExitCode -ne 0) { throw 'Installed editor exited unsuccessfully.' }
+    $observation.accepted = $true
 }
 
 try {
     $env:SOUL2D_MCP_BEARER = $null
+    if ($SoftwareGlArchive) {
+        $pin = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'windows-software-gl.json') | ConvertFrom-Json -AsHashtable
+        $archive = (Resolve-Path -LiteralPath $SoftwareGlArchive).Path
+        if ((Get-FileHash -LiteralPath $archive).Hash -ine $pin.archiveSha256) { throw 'Software GL archive hash mismatch.' }
+        $temporary = Join-Path $env:RUNNER_TEMP "soul2d-software-gl-$([guid]::NewGuid())"
+        New-Item -ItemType Directory $temporary | Out-Null
+        $ownedConfigs.Add($temporary)
+        & 7z x $archive "-o$temporary" opengl32.dll -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot extract pinned software GL fixture.' }
+        $softwareDll = Join-Path $temporary 'opengl32.dll'
+        $bytes = [IO.File]::ReadAllBytes($softwareDll)
+        $pe = [BitConverter]::ToInt32($bytes, 60)
+        if ((Get-FileHash -LiteralPath $softwareDll).Hash -ine $pin.dllSha256 `
+            -or [BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'Software GL DLL identity mismatch.' }
+        $result.graphicsFixture = $pin
+        $result.graphicsFixture.verified = $true
+    }
     $installationAttempted = $true
     $result.installExitCode = Invoke-Msi @('/i', "`"$msiPath`"") (Join-Path $evidence 'install.log')
     if ($result.installExitCode -eq 3010) { throw 'The installation requires a reboot; launch acceptance is unverified.' }
@@ -253,6 +390,7 @@ try {
             productName = $version.ProductName; copyright = $version.LegalCopyright }
     }
     $result.files = @(Get-ChildItem -LiteralPath $installDirectory -Recurse -File | ForEach-Object { $_.FullName.Substring($installDirectory.Length + 1) })
+    $originalInventory = Get-InstalledInventory
     python tools/verify-mcp-initialize.py (Join-Path $installDirectory 'soul2d-core.exe') --mcp
     if ($LASTEXITCODE -ne 0) { throw 'Installed core MCP initialization failed.' }
     $shortcuts = @(@([Environment]::GetFolderPath('CommonPrograms'), [Environment]::GetFolderPath('Programs')) |
@@ -270,6 +408,13 @@ try {
         -or $target.ToString() -ne $editorPath) { throw 'Shortcut does not resolve to the installed editor component.' }
     $result.shortcutTarget = $target.ToString()
     $result.installation = 'PASS'
+    if ($SoftwareGlArchive) {
+        $destination = Join-Path $installDirectory 'opengl32.dll'
+        if (Test-Path -LiteralPath $destination) { throw 'Refusing to replace an installed GL module.' }
+        $stagedDll = $destination
+        Copy-Item -LiteralPath $softwareDll -Destination $stagedDll
+        if ((Get-FileHash -LiteralPath $stagedDll).Hash -ine $result.graphicsFixture.dllSha256) { throw 'Staged GL fixture hash mismatch.' }
+    }
     $result.shortcut = 'FAIL'
     Wait-Editor 'start-menu' $shortcutPath $null
     $result.shortcut = 'PASS'
@@ -283,15 +428,34 @@ try {
     Wait-Editor 'association' $association $association
     if ((Get-FileHash -LiteralPath $association).Hash -ne $before) { throw 'Installed launch changed the input fixture.' }
     $result.association = 'PASS'
+    $config = Join-Path $env:RUNNER_TEMP "soul2d-installed-stdio-$([guid]::NewGuid())"
+    New-Item -ItemType Directory $config | Out-Null
+    $ownedConfigs.Add($config)
+    $env:INOCHI_CONFIG_PATH = $config
+    $env:SOUL2D_MCP_BEARER = $null
+    @{ firstrun_complete = $true; hasDoneQuickSetup = $true; 'MCP.Enabled' = $false; AutosaveEnabled = $false;
+        WinW = 900; WinH = 600; WinMax = $false } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $config 'settings.json') -Encoding utf8NoBOM
+    python tools/verify-mcp-initialize.py --editor $editorPath --mcp > (Join-Path $evidence 'editor-stdio.log') 2>&1
+    if ($LASTEXITCODE -ne 0) { throw 'Installed editor stdio initialize/state/quit failed.' }
+    $result.editorStdio = 'PASS'
 } catch {
     $result.failure = $_.Exception.Message
 } finally {
     foreach ($editorId in $ownedEditors) {
         try {
             $process = Get-Process -Id $editorId -ErrorAction SilentlyContinue
-            if ($null -ne $process -and $process.Path -eq $editorPath) { Stop-Process -Id $editorId -Force }
+            if ($null -ne $process -and $process.Path -eq $editorPath) { $process.Kill(); $process.WaitForExit() }
         } catch { $cleanupFailures.Add($_.Exception.Message) }
     }
+    try {
+        if ($null -ne $stagedDll -and (Test-Path -LiteralPath $stagedDll)) { Remove-Item -LiteralPath $stagedDll -Force }
+        $result.cleanup.fixtureRemoved = $null -eq $stagedDll -or -not (Test-Path -LiteralPath $stagedDll)
+        if ($null -ne $originalInventory) {
+            $result.cleanup.inventoryRestored = (Get-InstalledInventory) -ceq $originalInventory
+            if (-not $result.cleanup.inventoryRestored) { throw 'Installed file inventory changed before uninstall.' }
+        }
+    } catch { $cleanupFailures.Add($_.Exception.Message) }
     $env:SOUL2D_MCP_BEARER = $null
     if ($installationAttempted) {
         try {
@@ -299,7 +463,8 @@ try {
             $result.cleanup.productAbsent = [InstalledSoul2D]::MsiQueryProductState($productCode) -eq -1
             $result.cleanup.installDirectoryAbsent = -not (Test-Path -LiteralPath $installDirectory)
             $result.cleanup.shortcutAbsent = @($knownShortcuts | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0
-            $result.cleanup.registrationsAbsent = @($ownedRegistryKeys | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0
+            $result.cleanup.registrationsAbsent = @($ownedRegistryKeys | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0 `
+                -and -not (Test-OwnedRegistryValues)
             $extension = Get-Item 'HKLM:\SOFTWARE\Classes\.inx' -ErrorAction SilentlyContinue
             $result.cleanup.associationAbsent = $null -eq $extension -or $extension.GetValue('') -ne 'soul2d.inx'
             if (-not $result.cleanup.productAbsent -or -not $result.cleanup.installDirectoryAbsent -or -not $result.cleanup.shortcutAbsent `
@@ -315,7 +480,11 @@ try {
     $env:INOCHI_CONFIG_PATH = $oldConfig
     $env:SOUL2D_MCP_BEARER = $oldBearer
     $result.exitCode = Get-VerificationExitCode $result
-    $result.native = switch ($result.exitCode) { 0 { 'PASS' }; 2 { 'UNSUPPORTED' }; default { 'FAIL' } }
+    if ($SoftwareGlArchive) {
+        $result.softwareGl = $(if ($result.exitCode -eq 0) { 'PASS' } else { 'FAIL' })
+    } else {
+        $result.native = switch ($result.exitCode) { 0 { 'PASS' }; 2 { 'UNSUPPORTED' }; default { 'FAIL' } }
+    }
     $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $evidence 'result.json') -Encoding utf8NoBOM
 }
 if ($result.exitCode -eq 2) {

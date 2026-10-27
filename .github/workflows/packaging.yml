@@ -159,7 +159,11 @@ jobs:
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
       - name: Check Windows installation outcome handling
         shell: pwsh
-        run: ./tools/test-windows-install-outcome.ps1
+        run: |
+          ./tools/test-windows-install-outcome.ps1
+          ./tools/test-windows-editor-observation.ps1
+          python tools/test-mcp-initialize.py
+          if ($LASTEXITCODE -ne 0) { throw 'MCP probe checks failed.' }
       - name: Compile Windows resources
         shell: pwsh
         run: |
@@ -249,7 +253,10 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -notin @(0, 2)) { throw "Windows installation verification failed with exit code $code." }
           $receipt = Get-Content -Raw "$env:RUNNER_TEMP/windows-install/result.json" | ConvertFrom-Json
-          if ($receipt.exitCode -ne $code -or $receipt.installation -ne 'PASS' -or $receipt.cleanup.errors.Count -ne 0 `
+          if ($receipt.exitCode -ne $code -or $receipt.graphicsContext -ne 'system' `
+              -or $receipt.sourceRevision -ne $env:GITHUB_SHA `
+              -or $receipt.msiSha256 -ine (Get-FileHash out/Soul2D.msi).Hash `
+              -or $receipt.installation -ne 'PASS' -or $receipt.cleanup.errors.Count -ne 0 `
               -or $receipt.cleanup.uninstallExitCode -ne 0) { throw 'Inconsistent installation verification receipt.' }
           foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', 'associationAbsent')) {
             if ($receipt.cleanup.$field -ne $true) { throw "Incomplete installation cleanup: $field" }
@@ -274,5 +281,50 @@ jobs:
         with:
           name: windows-install
           path: ${{ runner.temp }}/windows-install
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Verify installed Windows editor with pinned test software GL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pin = Get-Content -Raw tools/windows-software-gl.json | ConvertFrom-Json
+          $archive = Join-Path $env:RUNNER_TEMP 'soul2d-test-software-gl.7z'
+          Invoke-WebRequest -Uri $pin.url -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive).Hash -ine $pin.archiveSha256) { throw 'Software GL archive hash mismatch.' }
+          $invalid = Join-Path $env:RUNNER_TEMP 'soul2d-invalid-install-fixture.inx'
+          [IO.File]::WriteAllBytes($invalid, [byte[]]@(73, 78, 88, 80, 65, 82, 84, 83, 255, 255, 255, 255))
+          $PSNativeCommandUseErrorActionPreference = $false
+          pwsh -NoProfile -File ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
+            -Fixture $invalid -SoftwareGlArchive $archive `
+            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install-software-gl/failure-cleanup"
+          if ($LASTEXITCODE -ne 1) { throw 'Malformed fixture did not fail after software GL staging.' }
+          $failure = Get-Content -Raw "$env:RUNNER_TEMP/windows-install-software-gl/failure-cleanup/result.json" | ConvertFrom-Json
+          if ($failure.exitCode -ne 1 -or $failure.softwareGl -ne 'FAIL' -or $failure.native -ne 'NOT_RUN' `
+              -or $failure.shortcut -ne 'PASS' -or $failure.association -ne 'NOT_RUN' `
+              -or $failure.launches.Count -ne 1 -or $failure.launches[0].softwareModule.verified -ne $true `
+              -or $failure.failure -notlike '*GetString*' -or $failure.cleanup.errors.Count -ne 0 `
+              -or $failure.cleanup.uninstallExitCode -ne 0) { throw 'Missing post-staging failure/cleanup evidence.' }
+          foreach ($field in @('productAbsent', 'installDirectoryAbsent', 'shortcutAbsent', 'registrationsAbsent', `
+              'associationAbsent', 'fixtureRemoved', 'inventoryRestored')) {
+            if ($failure.cleanup.$field -ne $true) { throw "Incomplete failure cleanup: $field" }
+          }
+          pwsh -NoProfile -File ./tools/verify-windows-install.ps1 -Msi out/Soul2D.msi `
+            -Fixture out/rust-verification/fixture.inx -SoftwareGlArchive $archive `
+            -EvidenceDirectory "$env:RUNNER_TEMP/windows-install-software-gl"
+          if ($LASTEXITCODE -ne 0) { throw 'Software GL installed-editor acceptance failed.' }
+          $receipt = Get-Content -Raw "$env:RUNNER_TEMP/windows-install-software-gl/result.json" | ConvertFrom-Json
+          if ($receipt.exitCode -ne 0 -or $receipt.graphicsContext -ne 'test-software-wgl' `
+              -or $receipt.softwareGl -ne 'PASS' -or $receipt.native -ne 'NOT_RUN' `
+              -or $receipt.sourceRevision -ne $env:GITHUB_SHA `
+              -or $receipt.msiSha256 -ine (Get-FileHash out/Soul2D.msi).Hash `
+              -or $receipt.graphicsFixture.archiveSha256 -ine $pin.archiveSha256 `
+              -or $receipt.graphicsFixture.dllSha256 -ine $pin.dllSha256) { throw 'Inconsistent software-context receipt.' }
+          '### Windows installed-editor software GL acceptance passed. This is a test-only llvmpipe context; the separate system-GL result remains authoritative for native hardware acceptance.' >> $env:GITHUB_STEP_SUMMARY
+      - name: Upload software GL installed-editor evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-software-gl
+          path: ${{ runner.temp }}/windows-install-software-gl
           if-no-files-found: warn
           retention-days: 3

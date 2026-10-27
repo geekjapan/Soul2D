@@ -1,0 +1,8 @@
+{
+  "provider": "mmozeiko/build-mesa",
+  "version": "26.2.5",
+  "buildCommit": "cb4cc458eff7c4b4b31d2623edd954d66201b88f",
+  "url": "https://github.com/mmozeiko/build-mesa/releases/download/26.2.5/mesa-llvmpipe-x64-26.2.5.7z",
+  "archiveSha256": "d1b713ca2a7fba47a50c058099f13c435ddb76a16a422c334e4d787f9755a31d",
+  "dllSha256": "8ddc061ee752fff06ae682de0ac2e010926d76a93c1aecc4c206adee771856e1"
+}

@@ -204,15 +204,32 @@ release binaries and the MSI, extracts it with `msiexec /a`, checks that the exe
 It then performs a real quiet installation on the disposable Windows runner with
 `tools/verify-windows-install.ps1`. The verifier checks installed x64 executables and resources,
 resolves and attempts to launch the advertised Start Menu shortcut, then opens an owned INX through
-its file association if startup succeeds. Native acceptance checks the installed process, its window visible style, its owned MCP
-listener and the loaded document identity before uninstalling. Window visible style is not
-an assertion about rendered pixels or an unobscured desktop. A missing window or listener
+its file association if startup succeeds. Acceptance checks the installed process, its owned MCP
+listener, document identity, console membership and actual client pixels before uninstalling.
+The desktop check brings the owned editor window forward and requires at least 1,000 identical
+pixel positions to respond to two distinct viewport background colours, with an RGB tolerance of three.
+It retains both client bitmaps, restores the original background and requires unchanged document state.
+The editor also answers initialize, editor-state and clean-Quit requests through its stdin/stdout MCP entry.
+A missing window or listener
 fails native acceptance. On a hosted runner, the exact observed OpenGL-below-2.0 startup
 error is recorded as `UNSUPPORTED`, with association launch `NOT_RUN`. The verifier returns
 2 only after installation checks and cleanup pass. Packaging CI reports that case with a
 warning and summary; it does not count as native acceptance or complete Issue #17.
-Other startup errors and installation or cleanup failures fail CI. Outcome-policy tests
-run before the Windows build. Installation logs and JSON observations are retained for three days; isolated
+Other startup errors and installation or cleanup failures fail CI.
+
+A separate invocation installs the same MSI with a test-only x64 llvmpipe fixture pinned in
+`tools/windows-software-gl.json`. This is a third-party [mmozeiko/build-mesa build](https://github.com/mmozeiko/build-mesa/releases/tag/26.2.5),
+not an official Mesa binary. Both the archive and `opengl32.dll` must match their SHA-256 pins.
+The verifier stages only that DLL beside the installed editor and verifies its actual loaded path and hash
+in both shell-launched processes. This invocation must pass shortcut, Unicode INX association, console,
+desktop-paint and editor-stdio checks. It records `graphicsContext=test-software-wgl`, `softwareGl=PASS`
+and `native=NOT_RUN`. It cannot replace the independent system-GL receipt or prove hardware compatibility.
+The verifier removes the owned DLL, requires the original installed file inventory and hashes, and uninstalls.
+CI also supplies a malformed owned fixture after software-GL staging and verifies complete cleanup after that failure.
+No global driver or product renderer changes are made, and the fixture DLL is not packaged or uploaded.
+
+Outcome-policy, pixel-comparison and stdio-probe tests run before the Windows build.
+Installation logs, client bitmaps and JSON observations are retained for three days; isolated
 settings and tokens are excluded. Neither job uploads the package.
 
 ### Status

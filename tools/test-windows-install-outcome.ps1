@@ -12,14 +12,28 @@ if ($null -eq $function) { throw 'Missing verification outcome function.' }
 . ([scriptblock]::Create($function.Extent.Text))
 
 $known = @{
+    graphicsContext = 'system'; editorStdio = 'NOT_RUN'; graphicsFixture = $null
     installation = 'PASS'; shortcut = 'FAIL'; association = 'NOT_RUN'
     failure = 'start-menu did not produce an installed editor window and owned MCP listener before the deadline.'
     cleanup = @{ uninstallExitCode = 0; errors = @(); productAbsent = $true; installDirectoryAbsent = $true;
-        shortcutAbsent = $true; registrationsAbsent = $true; associationAbsent = $true }
+        shortcutAbsent = $true; registrationsAbsent = $true; associationAbsent = $true;
+        fixtureRemoved = $true; inventoryRestored = $true }
     launches = @(@{ kind = 'start-menu'; accepted = $false; directDiagnostic = @{
         exited = $true; exitCode = 1; hwnd = 0
         stderr = 'Error: OpenGL(PainterError("egui_glow requires opengl 2.0+. "))'
     } })
+}
+function Set-PassingLaunches($Receipt) {
+    $Receipt.failure = $null; $Receipt.shortcut = 'PASS'; $Receipt.association = 'PASS'; $Receipt.editorStdio = 'PASS'
+    $Receipt.launches = @('start-menu', 'association') | ForEach-Object {
+        @{ kind = $_; accepted = $true; pid = 42; paint = @{ status = 'PASS'; restored = $true };
+            console = @{ attached = $true; detached = $true; processIds = @(42, 43) }; softwareModule = @{ verified = $true } }
+    }
+}
+function Set-SoftwareLaunches($Receipt) {
+    Set-PassingLaunches $Receipt
+    $Receipt.graphicsContext = 'test-software-wgl'
+    $Receipt.graphicsFixture = @{ verified = $true }
 }
 $cases = @(
     @{ name = 'known hosted OpenGL limitation'; expected = 2; change = {} }
@@ -33,9 +47,20 @@ $cases = @(
     @{ name = 'association was attempted'; expected = 1; change = { param($r) $r.association = 'FAIL' } }
     @{ name = 'native flags without observations'; expected = 1; change = { param($r) $r.failure = $null; $r.shortcut = 'PASS'; $r.association = 'PASS' } }
     @{ name = 'both native paths passed'; expected = 0; change = { param($r)
-        $r.failure = $null; $r.shortcut = 'PASS'; $r.association = 'PASS'
-        $r.launches = @(@{ kind = 'start-menu'; accepted = $true }, @{ kind = 'association'; accepted = $true })
+        Set-PassingLaunches $r
     } }
+    @{ name = 'unknown graphics context'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.graphicsContext = 'unknown' } }
+    @{ name = 'missing editor stdio'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.editorStdio = 'NOT_RUN' } }
+    @{ name = 'unproven paint'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.launches[1].paint.status = 'FAIL' } }
+    @{ name = 'view restoration failed'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.launches[0].paint.restored = $false } }
+    @{ name = 'console attach failed'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.launches[0].console.attached = $false } }
+    @{ name = 'wrong console membership'; expected = 1; change = { param($r) Set-PassingLaunches $r; $r.launches[1].console.processIds = @(99) } }
+    @{ name = 'both software paths passed'; expected = 0; change = { param($r) Set-SoftwareLaunches $r } }
+    @{ name = 'software failure is not unsupported'; expected = 1; change = { param($r) $r.graphicsContext = 'test-software-wgl' } }
+    @{ name = 'unverified archive'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.graphicsFixture.verified = $false } }
+    @{ name = 'unverified loaded DLL'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.launches[1].softwareModule.verified = $false } }
+    @{ name = 'fixture remains'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.cleanup.fixtureRemoved = $false } }
+    @{ name = 'installed inventory changed'; expected = 1; change = { param($r) Set-SoftwareLaunches $r; $r.cleanup.inventoryRestored = $false } }
 )
 foreach ($case in $cases) {
     $receipt = $known | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
