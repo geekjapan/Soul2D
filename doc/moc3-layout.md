@@ -174,9 +174,24 @@ in list order. ren_ja's 24 offscreen Parts, their masks, blends and opacities ma
 
 ## Attachment refusal checks
 
+Runtime attachment accepts at most 16,384 texture slots, 128 MiB of compressed data per slot, and 512 MiB of
+compressed data across slots. Before texture decoding, it checks the PNG header against the existing image
+limits of 8192 pixels per side and 16,777,216 pixels per image. A separate 512 MiB allowance bounds the sum of
+`width × height × 4` across every listed slot. Repeated paths count separately because each slot is decoded
+separately. Both aggregate allowances accept their exact boundary.
+
+The RGBA allowance bounds declared decoded workload. It does not bound peak process memory, retained compressed
+data, the previous attachment, decoder and encoder temporaries, or later rendering allocations. PNG headers that
+pass preflight still require successful decoding.
+
 The synthetic Session test `refused_runtime_attachments_preserve_the_previous_model_and_session`
 attaches an owned runtime model and changes its preview parameter. It then refuses missing Moc or texture files,
-escaping references, an empty texture list, invalid PNG data and excessive texture slots. Each refusal preserves
+escaping references, an empty texture list, invalid PNG data, excessive texture slots, oversized dimensions, and
+excess aggregate RGBA workload. Each refusal preserves
 the complete snapshot, evaluated geometry, CPU-rendered PNG and input files. Reattaching the valid model succeeds
 and resets its preview values without editing the CAN3 document. These checks do not establish native-window
 appearance or vendor rendering parity.
+
+`runtime_texture_rgba_budget_and_dimensions_preflight_each_slot` checks independent compressed and RGBA
+allowances with small valid PNGs. Header-only fixtures exercise dimension boundaries and the aggregate RGBA
+refusal before decoding, without allocating large images. They do not prove successful decoding at maximum size.

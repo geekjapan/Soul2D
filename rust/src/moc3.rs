@@ -206,6 +206,7 @@ const OFFSCREEN_PARTS: usize = 35;
 const OFFSCREEN_KEYFORMS: usize = 36;
 const MAX_TEXTURE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RUNTIME_TEXTURE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RUNTIME_TEXTURE_RGBA_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RUNTIME_TEXTURES: usize = 16_384;
 const RUNTIME_ROOT_PART: &str = "soul2d-moc3-root";
 
@@ -1402,16 +1403,21 @@ fn sibling(folder: &Path, reference: &str, what: &str) -> Result<std::path::Path
     Ok(folder.join(path))
 }
 
-fn read_runtime_textures(folder: &Path, references: &[Value], budget: u64) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_runtime_textures(folder: &Path, references: &[Value], compressed_budget: u64, rgba_budget: u64) -> Result<Vec<(String, Vec<u8>)>, String> {
     if references.len() > MAX_RUNTIME_TEXTURES {
         return Err("too many runtime textures".into());
     }
-    let mut remaining = budget;
+    let mut remaining = compressed_budget;
+    let mut rgba_remaining = rgba_budget;
     let mut textures = Vec::new();
     for texture in references {
         let name = texture.as_str().ok_or("a .model3.json texture reference is not a string")?;
         let file = sibling(folder, name, "texture")?;
         let data = crate::read_bounded_file(&file.to_string_lossy(), MAX_TEXTURE_BYTES.min(remaining), "texture")?;
+        let [width, height] = png_size(&data)?;
+        crate::model_import::check_picture_size(name, width, height)?;
+        rgba_remaining = rgba_remaining.checked_sub(u64::from(width) * u64::from(height) * 4)
+            .ok_or("runtime texture RGBA budget exceeded")?;
         remaining -= data.len() as u64;
         textures.push((name.to_owned(), data));
     }
@@ -1432,7 +1438,7 @@ pub(crate) fn attach(path: &str, guids: &RuntimeGuids) -> Result<(NativeScene, V
     let moc = sibling(folder, references["Moc"].as_str().ok_or("the .model3.json names no Moc")?, "Moc")?;
     let bytes = crate::read_bounded_file(&moc.to_string_lossy(), MAX_MOC3_BYTES, ".moc3")?;
     let textures = read_runtime_textures(folder, references["Textures"].as_array().map(Vec::as_slice).unwrap_or_default(),
-        MAX_RUNTIME_TEXTURE_BYTES)?;
+        MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES)?;
     if textures.is_empty() {
         return Err("the .model3.json names no textures".into());
     }
@@ -1728,15 +1734,69 @@ mod tests {
         std::fs::write(dir.join("b.png"), &data).unwrap();
         let references = [json!("a.png"), json!("b.png"), json!("a.png")];
         let budget = data.len() as u64 * 2;
-        let loaded = read_runtime_textures(&dir, &references[..2], budget).unwrap();
+        let loaded = read_runtime_textures(&dir, &references[..2], budget, MAX_RUNTIME_TEXTURE_RGBA_BYTES).unwrap();
         assert_eq!(loaded.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.png", "b.png"]);
         assert_eq!(loaded[0].1, data);
         let repeated = [json!("a.png"), json!("a.png")];
-        assert_eq!(read_runtime_textures(&dir, &repeated, budget).unwrap().len(), 2);
-        assert!(error(read_runtime_textures(&dir, &references, budget)).contains("size limit"));
-        assert!(error(read_runtime_textures(&dir, &repeated, data.len() as u64 - 1)).contains("size limit"));
+        assert_eq!(read_runtime_textures(&dir, &repeated, budget, MAX_RUNTIME_TEXTURE_RGBA_BYTES).unwrap().len(), 2);
+        assert!(error(read_runtime_textures(&dir, &references, budget, MAX_RUNTIME_TEXTURE_RGBA_BYTES)).contains("size limit"));
+        assert!(error(read_runtime_textures(&dir, &repeated, data.len() as u64 - 1, MAX_RUNTIME_TEXTURE_RGBA_BYTES)).contains("size limit"));
         let excessive = vec![json!("missing.png"); MAX_RUNTIME_TEXTURES + 1];
-        assert!(error(read_runtime_textures(&dir, &excessive, MAX_RUNTIME_TEXTURE_BYTES)).contains("too many runtime textures"));
+        assert!(error(read_runtime_textures(&dir, &excessive, MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES)).contains("too many runtime textures"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_texture_rgba_budget_and_dimensions_preflight_each_slot() {
+        let dir = std::env::temp_dir().join(format!("soul2d-moc3-rgba-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])))
+            .write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let data = encoded.into_inner();
+        assert!(data.len() < 256);
+        std::fs::write(dir.join("a.png"), &data).unwrap();
+        std::fs::write(dir.join("b.png"), &data).unwrap();
+        let references = [json!("a.png"), json!("b.png"), json!("a.png")];
+        let compressed = data.len() as u64 * 3;
+        let loaded = read_runtime_textures(&dir, &references, compressed, 768).unwrap();
+        assert_eq!(loaded.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.png", "b.png", "a.png"]);
+        assert!(loaded.iter().all(|(_, bytes)| *bytes == data));
+        assert_eq!(read_runtime_textures(&dir, &references[..1], compressed, 256).unwrap().len(), 1);
+        for (slots, rgba) in [(&references[..1], 255), (&references[..], 767)] {
+            assert!(error(read_runtime_textures(&dir, slots, compressed, rgba)).contains("runtime texture RGBA budget exceeded"));
+        }
+        assert!(error(read_runtime_textures(&dir, &references, compressed - 1, 768)).contains("size limit"));
+        let header_reference = [json!("header.png")];
+        for (width, height, accepted) in [(8192u32, 2048u32, true), (4096, 4096, true),
+            (8193, 1, false), (4097, 4096, false), (u32::MAX, u32::MAX, false)] {
+            let mut header = data[..24].to_vec();
+            header[16..20].copy_from_slice(&width.to_be_bytes());
+            header[20..24].copy_from_slice(&height.to_be_bytes());
+            std::fs::write(dir.join("header.png"), &header).unwrap();
+            let result = read_runtime_textures(&dir, &header_reference, MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES);
+            if accepted { assert_eq!(result.unwrap().len(), 1); }
+            else { assert!(error(result).contains("not a supported texture size")); }
+        }
+        for (width, height) in [(0u32, 1u32), (1, 0)] {
+            let mut header = data[..24].to_vec();
+            header[16..20].copy_from_slice(&width.to_be_bytes());
+            header[20..24].copy_from_slice(&height.to_be_bytes());
+            std::fs::write(dir.join("header.png"), header).unwrap();
+            assert!(error(read_runtime_textures(&dir, &header_reference, MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES)).contains("PNG has no size"));
+        }
+        for bytes in [&data[..8], &data[..20], b"not a PNG".as_slice()] {
+            std::fs::write(dir.join("header.png"), bytes).unwrap();
+            assert!(read_runtime_textures(&dir, &header_reference, MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES).is_err());
+        }
+        let mut header = data[..24].to_vec();
+        header[16..20].copy_from_slice(&4096u32.to_be_bytes());
+        header[20..24].copy_from_slice(&4096u32.to_be_bytes());
+        std::fs::write(dir.join("header.png"), header).unwrap();
+        let repeated = vec![json!("header.png"); 9];
+        assert_eq!(read_runtime_textures(&dir, &repeated[..8], MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES).unwrap().len(), 8);
+        assert!(error(read_runtime_textures(&dir, &repeated, MAX_RUNTIME_TEXTURE_BYTES, MAX_RUNTIME_TEXTURE_RGBA_BYTES))
+            .contains("runtime texture RGBA budget exceeded"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1761,6 +1821,14 @@ mod tests {
         std::fs::write(dir.join("owned.moc3"), &moc).unwrap();
         std::fs::write(dir.join("owned.png"), &texture).unwrap();
         std::fs::write(dir.join("broken.png"), b"not a PNG").unwrap();
+        let refusal_textures = [("rgba-budget.png", 4096u32, 4096u32), ("wide.png", 8193, 1), ("area.png", 4097, 4096)]
+            .map(|(name, width, height)| {
+                let mut header = texture[..24].to_vec();
+                header[16..20].copy_from_slice(&width.to_be_bytes());
+                header[20..24].copy_from_slice(&height.to_be_bytes());
+                std::fs::write(dir.join(name), &header).unwrap();
+                (name, header)
+            });
         let model3 = json!({"Version":3,"FileReferences":{"Moc":"owned.moc3","Textures":["owned.png"]}});
         let valid = dir.join("owned.model3.json");
         std::fs::write(&valid, model3.to_string()).unwrap();
@@ -1787,6 +1855,9 @@ mod tests {
             (json!({"Moc":"owned.moc3","Textures":[]}), "names no textures"),
             (json!({"Moc":"owned.moc3","Textures":["broken.png"]}), "PNG"),
             (json!({"Moc":"owned.moc3","Textures":vec!["missing.png"; MAX_RUNTIME_TEXTURES + 1]}), "too many runtime textures"),
+            (json!({"Moc":"owned.moc3","Textures":vec!["rgba-budget.png"; 9]}), "runtime texture RGBA budget exceeded"),
+            (json!({"Moc":"owned.moc3","Textures":["wide.png"]}), "not a supported texture size"),
+            (json!({"Moc":"owned.moc3","Textures":["area.png"]}), "not a supported texture size"),
         ];
         let refused_path = dir.join("refused.model3.json");
         for (references, message) in cases {
@@ -1803,6 +1874,9 @@ mod tests {
             assert_eq!(std::fs::read(dir.join("owned.moc3")).unwrap(), moc);
             assert_eq!(std::fs::read(dir.join("owned.png")).unwrap(), texture);
             assert_eq!(std::fs::read(&valid).unwrap(), model3.to_string().as_bytes());
+            for (name, bytes) in &refusal_textures {
+                assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+            }
         }
         let recovered = call(&mut session, json!({"op":"live2d.model.attach","path":valid,"resourceGuid":"res-guid"}));
         assert_eq!(recovered["values"]["ParamA"], 0.0);

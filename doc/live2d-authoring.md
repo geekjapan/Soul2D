@@ -424,6 +424,11 @@ identity agreement only, not view, playback, or vendor completeness.
 
 ## Native preview and playback
 
+Runtime `.model3.json` attachment checks each PNG's dimensions and the aggregate declared RGBA workload before
+decoding textures. Repeated slots count separately. The compressed-data and RGBA allowances are independent,
+and refusal preserves the previous Session attachment. See [runtime attachment limits](moc3-layout.md#attachment-refusal-checks)
+for the exact limits and the distinction from peak process memory.
+
 The Rust core now provides a session-only link between the active native
 document and its companion file. These operations are also advertised over
 stdio MCP with dots replaced by underscores. See
