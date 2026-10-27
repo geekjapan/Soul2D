@@ -295,6 +295,103 @@ fn a_pro_size_can3_curve_opens_edits_saves_and_reopens() {
 }
 
 #[test]
+#[ignore = "large decoded-texture workload runs sequentially in capacity CI"]
+fn a_pro_size_cmo3_large_textures_render_and_roundtrip() {
+    const SIZE: u32 = 2048;
+    let colors = [[220, 40, 20, 255], [20, 190, 40, 255], [30, 50, 210, 255], [190, 40, 180, 255]];
+    let pngs: Vec<Vec<u8>> = colors.iter().map(|color| {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(SIZE, SIZE, image::Rgba(*color)))
+            .write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }).collect();
+    let base = native_artmesh_xml("<f xs.n='opacity'>1</f>");
+    let parsed = roxmltree::Document::parse(&base).unwrap();
+    let source = &base[parsed.descendants().find(|node| node.attribute("xs.id") == Some("mesh")).unwrap().range()];
+    let texture = &base[parsed.descendants().find(|node| node.attribute("xs.id") == Some("texture")).unwrap().range()];
+    let sources: String = (0..4).map(|i| {
+        let (x, y) = ((i % 2) * 2, (i / 2) * 2);
+        source.replace("'mesh'", &format!("'mesh{i}'")).replace("mesh-guid", &format!("mesh-guid-{i}"))
+            .replace("form-guid", &format!("form-guid-{i}"))
+            .replace("xs.ref='texture'", &format!("xs.ref='texture{i}'"))
+            .replace("1 2 3 4 5 6", &format!("{x} {y} {} {y} {x} {}", x + 2, y + 2))
+    }).collect();
+    let textures: String = (0..4).map(|i| texture.replace("'texture'", &format!("'texture{i}'"))
+        .replace("texture-guid", &format!("texture-guid-{i}"))
+        .replace("width='2' height='3'", &format!("width='{SIZE}' height='{SIZE}'"))
+        .replace("mesh.png", &if i == 0 { "mesh.png".into() } else { format!("tex{}.png", i - 1) })).collect();
+    let xml = base.replace(source, &sources).replace(texture, &textures)
+        .replace("count='1'><CArtMeshSource xs.ref='mesh'/>", &format!("count='4'>{}",
+            (0..4).map(|i| format!("<CArtMeshSource xs.ref='mesh{i}'/>")).collect::<String>()));
+    let bytes = authoring_bytes_with_pngs(&xml, &pngs);
+    let directory = temp_dir();
+    let (original, saved) = (directory.join("large-textures.cmo3"), directory.join("large-textures-saved.cmo3"));
+    fs::write(&original, &bytes).unwrap();
+    let mut session = Session::new();
+    let clock = std::time::Instant::now();
+    let opened = result(&request(&mut session, json!({"op":"open","path":original}))).clone();
+    let render = |session: &mut Session| {
+        let response = request(session, json!({"op":"render","width":32,"height":32,"bounds":[0,0,4,4]}));
+        let png = result(&response)["png"].as_str().unwrap();
+        image::load_from_memory(&base64::Engine::decode(&base64::engine::general_purpose::STANDARD, png).unwrap())
+            .unwrap().into_rgba8()
+    };
+    let before = render(&mut session);
+    for (i, color) in colors.iter().enumerate() {
+        let (x, y) = ((i as u32 % 2) * 16 + 4, (i as u32 / 2) * 16 + 4);
+        assert_eq!(before.get_pixel(x, y).0, *color, "texture {i} must be decoded and drawn");
+    }
+    let edited = result(&request(&mut session, json!({"op":"live2d.form.set_opacity",
+        "sourceGuid":"mesh-guid-0","formGuid":"form-guid-0","coordinateType":"Canvas","opacity":0.5,
+        "expectedRevision":opened["revision"]}))).clone();
+    assert_ne!(render(&mut session), before);
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(render(&mut session), before);
+    result(&request(&mut session, json!({"op":"redo"})));
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    let reopened = result(&request(&mut session, json!({"op":"open","path":saved}))).clone();
+    assert_eq!(reopened["model"], edited["model"]);
+    assert_ne!(render(&mut session), before);
+    let container = soul2d_core::caff::CaffDocument::parse(&fs::read(saved).unwrap()).unwrap();
+    for (i, png) in pngs.iter().enumerate() {
+        let name = if i == 0 { "mesh.png".into() } else { format!("tex{}.png", i - 1) };
+        assert_eq!(container.entry_data(&name).unwrap(), *png);
+    }
+    assert_eq!(fs::read(original).unwrap(), bytes);
+    eprintln!("large-texture CMO3: 4 textures, {SIZE}x{SIZE} RGBA, {} decoded bytes, {} container bytes, {} XML bytes; open/render/edit/undo/redo/save/reopen {:?}",
+        4u64 * SIZE as u64 * SIZE as u64 * 4, bytes.len(), xml.len(), clock.elapsed());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "decoder allocation boundary runs sequentially in capacity CI"]
+fn a_capacity_native_texture_limits_refuse_without_state_changes() {
+    let directory = temp_dir();
+    for (width, height) in [(8193, 1), (4097, 4096)] {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(width, height, image::Rgba([30, 90, 60, 255])))
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let xml = native_artmesh_xml("").replace("width='2' height='3'", &format!("width='{width}' height='{height}'"));
+        let bytes = authoring_bytes_with_pngs(&xml, &[png.into_inner()]);
+        let source = directory.join(format!("limit-{width}-{height}.cmo3"));
+        fs::write(&source, &bytes).unwrap();
+        let mut session = Session::new();
+        result(&request(&mut session, json!({"op":"open","path":source})));
+        let before = session.snapshot();
+        let response = request(&mut session, json!({"op":"render","width":32,"height":32,"bounds":[0,0,10,10]}));
+        assert_eq!(response["succeeded"], false, "{response}");
+        assert!(response["message"].as_str().unwrap().contains("could not decode unpremultiplied native texture"), "{response}");
+        assert_eq!(session.snapshot(), before);
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        fs::write(&source, native_artmesh_bytes("")).unwrap();
+        result(&request(&mut session, json!({"op":"open","path":source})));
+        result(&request(&mut session, json!({"op":"render","width":32,"height":32,"bounds":[0,0,10,10]})));
+        eprintln!("native texture refusal: {width}x{height}, valid PNG; document/history/source unchanged, normal rendering recovered");
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn native_form_settings_save_reopen_and_undo() {
     let directory = temp_dir();
     let source = directory.join("source.cmo3");
@@ -3950,6 +4047,14 @@ fn authoring_bytes(xml: &str) -> Vec<u8> {
 
 /// Like `authoring_bytes`, with `extra_images` more PNG entries named `tex<i>.png` (the texture-count probe).
 fn authoring_bytes_with_images(xml: &str, extra_images: usize) -> Vec<u8> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1, 1, image::Rgba([255, 255, 255, 255]),
+    )).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    authoring_bytes_with_pngs(xml, &vec![png.into_inner(); extra_images + 1])
+}
+
+fn authoring_bytes_with_pngs(xml: &str, pngs: &[Vec<u8>]) -> Vec<u8> {
     use flate2::write::DeflateEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -3975,22 +4080,13 @@ fn authoring_bytes_with_images(xml: &str, extra_images: usize) -> Vec<u8> {
 
     let seed = 0x562e_099f_u32;
     let mask = seed as u8;
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-        1,
-        1,
-        image::Rgba([255, 255, 255, 255]),
-    ))
-    .write_to(&mut png, image::ImageFormat::Png)
-    .unwrap();
-    let png = png.into_inner();
-    let names: Vec<String> = (0..extra_images).map(|i| format!("tex{i}.png")).collect();
+    let names: Vec<String> = (0..pngs.len() - 1).map(|i| format!("tex{i}.png")).collect();
     let mut entries = vec![
         ("main.xml", "main_xml", [0x01u8, 0x21], zip),
-        ("mesh.png", "", [0x01, 0x10], png.clone()),
+        ("mesh.png", "", [0x01, 0x10], pngs[0].clone()),
         ("opaque.bin", "", [0x01, 0x10], vec![0, 1, 2, 0xff]),
     ];
-    entries.extend(names.iter().map(|name| (name.as_str(), "", [0x01, 0x10], png.clone())));
+    entries.extend(names.iter().zip(&pngs[1..]).map(|(name, png)| (name.as_str(), "", [0x01, 0x10], png.clone())));
     let mut bytes = vec![0; 58];
     bytes[..4].copy_from_slice(b"CAFF");
     bytes[4..8].copy_from_slice(&45u32.to_be_bytes());

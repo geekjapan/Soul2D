@@ -1,0 +1,77 @@
+name: Authoring capacity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: authoring-capacity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: 1
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Preserve fixture line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup override set stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Verify independent child memory counters and failures
+        run: python -I tools/test-measure-authoring-capacity.py
+      - name: Build the release workload executable
+        id: build
+        run: |
+          cargo fetch --locked --manifest-path rust/Cargo.toml
+          cargo test --locked --offline --release --manifest-path rust/Cargo.toml --target-dir out/capacity --test core --no-run --message-format=json > capacity-build.jsonl
+          python - <<'PY'
+          import json, os
+          rows = [json.loads(line) for line in open('capacity-build.jsonl')]
+          paths = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact'
+                   and row['target']['name'] == 'core' and row.get('executable') and row['profile']['test']]
+          assert len(paths) == 1, paths
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('executable=' + paths[0] + '\n')
+          PY
+      - name: Measure five isolated runs of each workload
+        env:
+          CAPACITY_EXECUTABLE: ${{ steps.build.outputs.executable }}
+        run: python -I tools/measure-authoring-capacity.py --executable "$CAPACITY_EXECUTABLE" --build-receipt capacity-build.jsonl --out "$RUNNER_TEMP/capacity" --repeats 5
+      - name: Retain raw measurements and build receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authoring-capacity-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/capacity
+            capacity-build.jsonl
+          if-no-files-found: warn
+          retention-days: 14

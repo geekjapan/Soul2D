@@ -11,6 +11,7 @@ and are marked (ja).
 - [Tutorials](../user-doc/tutorial/en/01-model-structuring.md): model structuring and parameter definition.
   Japanese: [チュートリアル](../user-doc/tutorial/ja/01-model-structuring.md).
 - [Build from source](../BUILD.md): prerequisites, build commands, local checks and packaging.
+- [Authoring capacity](authoring-capacity.md): synthetic workloads, defensive limits and release measurement CI.
 - [Translate the editor](../TRANSLATING.md): gettext workflow for `tl/*.po`.
 
 ## Architecture and decisions
