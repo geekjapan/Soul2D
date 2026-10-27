@@ -125,8 +125,11 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $start.FileName = $ShellPath
     $start.UseShellExecute = $true
     $start.WorkingDirectory = $installDirectory
+    $observation = [ordered]@{ kind = $Kind; shellPath = $ShellPath; accepted = $false;
+        shellPid = $null; processes = @(); httpError = $null; configFiles = @() }
+    $result.launches += $observation
     $started = [Diagnostics.Process]::Start($start)
-    if ($null -ne $started) { $started.Dispose() }
+    if ($null -ne $started) { $observation.shellPid = $started.Id; $started.Dispose() }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $editor = $null
     $state = $null
@@ -136,9 +139,18 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
         if ($matches.Count -eq 1) {
             $editor = Get-Process -Id $matches[0].ProcessId
             if (-not $ownedEditors.Contains($editor.Id)) { $ownedEditors.Add($editor.Id) }
+            $editor.Refresh()
+            $observation.processes = @(@{ pid = $editor.Id; parentPid = $matches[0].ParentProcessId;
+                sessionId = $editor.SessionId; hwnd = $editor.MainWindowHandle.ToInt64();
+                visible = [InstalledSoul2D]::IsWindowVisible($editor.MainWindowHandle);
+                listeners = @(Get-NetTCPConnection -OwningProcess $editor.Id -State Listen -ErrorAction SilentlyContinue |
+                    Select-Object LocalAddress, LocalPort) })
             $connections = @(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
             if ($connections.Count -eq 1 -and $connections[0].OwningProcess -eq $editor.Id) {
-                try { $state = Read-Resource 'resource://soul2d/editor/state' } catch { $state = $null }
+                try { $state = Read-Resource 'resource://soul2d/editor/state' } catch {
+                    $observation.httpError = $_.Exception.Message.Replace($env:SOUL2D_MCP_BEARER, '[redacted]')
+                    $state = $null
+                }
                 $editor.Refresh()
                 if ($null -ne $state -and $editor.MainWindowHandle -ne [IntPtr]::Zero) { break }
             }
@@ -146,6 +158,26 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
         Start-Sleep -Milliseconds 250
     }
     if ($null -eq $state -or $null -eq $editor -or $editor.MainWindowHandle -eq [IntPtr]::Zero) {
+        $observation.configFiles = @(Get-ChildItem -LiteralPath $config -Recurse -File |
+            ForEach-Object { $_.FullName.Substring($config.Length + 1) })
+        foreach ($editorId in $ownedEditors) {
+            $process = Get-Process -Id $editorId -ErrorAction SilentlyContinue
+            if ($null -ne $process -and $process.Path -eq $editorPath) { $process.Kill(); $process.WaitForExit() }
+        }
+        $stdout = Join-Path $evidence "$Kind-direct-stdout.log"
+        $stderr = Join-Path $evidence "$Kind-direct-stderr.log"
+        $probe = Start-Process -FilePath $editorPath -WorkingDirectory $installDirectory -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $ownedEditors.Add($probe.Id)
+        $exited = $probe.WaitForExit(10000)
+        $probe.Refresh()
+        $observation.directDiagnostic = @{ pid = $probe.Id; exited = $exited;
+            hwnd = $probe.MainWindowHandle.ToInt64(); exitCode = $(if ($exited) { $probe.ExitCode } else { $null }) }
+        if (-not $exited) { $probe.Kill(); $probe.WaitForExit() }
+        foreach ($log in @($stdout, $stderr)) {
+            $text = [IO.File]::ReadAllText($log).Replace($env:SOUL2D_MCP_BEARER, '[redacted]')
+            [IO.File]::WriteAllText($log, $text)
+        }
         throw "$Kind did not produce an installed editor window and owned MCP listener before the deadline."
     }
     if (-not $state.editor -or $state.document.modified -or $state.document.path -ne $ExpectedPath) {
@@ -157,10 +189,14 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     if ($null -ne $ExpectedPath -and $snapshot.model.meta.name -ne $script:expectedName) {
         throw 'File association did not load the fixture identity.'
     }
-    $observation = [ordered]@{ kind = $Kind; shellPath = $ShellPath; pid = $editor.Id; executablePath = $editor.Path;
-        listenerOwnerPid = $connections[0].OwningProcess; hwnd = $editor.MainWindowHandle.ToInt64();
-        windowVisibleStyle = $true; editorState = $state; modelName = $snapshot.model.meta.name }
-    $result.launches += $observation
+    $observation.accepted = $true
+    $observation.pid = $editor.Id
+    $observation.executablePath = $editor.Path
+    $observation.listenerOwnerPid = $connections[0].OwningProcess
+    $observation.hwnd = $editor.MainWindowHandle.ToInt64()
+    $observation.windowVisibleStyle = $true
+    $observation.editorState = $state
+    $observation.modelName = $snapshot.model.meta.name
     $quit = @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'editor_quit'; arguments = @{} } } | ConvertTo-Json -Depth 5 -Compress
     $reply = Invoke-RestMethod -Uri $script:endpoint -Method Post -ContentType 'application/json; charset=utf-8' `
         -Headers @{ Authorization = "Bearer $env:SOUL2D_MCP_BEARER" } -Body $quit -TimeoutSec 5
