@@ -1595,6 +1595,9 @@ and parameter IDs. The writer allocates the next unused `PhysicsSetting<n>` ID;
 it preserves the surrounding XML and container entries. Missing, null, shared or
 nonempty settings lists refuse this operation. Existing group duplication remains
 available. Creation is one Undo step and uses the same save/reopen checks as edits.
+Saving changed physics source adds missing class imports to the XML prolog for
+classes introduced by the edit. Existing declarations and their formatting
+remain intact; a conflicting short class name refuses the edit atomically.
 The Physics groups panel exposes **Create first group** with empty input, output
 and vertex lists, position normalization `-10, 0, 10` and angle normalization
 `-30, 0, 30`. This creates storage; simulation and Cubism acceptance require

@@ -2866,7 +2866,9 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         "<carray_list xs.n='_sourceCubismPhysics' count='0'><!--keep--></carray_list>"] {
         let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
             <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet?>\r\n\
-            <?version CModelSource:15?>\r\n<!--keep-prolog-->\r\n{}", native_artmesh_xml("")).replace("<CDrawableSourceSet", &format!(
+            <?version CModelSource:15?>\r\n\
+            <!--keep-prolog <?import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource?> -->\r\n\
+            {}<?import com.live2d.graphics3d.type.GVector2?>", native_artmesh_xml("")).replace("<CDrawableSourceSet", &format!(
             "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'><i xs.n='settingFPS'>60</i>\
              {list}</CPhysicsSettingsSourceSet><CDrawableSourceSet"));
         let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "empty.cmo3");
@@ -2889,13 +2891,17 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         assert_eq!(view["groups"][0]["vertices"][1]["delay"], 0.800001);
         result(&request(&mut session, json!({"op":"undo"})));
         assert_eq!(session.snapshot()["model"], before["model"]);
+        let undone = directory.join("undone.cmo3");
+        result(&request(&mut session, json!({"op":"save","path":undone})));
+        assert_eq!(saved_main_xml(&undone), xml, "undo must restore the original imports");
         result(&request(&mut session, json!({"op":"redo"})));
         assert_eq!(session.snapshot()["model"], created);
         let saved = directory.join("created.cmo3");
         result(&request(&mut session, json!({"op":"save","path":saved})));
         let saved_xml = saved_main_xml(&saved);
         let parsed = roxmltree::Document::parse(&saved_xml).unwrap();
-        let imports: Vec<_> = parsed.root().children().filter_map(|node| node.pi())
+        let imports: Vec<_> = parsed.root().children()
+            .filter(|node| node.range().start < parsed.root_element().range().start).filter_map(|node| node.pi())
             .filter(|pi| pi.target == "import").filter_map(|pi| pi.value).collect();
         for class in [
             "com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource",
@@ -2928,6 +2934,23 @@ fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step()
         assert_eq!(fs::read(directory.join("empty.cmo3")).unwrap(), authoring_bytes(&xml));
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn physics3_first_group_refuses_conflicting_class_import_without_changing_history() {
+    let xml = format!("<?import example.CPhysicsSettingsSource?>\n{}", native_artmesh_xml(""))
+        .replace("<CDrawableSourceSet", "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'>\
+            <carray_list xs.n='_sourceCubismPhysics' count='0'/></CPhysicsSettingsSourceSet><CDrawableSourceSet");
+    let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "conflict.cmo3");
+    let error = physics3_refuse(&mut session, &before, &json!({"op":"live2d.physics3.edit",
+        "expectedRevision":revision,"insert":0,"value":{"name":"First","normalization":{
+            "position":{"min":-10,"default":0,"max":10},"angle":{"min":-30,"default":0,"max":30}},
+            "inputs":[],"outputs":[],"vertices":[]}}));
+    assert!(error.contains("class import conflicts"), "{error}");
+    let saved = directory.join("unchanged.cmo3");
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    assert_eq!(saved_main_xml(&saved), xml);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

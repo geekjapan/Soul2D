@@ -1637,7 +1637,37 @@ pub(crate) fn splice_source(
     if text[range.clone()] != *initial_xml {
         return Err("authoring physics source does not match the stored model".into());
     }
-    Ok(format!("{}{}{}", &text[..range.start], candidate_xml, &text[range.end..]))
+    let candidate = parse(candidate_xml)?;
+    let root_start = document.root_element().range().start;
+    let imports: Vec<_> = document.root().children().filter(|node| node.range().start < root_start)
+        .filter_map(|node| node.pi())
+        .filter(|pi| pi.target == "import").filter_map(|pi| pi.value).map(str::trim).collect();
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut missing = String::new();
+    // Cubism resolves serialized class names through prolog imports, unlike our field-based reader.
+    for (tag, class) in [
+        ("CPhysicsSettingsSourceSet", "com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet"),
+        ("CPhysicsSettingsSource", "com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource"),
+        ("CPhysicsInput", "com.live2d.cubism.doc.gameData.physics.CPhysicsInput"),
+        ("CPhysicsOutput", "com.live2d.cubism.doc.gameData.physics.CPhysicsOutput"),
+        ("CPhysicsVertex", "com.live2d.cubism.doc.gameData.physics.CPhysicsVertex"),
+        ("CPhysicsSourceType", "com.live2d.cubism.doc.gameData.physics.CPhysicsController$CPhysicsSourceType"),
+        ("CPhysicsSettingId", "com.live2d.cubism.doc.model.id.CPhysicsSettingId"),
+        ("CPhysicsSettingsGuid", "com.live2d.type.CPhysicsSettingsGuid"),
+        ("CPhysicsDataGuid", "com.live2d.type.CPhysicsDataGuid"),
+        ("CParameterGuid", "com.live2d.type.CParameterGuid"),
+        ("GVector2", "com.live2d.graphics3d.type.GVector2"),
+    ] {
+        if !candidate.descendants().any(|node| node.has_tag_name(tag)) { continue; }
+        if imports.iter().any(|import| import.rsplit(['.', '$']).next() == Some(tag) && *import != class) {
+            return Err(format!("authoring physics class import conflicts with {class}"));
+        }
+        if !imports.contains(&class) && !field.descendants().any(|node| node.has_tag_name(tag)) {
+            missing.push_str(&format!("<?import {class}?>{newline}"));
+        }
+    }
+    Ok(format!("{}{}{}{}{}", &text[..root_start], missing, &text[root_start..range.start],
+        candidate_xml, &text[range.end..]))
 }
 
 #[cfg(test)]
