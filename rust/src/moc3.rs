@@ -1740,6 +1740,77 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn refused_runtime_attachments_preserve_the_previous_model_and_session() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("soul2d-moc3-session-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let animation = dir.join("owned.can3");
+        let animation_bytes = crate::authoring_edit::tests::test_container(r#"<root fileFormatVersion='503030001'>
+            <main><CAnimation xs.ref='animation'/></main><shared><CAnimation xs.id='animation'>
+            <s xs.n='name'>Runtime attachment</s><ResourceManager xs.n='resourceManager'>
+            <carray_list xs.n='_resourceRefList' count='1'><ResourceEntry>
+            <CResource_Linked_Model xs.n='resourceRef' xs.ref='resource'/></ResourceEntry></carray_list>
+            </ResourceManager><carray_list xs.n='_scenes' count='0'/></CAnimation>
+            <CResource_Linked_Model xs.id='resource'><CGuid xs.n='guid' uuid='res-guid'/>
+            <s xs.n='name'>Owned model</s><s xs.n='srcFile'>never-follow.cmo3</s></CResource_Linked_Model>
+            </shared></root>"#).encode();
+        std::fs::write(&animation, &animation_bytes).unwrap();
+        let moc = fixture().bytes();
+        let texture = png();
+        std::fs::write(dir.join("owned.moc3"), &moc).unwrap();
+        std::fs::write(dir.join("owned.png"), &texture).unwrap();
+        std::fs::write(dir.join("broken.png"), b"not a PNG").unwrap();
+        let model3 = json!({"Version":3,"FileReferences":{"Moc":"owned.moc3","Textures":["owned.png"]}});
+        let valid = dir.join("owned.model3.json");
+        std::fs::write(&valid, model3.to_string()).unwrap();
+        let call = |session: &mut crate::Session, request: Value| {
+            let reply = session.handle_request(&request);
+            assert_eq!(reply["succeeded"], true, "{request}: {reply}");
+            reply["result"].clone()
+        };
+        let mut session = crate::Session::new();
+        call(&mut session, json!({"op":"open","path":animation}));
+        call(&mut session, json!({"op":"live2d.model.attach","path":valid,"resourceGuid":"res-guid"}));
+        call(&mut session, json!({"op":"live2d.parameter.set","parameterId":"ParamA","value":0.5}));
+        let before = session.snapshot();
+        assert_eq!(before["values"]["ParamA"], 0.5);
+        let geometry = call(&mut session, json!({"op":"scene.geometry"}));
+        assert_eq!(geometry["parts"].as_array().unwrap().len(), 1);
+        let rendered = call(&mut session, json!({"op":"render","width":32,"height":32,"bounds":[0,0,100,100]}));
+        assert!(rendered["png"].as_str().unwrap().len() > 100);
+        let cases = [
+            (json!({"Moc":"missing.moc3","Textures":["owned.png"]}), "could not open .moc3 file"),
+            (json!({"Moc":"owned.moc3","Textures":["missing.png"]}), "could not open texture file"),
+            (json!({"Moc":"../owned.moc3","Textures":["owned.png"]}), "inside its folder"),
+            (json!({"Moc":"owned.moc3","Textures":["../owned.png"]}), "inside its folder"),
+            (json!({"Moc":"owned.moc3","Textures":[]}), "names no textures"),
+            (json!({"Moc":"owned.moc3","Textures":["broken.png"]}), "PNG"),
+            (json!({"Moc":"owned.moc3","Textures":vec!["missing.png"; MAX_RUNTIME_TEXTURES + 1]}), "too many runtime textures"),
+        ];
+        let refused_path = dir.join("refused.model3.json");
+        for (references, message) in cases {
+            let bytes = json!({"Version":3,"FileReferences":references}).to_string();
+            std::fs::write(&refused_path, &bytes).unwrap();
+            let refused = session.handle_request(&json!({"op":"live2d.model.attach","path":refused_path,"resourceGuid":"res-guid"}));
+            assert_eq!(refused["succeeded"], false, "{refused}");
+            assert!(refused["message"].as_str().unwrap().contains(message), "{message}: {refused}");
+            assert_eq!(session.snapshot(), before);
+            assert_eq!(call(&mut session, json!({"op":"scene.geometry"})), geometry);
+            assert_eq!(call(&mut session, json!({"op":"render","width":32,"height":32,"bounds":[0,0,100,100]})), rendered);
+            assert_eq!(std::fs::read(&refused_path).unwrap(), bytes.as_bytes());
+            assert_eq!(std::fs::read(&animation).unwrap(), animation_bytes);
+            assert_eq!(std::fs::read(dir.join("owned.moc3")).unwrap(), moc);
+            assert_eq!(std::fs::read(dir.join("owned.png")).unwrap(), texture);
+            assert_eq!(std::fs::read(&valid).unwrap(), model3.to_string().as_bytes());
+        }
+        let recovered = call(&mut session, json!({"op":"live2d.model.attach","path":valid,"resourceGuid":"res-guid"}));
+        assert_eq!(recovered["values"]["ParamA"], 0.0);
+        assert_eq!(recovered["revision"], before["revision"]);
+        assert_eq!(recovered["model"], before["model"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn children_of(scene: &Scene, id: &str) -> Vec<String> {
         let part = scene.sources.iter().find(|source| source.id == id).unwrap();
         let SourceData::Part { child_guids, .. } = &part.data else { panic!("not a Part") };

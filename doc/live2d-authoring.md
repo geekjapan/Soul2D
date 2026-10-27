@@ -618,10 +618,9 @@ in the angle conversion, and it is 400 times what single-precision rounding of
 the angle or of the positions could cause. Probing the warp 0.01, 0.05, 0.2 or
 0.5 above the origin, probing symmetrically or below, and mapping the origin by
 triangles instead of bilinearly all leave the residuals unchanged (the last
-makes them worse). What remains is Core's own arithmetic in its rotation
-chains, which the preview, computing in double precision, does not reproduce;
-reproducing it would mean copying Core, which the clean-room rule excludes.
-The residuals stay below 0.09 px.
+makes them worse). These experiments did not identify the cause of the remaining
+difference. Core arithmetic and the preview's rotation-chain calculation remain
+hypotheses. The reported residuals stay below 0.09 px.
 
 What that comparison does not cover:
 

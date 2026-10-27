@@ -171,3 +171,12 @@ the other three.
 Slot 155 lists the Parts the CMO3 marks `useOffscreen`; each composes with a blend word and flag byte like a
 drawable's, a mask run in slot 80 (the mask list starts with the Part masks) and an opacity per Part keyform, Parts
 in list order. ren_ja's 24 offscreen Parts, their masks, blends and opacities matched its CMO3.
+
+## Attachment refusal checks
+
+The synthetic Session test `refused_runtime_attachments_preserve_the_previous_model_and_session`
+attaches an owned runtime model and changes its preview parameter. It then refuses missing Moc or texture files,
+escaping references, an empty texture list, invalid PNG data and excessive texture slots. Each refusal preserves
+the complete snapshot, evaluated geometry, CPU-rendered PNG and input files. Reattaching the valid model succeeds
+and resets its preview values without editing the CAN3 document. These checks do not establish native-window
+appearance or vendor rendering parity.
