@@ -300,12 +300,21 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "CAN3 Outline > scene > track > curve > Delete curve > Confirm curve deletion",
         "Live2D panels",
     ]),
+    ("live2d_animation_curve_type_set", &[
+        "CAN3 Outline > scene > track > curve > Edit segment type > Apply",
+    ]),
+    ("live2d_animation_handle_set", &[
+        "CAN3 Outline > scene > track > curve > Edit previous/next handle > Apply",
+    ]),
     ("live2d_animation_key_add", &[
         "CAN3 Outline > scene > track > curve > New key > Add CAN3 key",
         "Live2D panels",
     ]),
     ("live2d_animation_key_delete", &[
         "CAN3 Outline > scene > track > curve > key > Delete key",
+    ]),
+    ("live2d_animation_key_set", &[
+        "CAN3 Outline > scene > track > curve > Edit anchor > Apply",
     ]),
     ("live2d_animation_resource_add", &[
         "Live2D panels",

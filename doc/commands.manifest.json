@@ -13817,6 +13817,9 @@
     {
       "description": "Set interpolation of the CAN3 parameter, modern PartOpacity or legacy-colon or underscore-map PartOpacity, or supported Image/Guide visual scalar segment starting at an existing key: SMOOTH, BEZIER, LINEAR or STEP, with shared revision, undo/redo and native save. A segment set to smooth or Bezier must have its handles in frame order. The last key starts no segment, but its stored type can be set. Soul2D plays SMOOTH and BEZIER the same way and does not recompute handles. Image/Guide use the six visualCurves IDs and reject partOpacityMapKey; Image requires owned consistent attribute references, and Guide requires complete supported ownership. Sound types remain unsupported. This edits stored types without proving Image/Guide interpolation or playback equivalence. For underscore-map channels, optional partOpacityMapKey selects the exact raw map key and is required when curveId is ambiguous; a supplied selector never falls back.",
       "effect": "document-edit",
+      "guiEntry": [
+        "CAN3 Outline > scene > track > curve > Edit segment type > Apply"
+      ],
       "headless_ok": true,
       "id": "live2d_animation_curve_type_set",
       "inputSchema": {
@@ -13870,6 +13873,9 @@
     {
       "description": "Move one Bezier handle of an existing CAN3 parameter, modern PartOpacity or legacy-colon or underscore-map PartOpacity key, or supported Image/Guide visual scalar key: side previous or next, frame (fractional) and value, with shared revision, undo/redo and native save. Give at least one of frame and value. A smooth or Bezier segment the handle shapes must stay in frame order if it was. Save rewrites only the handle's posF and doubleValue; its integer pos and isPosOptimized and every other stored field stay as they are. Image/Guide use the six visualCurves IDs and reject partOpacityMapKey; Image requires owned consistent attribute references, and Guide requires complete supported ownership. New float scalar writes must fit finite 32-bit storage. Sound controls remain unsupported. This edits stored controls without proving Image/Guide interpolation or playback equivalence. For underscore-map channels, optional partOpacityMapKey selects the exact raw map key and is required when curveId is ambiguous; a supplied selector never falls back.",
       "effect": "document-edit",
+      "guiEntry": [
+        "CAN3 Outline > scene > track > curve > Edit previous/next handle > Apply"
+      ],
       "headless_ok": true,
       "id": "live2d_animation_handle_set",
       "inputSchema": {
@@ -14094,6 +14100,9 @@
     {
       "description": "Edit one existing CAN3 parameter, modern PartOpacity, legacy-colon or underscore-map PartOpacity, or Image/Guide visual scalar anchor value with shared revision, undo/redo and native save. Image/Guide curveId is scalex, scaley, rotate, shear, opacity or artPathWidth, as listed in visualCurves; these channels reject partOpacityMapKey. Guide requires its complete supported track ownership and empty-map layout. Supported Image/Guide scalar channels also accept handle and type edits. Signed anchorFrame identifies the key; controls, key frames and unknown data stay unchanged. Anchor extrema caches are verified and updated; stored evaluation caches are invalidated. Shared scalar storage is rejected; this raw source edit does not claim Cubism playback equivalence. For underscore-map channels, optional partOpacityMapKey selects the exact raw map key and is required when curveId is ambiguous; a supplied selector never falls back.",
       "effect": "document-edit",
+      "guiEntry": [
+        "CAN3 Outline > scene > track > curve > Edit anchor > Apply"
+      ],
       "headless_ok": true,
       "id": "live2d_animation_key_set",
       "inputSchema": {

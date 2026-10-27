@@ -102,6 +102,68 @@ pub fn file_op_gate(dirty_draft: bool, modified: bool, request: &Value) -> Resul
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Can3KeyTarget {
+    pub scene_guid: String,
+    pub track_guid: String,
+    pub curve_id: String,
+    pub part_opacity_map_key: Option<String>,
+    pub frame: i64,
+}
+
+impl Can3KeyTarget {
+    fn request(&self) -> Value {
+        let mut request = json!({"sceneGuid":self.scene_guid, "trackGuid":self.track_guid,
+            "curveId":self.curve_id, "anchorFrame":self.frame});
+        if let Some(key) = &self.part_opacity_map_key { request["partOpacityMapKey"] = json!(key); }
+        request
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Can3HandleSide { Previous, Next }
+
+impl Can3HandleSide {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Previous => "previous", Self::Next => "next" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Can3HandlePoint { pub frame: f64, pub value: f64 }
+
+impl Can3HandlePoint {
+    pub fn is_finite(self) -> bool { self.frame.is_finite() && self.value.is_finite() }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Can3CurveType(&'static str);
+
+impl Can3CurveType {
+    pub fn parse(value: &str) -> Option<Self> { Self::values().find(|kind| kind.as_str() == value) }
+    pub fn values() -> impl Iterator<Item = Self> { crate::animation_source::CURVE_TYPES.into_iter().map(Self) }
+    pub fn as_str(self) -> &'static str { self.0 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Can3ScalarKind { Anchor, Handle(Can3HandleSide), CurveType }
+
+enum Can3ScalarDraft {
+    Anchor { original: f64, value: f64 },
+    Handle { side: Can3HandleSide, original: Can3HandlePoint, value: Can3HandlePoint },
+    CurveType { original: Can3CurveType, value: Can3CurveType },
+}
+
+impl Can3ScalarDraft {
+    fn dirty(&self) -> bool {
+        match self {
+            Self::Anchor { original, value } => original != value,
+            Self::Handle { original, value, .. } => original != value,
+            Self::CurveType { original, value } => original != value,
+        }
+    }
+}
+
 enum EditDraft {
     NodeName {
         id: u64,
@@ -109,22 +171,17 @@ enum EditDraft {
         original: String,
         value: String,
     },
-    Can3Anchor {
-        scene_guid: String,
-        track_guid: String,
-        curve_id: String,
-        part_opacity_map_key: Option<String>,
-        frame: i64,
+    Can3 {
+        target: Can3KeyTarget,
         revision: u64,
-        original: f64,
-        value: f64,
+        edit: Can3ScalarDraft,
     },
 }
 
 impl EditDraft {
     fn revision(&self) -> u64 {
         match self {
-            Self::NodeName { revision, .. } | Self::Can3Anchor { revision, .. } => *revision,
+            Self::NodeName { revision, .. } | Self::Can3 { revision, .. } => *revision,
         }
     }
 }
@@ -143,6 +200,17 @@ pub enum DraftView<'a> {
         frame: i64,
         original: f64,
         value: f64,
+    },
+    Can3Handle {
+        target: &'a Can3KeyTarget,
+        side: Can3HandleSide,
+        original: Can3HandlePoint,
+        value: Can3HandlePoint,
+    },
+    Can3CurveType {
+        target: &'a Can3KeyTarget,
+        original: Can3CurveType,
+        value: Can3CurveType,
     },
 }
 
@@ -678,44 +746,50 @@ impl EditorController {
         frame: i64,
         part_opacity_map_key: Option<&str>,
     ) -> Result<(), String> {
+        self.select_can3_scalar(Can3KeyTarget {
+            scene_guid: scene.to_owned(), track_guid: track.to_owned(), curve_id: curve.to_owned(),
+            part_opacity_map_key: part_opacity_map_key.map(str::to_owned), frame,
+        }, Can3ScalarKind::Anchor)
+    }
+
+    pub fn select_can3_scalar(&mut self, target: Can3KeyTarget, kind: Can3ScalarKind) -> Result<(), String> {
         if self.draft_dirty() {
             return Err(RESELECT_BLOCKED_MESSAGE.to_owned());
         }
         if self.snapshot["documentFormat"].as_str() != Some("live2d.can3") {
-            return Err("anchor drafts require a CAN3 document".into());
+            return Err("scalar drafts require a CAN3 document".into());
         }
         let scenes = self.snapshot["model"]["scenes"]
             .as_array()
             .ok_or("CAN3 model lacks scenes")?;
-        let scene_value = scenes
-            .iter()
-            .find(|s| s["guid"].as_str() == Some(scene))
-            .ok_or_else(|| format!("animation scene {scene} was not found"))?;
-        let track_value = scene_value["tracks"]
-            .as_array()
-            .and_then(|tracks| tracks.iter().find(|t| t["guid"].as_str() == Some(track)))
-            .ok_or_else(|| format!("animation track {track} was not found"))?;
-        let (field, index) = crate::animation_source::editable_curve_slot(track_value, curve, part_opacity_map_key)?;
-        let curve_value = &track_value[field][index];
-        let original = curve_value["points"]
-            .as_array()
-            .and_then(|points| {
-                points
-                    .iter()
-                    .find(|p| p["anchor"]["frame"].as_i64() == Some(frame))
-            })
-            .and_then(|point| point["anchor"]["value"].as_f64())
-            .ok_or_else(|| format!("animation anchor frame {frame} was not found"))?;
-        self.draft = Some(EditDraft::Can3Anchor {
-            scene_guid: scene.to_owned(),
-            track_guid: track.to_owned(),
-            curve_id: curve.to_owned(),
-            part_opacity_map_key: part_opacity_map_key.map(str::to_owned),
-            frame,
-            revision: self.revision(),
-            original,
-            value: original,
-        });
+        let mut matches = scenes.iter().filter(|scene| scene["guid"].as_str() == Some(&target.scene_guid));
+        let scene_value = matches.next().ok_or("animation sceneGuid was not found")?;
+        if matches.next().is_some() { return Err("animation sceneGuid is ambiguous".into()); }
+        let curve = crate::animation_source::scalar_curve(scene_value, &target.request())?;
+        let points = curve["points"].as_array().ok_or("animation curve lacks points")?;
+        let index = points.iter().position(|point| point["anchor"]["frame"].as_i64() == Some(target.frame))
+            .ok_or("animation anchor frame was not found")?;
+        let point = &points[index];
+        let edit = match kind {
+            Can3ScalarKind::Anchor => {
+                let original = point["anchor"]["value"].as_f64().ok_or("animation anchor value is unreadable")?;
+                Can3ScalarDraft::Anchor { original, value: original }
+            }
+            Can3ScalarKind::Handle(side) => {
+                let handle = &point[side.as_str()];
+                let original = Can3HandlePoint {
+                    frame: handle["frame"].as_f64().ok_or("animation handle frame is unreadable")?,
+                    value: handle["value"].as_f64().ok_or("animation handle value is unreadable")?,
+                };
+                Can3ScalarDraft::Handle { side, original, value: original }
+            }
+            Can3ScalarKind::CurveType => {
+                let original = curve["curveTypes"][index].as_str().and_then(Can3CurveType::parse)
+                    .ok_or("animation curve type is unreadable")?;
+                Can3ScalarDraft::CurveType { original, value: original }
+            }
+        };
+        self.draft = Some(EditDraft::Can3 { target, revision: self.revision(), edit });
         Ok(())
     }
 
@@ -726,7 +800,19 @@ impl EditorController {
     }
 
     pub fn set_draft_value(&mut self, value: f64) {
-        if let Some(EditDraft::Can3Anchor { value: current, .. }) = &mut self.draft {
+        if let Some(EditDraft::Can3 { edit: Can3ScalarDraft::Anchor { value: current, .. }, .. }) = &mut self.draft {
+            *current = value;
+        }
+    }
+
+    pub fn set_draft_handle(&mut self, value: Can3HandlePoint) {
+        if let Some(EditDraft::Can3 { edit: Can3ScalarDraft::Handle { value: current, .. }, .. }) = &mut self.draft {
+            *current = value;
+        }
+    }
+
+    pub fn set_draft_curve_type(&mut self, value: Can3CurveType) {
+        if let Some(EditDraft::Can3 { edit: Can3ScalarDraft::CurveType { value: current, .. }, .. }) = &mut self.draft {
             *current = value;
         }
     }
@@ -743,23 +829,18 @@ impl EditorController {
                 original,
                 value,
             }),
-            Some(EditDraft::Can3Anchor {
-                scene_guid,
-                track_guid,
-                curve_id,
-                part_opacity_map_key,
-                frame,
-                original,
-                value,
-                ..
-            }) => Some(DraftView::Can3Anchor {
-                scene_guid,
-                track_guid,
-                curve_id,
-                part_opacity_map_key: part_opacity_map_key.as_deref(),
-                frame: *frame,
-                original: *original,
-                value: *value,
+            Some(EditDraft::Can3 { target, edit, .. }) => Some(match edit {
+                Can3ScalarDraft::Anchor { original, value } => DraftView::Can3Anchor {
+                    scene_guid: &target.scene_guid, track_guid: &target.track_guid, curve_id: &target.curve_id,
+                    part_opacity_map_key: target.part_opacity_map_key.as_deref(), frame: target.frame,
+                    original: *original, value: *value,
+                },
+                Can3ScalarDraft::Handle { side, original, value } => DraftView::Can3Handle {
+                    target, side: *side, original: *original, value: *value,
+                },
+                Can3ScalarDraft::CurveType { original, value } => DraftView::Can3CurveType {
+                    target, original: *original, value: *value,
+                },
             }),
             None => None,
         }
@@ -770,9 +851,7 @@ impl EditorController {
             Some(EditDraft::NodeName {
                 original, value, ..
             }) => original != value,
-            Some(EditDraft::Can3Anchor {
-                original, value, ..
-            }) => original != value,
+            Some(EditDraft::Can3 { edit, .. }) => edit.dirty(),
             None => false,
         }
     }
@@ -800,25 +879,32 @@ impl EditorController {
             EditDraft::NodeName { id, value, .. } => {
                 json!({"op":"node.rename", "id":id, "name":value})
             }
-            EditDraft::Can3Anchor {
-                scene_guid,
-                track_guid,
-                curve_id,
-                part_opacity_map_key,
-                frame,
-                revision,
-                value,
-                ..
-            } => {
-                if !value.is_finite() {
-                    self.status = "animation anchor value must be finite".into();
-                    return failure("animation anchor value must be finite");
-                }
-                let mut request = json!({"op":"live2d.animation.key.set", "sceneGuid":scene_guid,
-                    "trackGuid":track_guid, "curveId":curve_id, "anchorFrame":frame,
-                    "value":value, "expectedRevision":revision});
-                if let Some(key) = part_opacity_map_key {
-                    request["partOpacityMapKey"] = json!(key);
+            EditDraft::Can3 { target, revision, edit } => {
+                let mut request = target.request();
+                request["expectedRevision"] = json!(revision);
+                match edit {
+                    Can3ScalarDraft::Anchor { value, .. } => {
+                        if !value.is_finite() {
+                            self.status = "animation anchor value must be finite".into();
+                            return failure("animation anchor value must be finite");
+                        }
+                        request["op"] = json!("live2d.animation.key.set");
+                        request["value"] = json!(value);
+                    }
+                    Can3ScalarDraft::Handle { side, value, .. } => {
+                        if !value.is_finite() {
+                            self.status = "animation handle frame and value must be finite".into();
+                            return failure("animation handle frame and value must be finite");
+                        }
+                        request["op"] = json!("live2d.animation.handle.set");
+                        request["side"] = json!(side.as_str());
+                        request["frame"] = json!(value.frame);
+                        request["value"] = json!(value.value);
+                    }
+                    Can3ScalarDraft::CurveType { value, .. } => {
+                        request["op"] = json!("live2d.animation.curve_type.set");
+                        request["type"] = json!(value.as_str());
+                    }
                 }
                 request
             }

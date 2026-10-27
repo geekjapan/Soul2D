@@ -1,11 +1,14 @@
 mod common;
+#[path = "common/visual_scalar.rs"]
+mod visual_scalar;
 
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use soul2d_core::editor_controller::{
-    DraftView, EditorController, FILE_OP_BLOCKED_MESSAGE, RESELECT_BLOCKED_MESSAGE,
+    DraftView, EditorController, Can3KeyTarget, Can3ScalarKind, Can3HandleSide, Can3HandlePoint, Can3CurveType,
+    FILE_OP_BLOCKED_MESSAGE, RESELECT_BLOCKED_MESSAGE,
     UNSAVED_REPLACEMENT_MESSAGE,
 };
 
@@ -28,6 +31,173 @@ fn first_node_id(snapshot: &Value) -> u64 {
         .and_then(|children| children.first())
         .and_then(|node| node["uuid"].as_u64())
         .expect("no top-level node")
+}
+
+#[test]
+fn image_anchor_draft_applies_undoes_and_reopens() {
+    let directory = temp_dir();
+    let source = directory.join("image.can3");
+    let xml = visual_scalar::xml(false, "opacity", "attrOpacity");
+    fs::write(&source, authoring_bytes(&xml)).unwrap();
+    let mut controller = EditorController::new();
+    assert_eq!(controller.core_request(&json!({"op":"open","path":source}))["succeeded"], true);
+    let revision = controller.snapshot()["revision"].clone();
+    let added = controller.core_request(&json!({"op":"live2d.animation.key.add","sceneGuid":"scene-guid",
+        "trackGuid":"image-track-guid","curveId":"opacity","anchorFrame":0,"value":1.0,
+        "expectedRevision":revision}));
+    assert_eq!(added["succeeded"], true, "{added}");
+    let before = controller.snapshot()["model"].clone();
+    controller.select_can3_anchor("scene-guid", "image-track-guid", "opacity", 0, None).unwrap();
+    controller.set_draft_value(0.4);
+    assert_eq!(controller.apply_draft()["succeeded"], true);
+    let mut expected = before.clone();
+    expected["scenes"][0]["imageTracks"][0]["visualCurves"][0]["points"][0]["anchor"]["value"] = json!(0.4);
+    assert_eq!(controller.snapshot()["model"], expected);
+    assert_eq!(controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+    assert_eq!(controller.snapshot()["model"], before);
+    assert_eq!(controller.core_request(&json!({"op":"redo"}))["succeeded"], true);
+    assert_eq!(controller.snapshot()["model"], expected);
+    let saved = directory.join("saved.can3");
+    assert_eq!(controller.core_request(&json!({"op":"save","path":saved}))["succeeded"], true);
+    assert_eq!(controller.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+    assert_eq!(controller.snapshot()["model"], expected);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn visual_scalar_drafts_cover_six_image_and_guide_channels_with_shared_history() {
+    assert!(Can3CurveType::parse("unknown").is_none());
+    for guide in [false, true] {
+        for (id, named) in [("scalex", "attrScaleX"), ("scaley", "attrScaleY"), ("rotate", "attrRotate"),
+            ("shear", "attrShear"), ("opacity", "attrOpacity"), ("artPathWidth", "attrArtPathWidth")]
+        {
+            let directory = temp_dir();
+            let source = directory.join("visual.can3");
+            fs::write(&source, authoring_bytes(&visual_scalar::xml(guide, id, named))).unwrap();
+            let original = fs::read(&source).unwrap();
+            let mut controller = EditorController::new();
+            assert_eq!(controller.core_request(&json!({"op":"open","path":source}))["succeeded"], true);
+            let revision = controller.snapshot()["revision"].clone();
+            let added = controller.core_request(&json!({"op":"live2d.animation.key.add","sceneGuid":"scene-guid",
+                "trackGuid":"image-track-guid","curveId":id,"anchorFrame":0,"value":1.0,"expectedRevision":revision}));
+            assert_eq!(added["succeeded"], true, "{guide}/{id}: {added}");
+            let target = Can3KeyTarget { scene_guid: "scene-guid".into(), track_guid: "image-track-guid".into(),
+                curve_id: id.into(), part_opacity_map_key: None, frame: 0 };
+            let family = if guide { "guideTracks" } else { "imageTracks" };
+            let before = controller.snapshot()["model"].clone();
+            let curve_index = before["scenes"][0][family][0]["visualCurves"].as_array().unwrap().iter()
+                .position(|curve| curve["id"] == id).unwrap();
+            let mut expected = before.clone();
+            for kind in [Can3ScalarKind::Anchor, Can3ScalarKind::Handle(Can3HandleSide::Previous),
+                Can3ScalarKind::Handle(Can3HandleSide::Next), Can3ScalarKind::CurveType]
+            {
+                controller.select_can3_scalar(target.clone(), kind).unwrap();
+                assert!(!controller.draft_dirty());
+                let curve = &mut expected["scenes"][0][family][0]["visualCurves"][curve_index];
+                match kind {
+                    Can3ScalarKind::Anchor => {
+                        controller.set_draft_value(0.4);
+                        curve["points"][0]["anchor"]["value"] = json!(0.4);
+                    }
+                    Can3ScalarKind::Handle(side) => {
+                        let frame = if side == Can3HandleSide::Previous { -2.5 } else { 2.5 };
+                        controller.set_draft_handle(Can3HandlePoint { frame, value: 3.5 });
+                        curve["points"][0][side.as_str()]["frame"] = json!(frame);
+                        curve["points"][0][side.as_str()]["value"] = json!(3.5);
+                    }
+                    Can3ScalarKind::CurveType => {
+                        controller.set_draft_curve_type(Can3CurveType::parse("STEP").unwrap());
+                        curve["curveTypes"][0] = json!("STEP");
+                    }
+                }
+                let revision = controller.snapshot()["revision"].as_u64().unwrap();
+                assert!(controller.draft_dirty());
+                let response = controller.apply_draft();
+                assert_eq!(response["succeeded"], true, "{guide}/{id}/{kind:?}: {response}");
+                assert_eq!(controller.snapshot()["revision"], revision + 1);
+                assert_eq!(controller.snapshot()["model"], expected);
+                assert!(controller.draft_view().is_none());
+            }
+            for _ in 0..4 { assert_eq!(controller.core_request(&json!({"op":"undo"}))["succeeded"], true); }
+            assert_eq!(controller.snapshot()["model"], before);
+            for _ in 0..4 { assert_eq!(controller.core_request(&json!({"op":"redo"}))["succeeded"], true); }
+            assert_eq!(controller.snapshot()["model"], expected);
+            controller.select_can3_scalar(target.clone(), Can3ScalarKind::CurveType).unwrap();
+            let snapshot = controller.snapshot().clone();
+            assert_eq!(controller.apply_draft()["succeeded"], true);
+            assert_eq!(controller.snapshot(), &snapshot);
+            let saved = directory.join("saved.can3");
+            assert_eq!(controller.core_request(&json!({"op":"save","path":saved}))["succeeded"], true);
+            assert_eq!(controller.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+            assert_eq!(controller.snapshot()["model"], expected);
+            assert_eq!(fs::read(source).unwrap(), original);
+
+            controller.select_can3_scalar(target.clone(), Can3ScalarKind::Handle(Can3HandleSide::Next)).unwrap();
+            controller.set_draft_handle(Can3HandlePoint { frame: f64::NAN, value: 7.0 });
+            let snapshot = controller.snapshot().clone();
+            assert_eq!(controller.core_request(&json!({"op":"save","path":directory.join("blocked.can3")}))["message"], FILE_OP_BLOCKED_MESSAGE);
+            assert_eq!(controller.core_request(&json!({"op":"new"}))["message"], FILE_OP_BLOCKED_MESSAGE);
+            assert_eq!(controller.select_can3_scalar(target.clone(), Can3ScalarKind::CurveType).unwrap_err(), RESELECT_BLOCKED_MESSAGE);
+            assert_eq!(controller.apply_draft()["succeeded"], false);
+            assert_eq!(controller.snapshot(), &snapshot);
+            assert!(matches!(controller.draft_view(), Some(DraftView::Can3Handle { value, .. }) if value.frame.is_nan()));
+            controller.set_draft_handle(Can3HandlePoint { frame: f64::MAX, value: 7.0 });
+            assert_eq!(controller.apply_draft()["succeeded"], false);
+            assert_eq!(controller.snapshot(), &snapshot);
+            assert!(controller.draft_dirty());
+            controller.discard_draft();
+            controller.select_can3_scalar(target, Can3ScalarKind::CurveType).unwrap();
+            controller.set_draft_curve_type(Can3CurveType::parse("BEZIER").unwrap());
+            let revision = controller.snapshot()["revision"].clone();
+            assert_eq!(controller.core_request(&json!({"op":"live2d.animation.scene.set","sceneGuid":"scene-guid",
+                "name":"Concurrent", "expectedRevision":revision}))["succeeded"], true);
+            let snapshot = controller.snapshot().clone();
+            assert!(controller.draft_stale());
+            assert_eq!(controller.apply_draft()["succeeded"], false);
+            assert_eq!(controller.snapshot(), &snapshot);
+            assert!(matches!(controller.draft_view(), Some(DraftView::Can3CurveType { value, .. }) if value.as_str() == "BEZIER"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn visual_scalar_draft_targets_an_unsaved_copy_without_changing_the_donor() {
+    for guide in [false, true] {
+        let directory = temp_dir(); let source = directory.join("copies.can3");
+        fs::write(&source, authoring_bytes(&visual_scalar::xml(guide, "opacity", "attrOpacity"))).unwrap();
+        let mut controller = EditorController::new();
+        assert_eq!(controller.core_request(&json!({"op":"open", "path":source}))["succeeded"], true);
+        let revision = controller.snapshot()["revision"].clone();
+        assert_eq!(controller.core_request(&json!({"op":"live2d.animation.key.add", "sceneGuid":"scene-guid",
+            "trackGuid":"image-track-guid", "curveId":"opacity", "anchorFrame":0, "value":1.0, "expectedRevision":revision}))["succeeded"], true);
+        let revision = controller.snapshot()["revision"].clone();
+        let copied = controller.core_request(&json!({"op":"live2d.animation.track.duplicate", "sceneGuid":"scene-guid",
+            "trackGuid":"image-track-guid", "name":"Copy", "expectedRevision":revision}));
+        assert_eq!(copied["succeeded"], true, "{copied}");
+        let guid = copied["result"]["trackGuid"].as_str().unwrap().to_owned();
+        let target = Can3KeyTarget { scene_guid:"scene-guid".into(), track_guid:guid.clone(),
+            curve_id:"opacity".into(), part_opacity_map_key:None, frame:0 };
+        let before = controller.snapshot()["model"].clone();
+        let mut expected = before.clone();
+        let family = if guide { "guideTracks" } else { "imageTracks" };
+        let track = expected["scenes"][0][family].as_array_mut().unwrap().iter_mut().find(|track| track["guid"] == guid).unwrap();
+        let curve = track["visualCurves"].as_array_mut().unwrap().iter_mut().find(|curve| curve["id"] == "opacity").unwrap();
+        curve["points"][0]["next"]["frame"] = json!(1.5);
+        curve["points"][0]["next"]["value"] = json!(2.5);
+        controller.select_can3_scalar(target, Can3ScalarKind::Handle(Can3HandleSide::Next)).unwrap();
+        controller.set_draft_handle(Can3HandlePoint { frame:1.5, value:2.5 });
+        assert_eq!(controller.apply_draft()["succeeded"], true);
+        assert_eq!(controller.snapshot()["model"], expected);
+        assert_eq!(controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+        assert_eq!(controller.snapshot()["model"], before);
+        assert_eq!(controller.core_request(&json!({"op":"redo"}))["succeeded"], true);
+        let saved = directory.join("saved.can3");
+        assert_eq!(controller.core_request(&json!({"op":"save", "path":saved}))["succeeded"], true);
+        assert_eq!(controller.core_request(&json!({"op":"open", "path":saved}))["succeeded"], true);
+        assert_eq!(controller.snapshot()["model"], expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[test]

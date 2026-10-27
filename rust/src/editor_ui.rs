@@ -6,7 +6,8 @@ use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use soul2d_core::editor_controller::{
     node_convert_classes, parameter_usage, DraftView, DropSite, EditorController, NodeAction,
-    ParameterUse, NODE_CREATE_CLASSES, NODE_INSERT_CLASSES,
+    ParameterUse, Can3KeyTarget, Can3ScalarKind, Can3HandleSide, Can3HandlePoint, Can3CurveType,
+    NODE_CREATE_CLASSES, NODE_INSERT_CLASSES,
 };
 
 use crate::editor_stdio::{self, HostMessage};
@@ -16,7 +17,32 @@ use soul2d_core::window_shell::{self, Choice, DropAction, Gate, WindowGeometry};
 
 enum OwnedDraft {
     NodeName { id: u64, original: String },
-    Can3Anchor { curve_id: String, map_key: Option<String>, frame: i64, original: f64 },
+    Can3Anchor { curve_id: String, map_key: Option<String>, frame: i64, original: f64, value: f64 },
+    Can3Handle { target: Can3KeyTarget, side: Can3HandleSide, original: Can3HandlePoint, value: Can3HandlePoint },
+    Can3CurveType { target: Can3KeyTarget, original: Can3CurveType, value: Can3CurveType },
+}
+
+impl From<DraftView<'_>> for OwnedDraft {
+    fn from(view: DraftView<'_>) -> Self {
+        match view {
+            DraftView::NodeName { id, original, .. } => Self::NodeName { id, original: original.to_owned() },
+            DraftView::Can3Anchor { curve_id, part_opacity_map_key, frame, original, value, .. } => Self::Can3Anchor {
+                curve_id: curve_id.to_owned(), map_key: part_opacity_map_key.map(str::to_owned), frame, original, value,
+            },
+            DraftView::Can3Handle { target, side, original, value } => Self::Can3Handle {
+                target: target.clone(), side, original, value,
+            },
+            DraftView::Can3CurveType { target, original, value } => Self::Can3CurveType {
+                target: target.clone(), original, value,
+            },
+        }
+    }
+}
+
+enum Can3ScalarAction {
+    Select(Can3KeyTarget, Can3ScalarKind),
+    New(Can3KeyDraft),
+    Delete(Value),
 }
 
 #[derive(PartialEq)]
@@ -1463,7 +1489,6 @@ pub struct EditorApp {
     recovery_offer: Vec<PathBuf>,
     file_path: String,
     draft_name: String,
-    draft_value: f64,
     preview_dirty: bool,
     preview: Option<egui::TextureHandle>,
     /// The preview is an Onion Slice picture, not the plain render.
@@ -1588,7 +1613,6 @@ impl EditorApp {
             recovery_offer: tools.config_dir.as_deref().and_then(|dir| autosave::list_recovery(dir).ok()).unwrap_or_default(),
             file_path: String::new(),
             draft_name: String::new(),
-            draft_value: 0.0,
             preview_dirty: true,
             preview: None,
             onion_drawn: false,
@@ -1786,9 +1810,6 @@ impl EditorApp {
         match self.controller.select_can3_anchor(scene, track, curve, frame, map_key) {
             Ok(()) => {
                 self.notice.clear();
-                if let Some(DraftView::Can3Anchor { value, .. }) = self.controller.draft_view() {
-                    self.draft_value = value;
-                }
             }
             Err(message) => self.notice = message,
         }
@@ -2949,13 +2970,63 @@ impl EditorApp {
         } else if discard { self.can3_key_draft = None; }
     }
 
+    fn can3_scalar_keys(ui: &mut egui::Ui, scene: &str, track: &str, curve: &Value,
+        revision: u64, can_edit: bool, can_add: bool) -> Option<Can3ScalarAction>
+    {
+        let id = curve["id"].as_str().unwrap_or_default();
+        let map_key = curve["mapKey"].as_str();
+        let label = map_key.map(|key| format!("{id} [{key}]")).unwrap_or_else(|| id.to_owned());
+        let mut action = None;
+        if ui.add_enabled(can_edit && can_add, egui::Button::new(format!("New key \"{label}\"..."))).clicked() {
+            action = Some(Can3ScalarAction::New(Can3KeyDraft {
+                scene_guid: scene.to_owned(), track_guid: track.to_owned(), curve_id: id.to_owned(),
+                map_key: map_key.map(str::to_owned), expected_revision: revision,
+                frame: 0, value: 0.0, curve_type: "LINEAR",
+            }));
+        }
+        for (index, point) in curve["points"].as_array().into_iter().flatten().enumerate() {
+            let Some(frame) = point["anchor"]["frame"].as_i64() else { continue };
+            let target = || Can3KeyTarget { scene_guid: scene.to_owned(), track_guid: track.to_owned(),
+                curve_id: id.to_owned(), part_opacity_map_key: map_key.map(str::to_owned), frame };
+            ui.push_id(frame, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("frame {frame} = {}", point["anchor"]["value"]));
+                    if ui.add_enabled(can_edit, egui::Button::new(format!("Edit anchor {frame} in \"{label}\""))).clicked() {
+                        action = Some(Can3ScalarAction::Select(target(), Can3ScalarKind::Anchor));
+                    }
+                    if ui.add_enabled(can_edit, egui::Button::new(format!("Delete key {frame} in \"{label}\""))).clicked() {
+                        let mut request = json!({"op":"live2d.animation.key.delete", "sceneGuid":scene,
+                            "trackGuid":track, "curveId":id, "anchorFrame":frame, "expectedRevision":revision});
+                        if let Some(key) = map_key { request["partOpacityMapKey"] = json!(key); }
+                        action = Some(Can3ScalarAction::Delete(request));
+                    }
+                });
+                for side in [Can3HandleSide::Previous, Can3HandleSide::Next] {
+                    let control = &point[side.as_str()];
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}: frame {} / {}, value {}", side.as_str(),
+                            control["frame"], control["integerFrame"], control["value"]));
+                        if ui.add_enabled(can_edit, egui::Button::new(format!("Edit {} handle {frame} in \"{label}\"", side.as_str()))).clicked() {
+                            action = Some(Can3ScalarAction::Select(target(), Can3ScalarKind::Handle(side)));
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("Stored segment type: {}", curve["curveTypes"][index]));
+                    if ui.add_enabled(can_edit, egui::Button::new(format!("Edit segment type {frame} in \"{label}\""))).clicked() {
+                        action = Some(Can3ScalarAction::Select(target(), Can3ScalarKind::CurveType));
+                    }
+                });
+            });
+        }
+        action
+    }
+
     fn can3_tree(&mut self, ui: &mut egui::Ui) {
-        let mut picked = None;
+        let mut scalar_action = None;
         let mut delete = None;
         let mut delete_track = None;
         let mut delete_curve = None;
-        let mut new_key = None;
-        let mut delete_key = None;
         let revision = self.controller.snapshot()["revision"].as_u64().unwrap_or_default();
         let can_edit = !self.closing && !self.controller.draft_dirty() && self.can3_delete.is_none()
             && self.unsaved.is_none() && self.tools.prompt.is_none();
@@ -3010,18 +3081,28 @@ impl EditorApp {
                             });
                         }
                         ui.label(format!("FPS {}, duration {} frames", scene["fps"], scene["durationFrames"]));
-                        for track in scene["imageTracks"].as_array().into_iter().flatten() {
+                        for (family, track) in ["imageTracks", "guideTracks"].into_iter()
+                            .flat_map(|field| scene[field].as_array().into_iter().flatten().map(move |track| (field, track)))
+                        {
                             let track_guid = track["guid"].as_str().unwrap_or_default();
                             let name = track["name"].as_str().unwrap_or(track_guid);
-                            egui::CollapsingHeader::new(format!("Image: {name}"))
-                                .id_salt((&scene_guid, "image", track_guid)).show(ui, |ui| {
+                            let kind = if family == "imageTracks" { "Image" } else { "Guide" };
+                            egui::CollapsingHeader::new(format!("{kind}: {name}"))
+                                .id_salt((&scene_guid, family, track_guid)).show(ui, |ui| {
                                     ui.label(format!("Track GUID: {track_guid}"));
-                                    ui.label(format!("Image resource GUID: {}", track["resourceGuid"].as_str().unwrap_or_default()));
-                                    if ui.add_enabled(can_edit, egui::Button::new(format!("Delete image track \"{name}\"..."))).clicked() {
+                                    ui.label(format!("{kind} resource GUID: {}", track["resourceGuid"].as_str().unwrap_or_default()));
+                                    if family == "imageTracks" && ui.add_enabled(can_edit, egui::Button::new(format!("Delete image track \"{name}\"..."))).clicked() {
                                         delete_track = Some(TrackDeleteConfirmation {
                                             scene_guid:scene_guid.clone(), track_guid:track_guid.to_owned(), track_name:name.to_owned(),
                                             resource_guid:track["resourceGuid"].as_str().unwrap_or_default().to_owned(),
                                             details:TrackDeleteDetails::Image, expected_revision:revision,
+                                        });
+                                    }
+                                    for curve in track["visualCurves"].as_array().into_iter().flatten() {
+                                        let id = curve["id"].as_str().unwrap_or_default();
+                                        egui::CollapsingHeader::new(id).id_salt((&scene_guid, track_guid, id)).show(ui, |ui| {
+                                            if let Some(action) = Self::can3_scalar_keys(ui, &scene_guid, track_guid, curve,
+                                                revision, can_edit, self.can3_key_draft.is_none()) { scalar_action = Some(action); }
                                         });
                                     }
                                 });
@@ -3059,13 +3140,6 @@ impl EditorApp {
                                     egui::CollapsingHeader::new(&curve_label)
                                         .id_salt((&track_guid, &curve_id, map_key))
                                         .show(ui, |ui| {
-                                            if ui.add_enabled(can_edit && self.can3_key_draft.is_none(),
-                                                egui::Button::new(format!("New key \"{curve_label}\"..."))).clicked()
-                                            {
-                                                new_key = Some(Can3KeyDraft { scene_guid:scene_guid.clone(), track_guid:track_guid.clone(),
-                                                    curve_id:curve_id.clone(), map_key:map_key.map(str::to_owned), expected_revision:revision,
-                                                    frame:0, value:0.0, curve_type:"LINEAR" });
-                                            }
                                             if ui.add_enabled(can_edit, egui::Button::new(format!("Delete curve \"{curve_label}\"..."))).clicked() {
                                                 delete_curve = Some(CurveDeleteConfirmation {
                                                     scene_guid:scene_guid.clone(), track_guid:track_guid.clone(), curve_id:curve_id.clone(),
@@ -3077,45 +3151,8 @@ impl EditorApp {
                                                 .or_else(|| curve["legacyMapPartId"].as_str())
                                                 .or(map_key)
                                                 .or_else(|| curve["parameterGuid"].as_str()).unwrap_or(""));
-                                            for point in curve["points"]
-                                                .as_array()
-                                                .into_iter()
-                                                .flatten()
-                                            {
-                                                let frame = point["anchor"]["frame"]
-                                                    .as_i64()
-                                                    .unwrap_or(0);
-                                                let value = point["anchor"]["value"]
-                                                    .as_f64()
-                                                    .unwrap_or(0.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.label(format!(
-                                                        "frame {frame} = {value}"
-                                                    ));
-                                                    if ui.small_button(tr("Edit")).clicked() {
-                                                        picked = Some((
-                                                            scene_guid.clone(),
-                                                            track_guid.clone(),
-                                                            curve_id.clone(),
-                                                            frame,
-                                                            map_key.map(str::to_owned),
-                                                        ));
-                                                    }
-                                                    if ui.add_enabled(can_edit, egui::Button::new(format!("Delete key {frame} in \"{curve_label}\""))).clicked() {
-                                                        let mut request = json!({"op":"live2d.animation.key.delete", "sceneGuid":scene_guid,
-                                                            "trackGuid":track_guid, "curveId":curve_id, "anchorFrame":frame, "expectedRevision":revision});
-                                                        if let Some(key) = map_key { request["partOpacityMapKey"] = json!(key); }
-                                                        delete_key = Some(request);
-                                                    }
-                                                });
-                                                for handle in ["previous", "next"] {
-                                                    let control = &point[handle];
-                                                    ui.label(format!(
-                                                        "  {handle}: frame {} / {}, value {}",
-                                                        control["frame"], control["integerFrame"], control["value"]
-                                                    ));
-                                                }
-                                            }
+                                            if let Some(action) = Self::can3_scalar_keys(ui, &scene_guid, &track_guid, curve,
+                                                revision, can_edit, self.can3_key_draft.is_none()) { scalar_action = Some(action); }
                                         });
                                 }
                             });
@@ -3125,8 +3162,20 @@ impl EditorApp {
         } else {
             ui.label("CAN3 model lacks scenes.");
         }
-        if let Some((scene, track, curve, frame, map_key)) = picked {
-            self.select_anchor_draft(&scene, &track, &curve, frame, map_key.as_deref());
+        match scalar_action {
+            Some(Can3ScalarAction::Select(target, Can3ScalarKind::Anchor)) => {
+                self.select_anchor_draft(&target.scene_guid, &target.track_guid, &target.curve_id,
+                    target.frame, target.part_opacity_map_key.as_deref());
+            }
+            Some(Can3ScalarAction::Select(target, kind)) => {
+                match self.controller.select_can3_scalar(target, kind) {
+                    Ok(()) => self.notice.clear(),
+                    Err(message) => self.notice = message,
+                }
+            }
+            Some(Can3ScalarAction::New(draft)) => self.can3_key_draft = Some(draft),
+            Some(Can3ScalarAction::Delete(request)) => self.command(request),
+            None => {},
         }
         if let Some(confirmation) = delete {
             self.can3_delete = Some(Can3DeleteConfirmation::Scene(confirmation));
@@ -3137,8 +3186,6 @@ impl EditorApp {
         if let Some(confirmation) = delete_curve {
             self.can3_delete = Some(Can3DeleteConfirmation::Curve(confirmation));
         }
-        if let Some(draft) = new_key { self.can3_key_draft = Some(draft); }
-        if let Some(request) = delete_key { self.command(request); }
         self.can3_key_form(ui, can_edit);
     }
 
@@ -3552,11 +3599,11 @@ impl EditorApp {
         dirty: bool,
         stale: bool,
     ) {
-        let Some(draft) = draft else {
-            ui.label("No draft selected. Edit an INX node or a CAN3 anchor.");
+        let Some(mut draft) = draft else {
+            ui.label("No draft selected. Edit an INX node or a CAN3 key.");
             return;
         };
-        match &draft {
+        match &mut draft {
             OwnedDraft::NodeName { id, original } => {
                 ui.label(format!("Rename node {id} (was \"{original}\")"));
                 if ui.text_edit_singleline(&mut self.draft_name).changed() {
@@ -3569,23 +3616,50 @@ impl EditorApp {
                 map_key,
                 frame,
                 original,
+                value,
             } => {
                 ui.label(format!(
                     "Anchor value for {curve_id} at frame {frame} (was {original})"
                 ));
                 if let Some(key) = map_key { ui.label(format!("Part opacity map key: {key}")); }
-                if ui
-                    .add(egui::DragValue::new(&mut self.draft_value).speed(0.01))
-                    .changed()
+                let label = ui.label("Anchor value");
+                if ui.add(egui::DragValue::new(value).speed(0.01)).labelled_by(label.id).changed()
                 {
                     self.remote_quit.cancel("anchor_value_draft_changed");
-                    self.controller.set_draft_value(self.draft_value);
+                    self.controller.set_draft_value(*value);
+                }
+            }
+            OwnedDraft::Can3Handle { target, side, original, value } => {
+                ui.label(format!("{} handle for {} at anchor frame {} (was {}, {})",
+                    side.as_str(), target.curve_id, target.frame, original.frame, original.value));
+                if let Some(key) = &target.part_opacity_map_key { ui.label(format!("Part opacity map key: {key}")); }
+                let label = ui.label("Handle frame");
+                let frame_changed = ui.add(egui::DragValue::new(&mut value.frame).speed(0.01)).labelled_by(label.id).changed();
+                let label = ui.label("Handle value");
+                let value_changed = ui.add(egui::DragValue::new(&mut value.value).speed(0.01)).labelled_by(label.id).changed();
+                if frame_changed || value_changed {
+                    self.remote_quit.cancel("handle_draft_changed");
+                    self.controller.set_draft_handle(*value);
+                }
+            }
+            OwnedDraft::Can3CurveType { target, original, value } => {
+                ui.label(format!("Segment starting at {} frame {} (was {})", target.curve_id, target.frame, original.as_str()));
+                if let Some(key) = &target.part_opacity_map_key { ui.label(format!("Part opacity map key: {key}")); }
+                let before = *value;
+                let label = ui.label("Stored segment type");
+                egui::ComboBox::from_id_salt("can3-stored-segment-type").selected_text(value.as_str()).show_ui(ui, |ui| {
+                    for kind in Can3CurveType::values() { ui.selectable_value(value, kind, kind.as_str()); }
+                }).response.labelled_by(label.id);
+                if *value != before {
+                    self.remote_quit.cancel("segment_type_draft_changed");
+                    self.controller.set_draft_curve_type(*value);
                 }
             }
         }
         let finite = match &draft {
-            OwnedDraft::Can3Anchor { .. } => self.draft_value.is_finite(),
-            OwnedDraft::NodeName { .. } => true,
+            OwnedDraft::Can3Anchor { value, .. } => value.is_finite(),
+            OwnedDraft::Can3Handle { value, .. } => value.is_finite(),
+            OwnedDraft::NodeName { .. } | OwnedDraft::Can3CurveType { .. } => true,
         };
         ui.horizontal(|ui| {
             if ui
@@ -6687,24 +6761,7 @@ impl eframe::App for EditorApp {
         let can_redo = self.controller.snapshot()["canRedo"].as_bool() == Some(true);
         let draft_dirty = self.controller.draft_dirty();
         let draft_stale = self.controller.draft_stale();
-        let owned_draft = self.controller.draft_view().map(|view| match view {
-            DraftView::NodeName { id, original, .. } => OwnedDraft::NodeName {
-                id,
-                original: original.to_owned(),
-            },
-            DraftView::Can3Anchor {
-                curve_id,
-                part_opacity_map_key,
-                frame,
-                original,
-                ..
-            } => OwnedDraft::Can3Anchor {
-                curve_id: curve_id.to_owned(),
-                map_key: part_opacity_map_key.map(str::to_owned),
-                frame,
-                original,
-            },
-        });
+        let owned_draft = self.controller.draft_view().map(OwnedDraft::from);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -18631,6 +18688,129 @@ mod editor_state_tests {
         app.can3_delete_dialog(ctx);
     }
 
+    fn draw_can3_scalar_gui(app: &mut EditorApp, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            app.can3_tree(ui);
+            let draft = app.controller.draft_view().map(OwnedDraft::from);
+            app.draft_editor(ui, draft, app.controller.draft_dirty(), app.controller.draft_stale());
+        });
+    }
+
+    fn set_can3_scalar_number(app: &mut EditorApp, harness: &mut crate::editor_test_support::Harness, label: &str, value: f64) {
+        use crate::editor_test_support::name_of;
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        let output = harness.frame(Vec::new(), |ctx| draw_can3_scalar_gui(app, ctx));
+        let target = output.iter().find(|(_, node)| node.role() == Role::SpinButton && name_of(&output, node).as_deref() == Some(label))
+            .map(|(id, _)| *id).unwrap_or_else(|| panic!("missing scalar field {label}"));
+        harness.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::SetValue, target, data: Some(ActionData::NumericValue(value)),
+        })], |ctx| draw_can3_scalar_gui(app, ctx));
+    }
+
+    #[test]
+    fn can3_visual_scalar_gui_edits_anchor_handles_and_type_through_widgets() {
+        mod fixture { include!("../tests/common/visual_scalar.rs"); }
+        use crate::editor_test_support::{name_of, Harness};
+        use egui::accesskit::Role;
+        for guide in [false, true] {
+            let name = format!("visual-scalar-gui-{guide}");
+            let mut app = can3_app_with_xml(&name, &fixture::xml(guide, "opacity", "attrOpacity"));
+            let family = if guide { "guideTracks" } else { "imageTracks" };
+            let curve_index = app.controller.snapshot()["model"]["scenes"][0][family][0]["visualCurves"].as_array().unwrap()
+                .iter().position(|curve| curve["id"] == "opacity").unwrap();
+            let mut harness = Harness::new();
+            harness.screen = egui::vec2(1600.0, 4000.0);
+            begin_can3_key(&mut app, &mut harness, "scene-guid", "image-track-guid", "opacity", None);
+            set_can3_key_fields(&mut app, &mut harness, -3, 1.0, "LINEAR");
+            harness.click(Role::Button, "Add CAN3 key", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+            assert!(app.can3_key_draft.is_none(), "{}", app.controller.status());
+            let baseline = app.controller.snapshot()["model"].clone();
+            let mut expected = baseline.clone();
+            for (button, fields, kind) in [
+                ("Edit anchor -3 in \"opacity\"", vec![("Anchor value", 0.4)], Can3ScalarKind::Anchor),
+                ("Edit previous handle -3 in \"opacity\"", vec![("Handle frame", -4.5), ("Handle value", 3.5)], Can3ScalarKind::Handle(Can3HandleSide::Previous)),
+                ("Edit next handle -3 in \"opacity\"", vec![("Handle frame", -1.5), ("Handle value", 4.5)], Can3ScalarKind::Handle(Can3HandleSide::Next)),
+                ("Edit segment type -3 in \"opacity\"", vec![], Can3ScalarKind::CurveType),
+            ] {
+                harness.click(Role::Button, button, |ctx| draw_can3_scalar_gui(&mut app, ctx));
+                for (label, value) in fields { set_can3_scalar_number(&mut app, &mut harness, label, value); }
+                let curve = &mut expected["scenes"][0][family][0]["visualCurves"][curve_index];
+                match kind {
+                    Can3ScalarKind::Anchor => curve["points"][0]["anchor"]["value"] = json!(0.4),
+                    Can3ScalarKind::Handle(side) => {
+                        let (frame, value) = if side == Can3HandleSide::Previous { (-4.5, 3.5) } else { (-1.5, 4.5) };
+                        curve["points"][0][side.as_str()]["frame"] = json!(frame);
+                        curve["points"][0][side.as_str()]["value"] = json!(value);
+                    }
+                    Can3ScalarKind::CurveType => {
+                        let output = harness.click(Role::ComboBox, "Stored segment type", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+                        let role = output.iter().find(|(_, node)| name_of(&output, node).as_deref() == Some("STEP")).map(|(_, node)| node.role()).unwrap();
+                        harness.click(role, "STEP", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+                        curve["curveTypes"][0] = json!("STEP");
+                    }
+                }
+                assert!(app.controller.draft_dirty());
+                let revision = app.controller.snapshot()["revision"].as_u64().unwrap();
+                harness.click(Role::Button, "Apply", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+                assert_eq!(app.controller.snapshot()["revision"], revision + 1, "{}", app.controller.status());
+                assert_eq!(app.controller.snapshot()["model"], expected);
+                assert!(app.controller.draft_view().is_none());
+            }
+            for _ in 0..4 { app.command(json!({"op":"undo"})); }
+            assert_eq!(app.controller.snapshot()["model"], baseline);
+            for _ in 0..4 { app.command(json!({"op":"redo"})); }
+            assert_eq!(app.controller.snapshot()["model"], expected);
+            let saved = temp_dir(&name).join("saved.can3");
+            app.command(json!({"op":"save", "path":saved}));
+            assert!(saved.exists(), "{}", app.controller.status());
+            app.command(json!({"op":"open", "path":saved}));
+            assert_eq!(app.controller.snapshot()["model"], expected);
+        }
+    }
+
+    #[test]
+    fn can3_visual_scalar_gui_retains_handle_and_type_drafts_across_file_and_close_refusals() {
+        mod fixture { include!("../tests/common/visual_scalar.rs"); }
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for (button, handle) in [("Edit next handle 0 in \"opacity\"", true), ("Edit segment type 0 in \"opacity\"", false)] {
+            let name = format!("visual-draft-guards-{handle}");
+            let mut app = can3_app_with_xml(&name, &fixture::xml(false, "opacity", "attrOpacity"));
+            let mut harness = Harness::new(); harness.screen = egui::vec2(1600.0, 4000.0);
+            begin_can3_key(&mut app, &mut harness, "scene-guid", "image-track-guid", "opacity", None);
+            harness.click(Role::Button, "Add CAN3 key", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+            let baseline = temp_dir(&name).join("baseline.can3");
+            app.command(json!({"op":"save", "path":baseline}));
+            assert!(baseline.exists());
+            assert_eq!(app.controller.snapshot()["modified"], false);
+            harness.click(Role::Button, button, |ctx| draw_can3_scalar_gui(&mut app, ctx));
+            if handle {
+                set_can3_scalar_number(&mut app, &mut harness, "Handle value", 4.0);
+            } else {
+                use crate::editor_test_support::name_of;
+                let output = harness.click(Role::ComboBox, "Stored segment type", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+                let role = output.iter().find(|(_, node)| name_of(&output, node).as_deref() == Some("STEP")).map(|(_, node)| node.role()).unwrap();
+                harness.click(role, "STEP", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+            }
+            assert_eq!(state(&mut app)["drafts"]["panels"], true);
+            assert_eq!(request_quit(&mut app).into_message().unwrap()["result"]["isError"], true);
+            assert!(matches!(app.remote_quit, RemoteQuit::Idle));
+            let before = document(&app);
+            let saved = temp_dir(&name).join("refused.can3");
+            assert_eq!(refused(&mut app, "save", json!({"path":saved})), FILE_OP_BLOCKED_MESSAGE);
+            assert_eq!(refused(&mut app, "new", json!({})), FILE_OP_BLOCKED_MESSAGE);
+            assert!(!saved.exists());
+            harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
+            harness.frame(Vec::new(), |ctx| app.handle_close_request(ctx));
+            assert!(!app.closing);
+            assert_eq!(document(&app), before);
+            assert!(app.controller.draft_dirty());
+            harness.click(Role::Button, "Discard", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+            assert!(!app.controller.draft_dirty());
+            assert_eq!(document(&app), before);
+        }
+    }
+
     fn click_track_delete(app: &mut EditorApp, harness: &mut crate::editor_test_support::Harness, scene: &str, track: &str) {
         use crate::editor_test_support::has;
         use egui::accesskit::Role;
@@ -18951,12 +19131,16 @@ mod editor_state_tests {
         use egui::accesskit::Role;
         let row=app.controller.snapshot()["model"]["scenes"].as_array().unwrap().iter().find(|row|row["guid"]==scene).unwrap();
         let scene_name=row["name"].as_str().unwrap().to_owned();
-        let track_name=row["tracks"].as_array().unwrap().iter().find(|row|row["guid"]==track).unwrap()["name"].as_str().unwrap().to_owned();
+        let (family, track_row) = ["tracks", "imageTracks", "guideTracks"].into_iter()
+            .flat_map(|field| row[field].as_array().into_iter().flatten().map(move |row| (field, row)))
+            .find(|(_, row)| row["guid"] == track).unwrap();
+        let name = track_row["name"].as_str().unwrap();
+        let track_name = match family { "imageTracks" => format!("Image: {name}"), "guideTracks" => format!("Guide: {name}"), _ => name.to_owned() };
         let curve_label=map_key.map(|key|format!("{curve_id} [{key}]")).unwrap_or_else(||curve_id.to_owned());
         let mut output=harness.frame(Vec::new(),|ctx|draw_can3_scene_gui(app,ctx));
         if !has(&output,Role::Button,&track_name) {output=harness.click(Role::Button,&scene_name,|ctx|draw_can3_scene_gui(app,ctx));}
         if !has(&output,Role::Button,&curve_label) {output=harness.click(Role::Button,&track_name,|ctx|draw_can3_scene_gui(app,ctx));}
-        let label=format!("Delete curve \"{curve_label}\"...");
+        let label=format!("New key \"{curve_label}\"...");
         if !has(&output,Role::Button,&label) {harness.click(Role::Button,&curve_label,|ctx|draw_can3_scene_gui(app,ctx));}
     }
 

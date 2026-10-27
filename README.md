@@ -29,6 +29,10 @@ operations, and bounded inspection and editing of CMO3/CAN3 source files.
 Support varies by format and operation. Reading or saving a source file does
 not establish correct rendering or playback in another editor.
 
+In the CAN3 Outline, expand an Image or Guide track and a readable scalar channel
+to add or delete keys, or edit an anchor value, either handle, or the stored segment
+type. Apply or discard each edit before saving. Missing or fixed channels are not created.
+
 The following work remains incomplete:
 
 - Packaging: `build-aux/osx/BuildUniversal.sh` builds an unsigned macOS app

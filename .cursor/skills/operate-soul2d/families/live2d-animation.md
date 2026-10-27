@@ -59,8 +59,11 @@ Integer positions, optimization/corner flags, anchors/extrema and other channels
 Recreated and new keys retain canonical protected fields after later handle/type edits. This is stored-field
 authoring; the four vendor inputs have one scalar key per channel and do not prove multi-key interpolation
 or Image/Guide playback equivalence. New float scalar writes must fit finite 32-bit storage;
-the existing raw decimal handling is otherwise unchanged. Dedicated Image/Guide handle/type editor
-controls remain unverified.
+the existing raw decimal handling is otherwise unchanged. CAN3 Outline Image/Guide rows expose these
+readable scalar channels. New key and Delete key use the shared operations. Edit anchor, Edit previous/next
+handle and Edit segment type open one controller-owned revision-bound draft; Apply sends one operation.
+Handle frame/value travel together. Apply or discard before saving or replacing the document.
+Native window and vendor playback acceptance remain separate from egui widget checks.
 Read back, undo/redo and save/reopen.
 
 Image and Guide `pointChannels` list readable `xy` and `anchor` channels with `id` and

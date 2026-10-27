@@ -108,7 +108,7 @@ pub(crate) fn set_handle(model: &Value, request: &Value) -> Result<Value, String
 }
 
 /// The interpolation types a CAN3 segment may take; Soul2D plays SMOOTH and BEZIER the same way.
-const CURVE_TYPES: [&str; 4] = ["SMOOTH", "BEZIER", "LINEAR", "STEP"];
+pub(crate) const CURVE_TYPES: [&str; 4] = ["SMOOTH", "BEZIER", "LINEAR", "STEP"];
 
 const ONLY_EDITS: &str = "animation edit may change only supported parameter or modern part-opacity curves, legacy or underscore part-opacity keys, tracks and scene settings, add or delete scenes, and add linked-model resources";
 const TRACK_FIELDS: [&str; 4] = ["tracks", "imageTracks", "soundTracks", "guideTracks"];
@@ -449,19 +449,19 @@ fn model_parts(model: &Value) -> Result<ModelParts<'_>, String> {
     Ok(parts)
 }
 
-fn track_key_curve<'a>(scene: &'a mut Value, request: &Value) -> Result<&'a mut Value, String> {
+fn scalar_curve_location(scene: &Value, request: &Value) -> Result<(&'static str, usize, &'static str, usize), String> {
     let guid = request["trackGuid"].as_str().filter(|id| !id.is_empty()).ok_or("trackGuid must be a nonempty string")?;
     let families: Vec<_> = TRACK_FIELDS.into_iter().flat_map(|field| {
         scene[field].as_array().into_iter().flatten()
-            .filter(|track| track["guid"] == guid).map(move |_| field)
+            .enumerate().filter(|(_, track)| track["guid"] == guid).map(move |(index, _)| (field, index))
     }).collect();
     if families.is_empty() { return Err("animation trackGuid was not found".into()); }
     if families.len() != 1 { return Err("animation trackGuid is ambiguous".into()); }
-    let family = families[0];
+    let (family, track_index) = families[0];
     if !matches!(family, "tracks" | "imageTracks" | "guideTracks") {
         return Err("animation operation does not support this track family".into());
     }
-    let track = select_json(&mut scene[family], "guid", request, "trackGuid")?;
+    let track = &scene[family][track_index];
     let (field, index) = if family != "tracks" {
         if request.get("partOpacityMapKey").is_some() { return Err("visual keys do not take partOpacityMapKey".into()); }
         let id = request["curveId"].as_str().filter(|id| !id.is_empty()).ok_or("curveId must be a nonempty string")?;
@@ -470,7 +470,17 @@ fn track_key_curve<'a>(scene: &'a mut Value, request: &Value) -> Result<&'a mut 
         if found.len() != 1 { return Err("curveId must identify one readable visual scalar curve".into()); }
         ("visualCurves", found[0])
     } else { key_curve_slot(track, request)? };
-    Ok(&mut track[field][index])
+    Ok((family, track_index, field, index))
+}
+
+pub(crate) fn scalar_curve<'a>(scene: &'a Value, request: &Value) -> Result<&'a Value, String> {
+    let (family, track, field, curve) = scalar_curve_location(scene, request)?;
+    Ok(&scene[family][track][field][curve])
+}
+
+fn track_key_curve<'a>(scene: &'a mut Value, request: &Value) -> Result<&'a mut Value, String> {
+    let (family, track, field, curve) = scalar_curve_location(scene, request)?;
+    Ok(&mut scene[family][track][field][curve])
 }
 
 fn edit_point(
