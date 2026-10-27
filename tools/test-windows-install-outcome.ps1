@@ -104,3 +104,30 @@ foreach ($expected in @(0, 7)) {
         $launcher.Dispose()
     }
 }
+
+$function = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-DocumentPath'
+}, $false)
+if ($null -eq $function) { throw 'Missing document-path comparison function.' }
+. ([scriptblock]::Create($function.Extent.Text))
+if (-not (Test-DocumentPath $null $null) -or (Test-DocumentPath $null 'missing.inx') `
+    -or (Test-DocumentPath 'missing.inx' $null)) { throw 'Document-path null handling is inconsistent.' }
+$type = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.StringConstantExpressionAst] -and $node.Value.Contains('public static class InstalledSoul2D')
+}, $true)
+if ($null -eq $type) { throw 'Missing installed-product native API class.' }
+Add-Type -TypeDefinition $type.Value
+if ($IsWindows) {
+    $directory = Join-Path ([IO.Path]::GetTempPath()) "soul2d-path-$([guid]::NewGuid())"
+    New-Item -ItemType Directory $directory | Out-Null
+    try {
+        $file = Join-Path $directory 'installed project-日本語.inx'
+        $other = Join-Path $directory 'other.inx'
+        [IO.File]::WriteAllText($file, 'owned fixture')
+        [IO.File]::WriteAllText($other, 'owned fixture')
+        $extended = '\\?\' + $file
+        if (-not (Test-DocumentPath $extended $file) -or -not (Test-DocumentPath $file $extended) `
+            -or (Test-DocumentPath $other $file)) { throw 'Canonical document-path comparison failed.' }
+        Write-Output 'PASS Windows ordinary/extended Unicode paths match; distinct files remain distinct.'
+    } finally { Remove-Item -LiteralPath $directory -Recurse -Force }
+} else { Write-Output 'Windows canonical-path runtime check NOT_RUN on this host.' }

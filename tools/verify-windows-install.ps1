@@ -48,6 +48,12 @@ function Get-ObservedProcess([int]$ProcessId) {
     return $process
 }
 
+function Test-DocumentPath($Actual, $Expected) {
+    if ($null -eq $Actual -or $null -eq $Expected) { return $null -eq $Actual -and $null -eq $Expected }
+    return [String]::Equals([InstalledSoul2D]::CanonicalPath($Actual), [InstalledSoul2D]::CanonicalPath($Expected),
+        [StringComparison]::OrdinalIgnoreCase)
+}
+
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' `
     -or -not [Environment]::Is64BitProcess) {
     throw 'This verifier installs a product and requires a disposable Windows x64 GitHub Actions runner.'
@@ -55,9 +61,23 @@ if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONME
 
 Add-Type -TypeDefinition @'
 using System;
+using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 public static class InstalledSoul2D {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint length, uint flags);
+    public static string CanonicalPath(string path) {
+        using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+            StringBuilder result = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandle(file.SafeFileHandle, result, (uint)result.Capacity, 0);
+            if (length == 0 || length >= result.Capacity) {
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Cannot canonicalize the observed document path.");
+            }
+            return result.ToString();
+        }
+    }
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
     public static extern int MsiQueryProductState(string product);
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
@@ -267,7 +287,7 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $start.FileName = $ShellPath
     $start.UseShellExecute = $true
     $start.WorkingDirectory = $installDirectory
-    $observation = [ordered]@{ kind = $Kind; shellPath = $ShellPath; accepted = $false;
+    $observation = [ordered]@{ kind = $Kind; shellPath = $ShellPath; expectedDocumentPath = $ExpectedPath; accepted = $false;
         shellPid = $null; processes = @(); httpError = $null; configFiles = @(); directDiagnostic = $null }
     $result.launches += $observation
     $started = [Diagnostics.Process]::Start($start)
@@ -299,6 +319,7 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
         }
         Start-Sleep -Milliseconds 250
     }
+    $observation.editorState = $state
     if ($null -eq $state -or $null -eq $editor -or $editor.MainWindowHandle -eq [IntPtr]::Zero) {
         $observation.configFiles = @(Get-ChildItem -LiteralPath $config -Recurse -File |
             ForEach-Object { $_.FullName.Substring($config.Length + 1) })
@@ -323,9 +344,9 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
         $observation.directDiagnostic.stderr = [IO.File]::ReadAllText($stderr).Trim()
         throw "$Kind did not produce an installed editor window and owned MCP listener before the deadline."
     }
-    if (-not $state.editor -or $state.document.modified -or $state.document.path -ne $ExpectedPath) {
-        throw "$Kind opened an unexpected document."
-    }
+    if (-not $state.editor) { throw "$Kind did not return editor state." }
+    if ($state.document.modified) { throw "$Kind opened a modified document." }
+    if (-not (Test-DocumentPath $state.document.path $ExpectedPath)) { throw "$Kind opened an unexpected document path." }
     if ($null -ne $ExpectedPath -and $state.document.format -ne 'inx') { throw 'File association opened the wrong document format.' }
     if (-not [InstalledSoul2D]::IsWindowVisible($editor.MainWindowHandle)) { throw "$Kind window lacks visible style." }
     $snapshot = Read-Resource 'resource://vsoul/snapshot'
@@ -337,7 +358,6 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
     $observation.listenerOwnerPid = $connections[0].OwningProcess
     $observation.hwnd = $editor.MainWindowHandle.ToInt64()
     $observation.windowVisibleStyle = $true
-    $observation.editorState = $state
     $observation.modelName = $snapshot.model.meta.name
     if ($SoftwareGlArchive) {
         $modules = @($editor.Modules | Where-Object { $_.ModuleName -ieq 'opengl32.dll' })
