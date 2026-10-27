@@ -38,6 +38,19 @@ A name like `<part name>::Physics` makes it easy to see which physics parameter 
 - Use a regular parameter for things whose shape you want to change on purpose in step with an expression.
 - Use physics for things that you want to move with a natural delay, as inertia or sway.
 
+## Edit shared CMO3 physics settings
+
+For an open CMO3, the Physics groups panel has **Make physics settings independent**.
+Use it before editing settings stored as shared references. It copies the complete
+physics settings in one Undo step and keeps the original definitions for other
+references. Parameter identities and authored values stay unchanged. Repeating it
+on independent settings changes nothing. Unsupported storage is refused without
+changing the document. This action does not establish Cubism interoperability or
+simulation behavior.
+
+MCP clients use `live2d_physics3_edit` with the current `expectedRevision` and
+`detach: true`. Supply no other edit arguments.
+
 ## Final points to check
 
 After you create the basic parameters, check the following:

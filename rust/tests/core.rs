@@ -3631,6 +3631,169 @@ fn physics3_edit_rejects_shared_storage_containers_and_leaf_comments() {
 }
 
 #[test]
+fn physics3_detach_makes_aliased_items_private_and_roundtrips() {
+    let (mut session, revision, before, directory) = physics3_session(native_physics_bytes(), "detach.cmo3");
+    let original = physics3_read(&mut session);
+    let response = session.handle_mcp(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":"live2d_physics3_edit","arguments":{"expectedRevision":revision,"detach":true}}})).unwrap();
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let detached = session.snapshot();
+    assert_eq!(detached["revision"], revision + 1);
+    assert_ne!(detached["model"]["physicsSource"], before["model"]["physicsSource"]);
+    let view = physics3_read(&mut session);
+    assert_eq!(view["groups"][1]["vertices"][2]["shared"], false, "{view}");
+    assert_eq!(view["groups"][1]["vertices"][2]["editable"], true, "{view}");
+    assert_eq!(view["groups"][1]["vertices"][2]["delay"], original["groups"][1]["vertices"][2]["delay"]);
+    assert_eq!(detached["model"]["parameters"], before["model"]["parameters"]);
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,"detach":true})));
+    assert_eq!(session.snapshot(), detached, "a second detach is a complete no-op");
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,
+        "group":1,"list":"vertices","index":2,"field":"delay","value":0.2})));
+    let edited = session.snapshot();
+    assert_eq!(physics3_read(&mut session)["groups"][1]["vertices"][2]["delay"], 0.2);
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(session.snapshot()["model"], detached["model"]);
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(session.snapshot()["model"], before["model"]);
+    result(&request(&mut session, json!({"op":"redo"})));
+    result(&request(&mut session, json!({"op":"redo"})));
+    assert_eq!(session.snapshot()["model"], edited["model"]);
+    let saved = directory.join("detached.cmo3");
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    let mut reopened = Session::new();
+    result(&request(&mut reopened, json!({"op":"open","path":saved})));
+    assert_eq!(reopened.snapshot()["model"], edited["model"]);
+    assert!(saved_main_xml(&saved).contains("<CPhysicsVertex xs.id='shared-vertex'>"),
+        "the original donor remains available");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn physics3_detach_preserves_displaced_definitions_and_parameter_identity() {
+    for (needle, marked) in [
+        ("<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet'>", "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet' xs.id='shared-target'>"),
+        ("<carray_list xs.n='_sourceCubismPhysics' count='2'>", "<carray_list xs.n='_sourceCubismPhysics' count='2' xs.id='shared-target'>"),
+        ("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource xs.id='shared-target'>"),
+        ("<carray_list xs.n='inputs' count='1'>", "<carray_list xs.n='inputs' count='1' xs.id='shared-target'>"),
+        ("<CPhysicsInput>", "<CPhysicsInput xs.id='shared-target'>"),
+        ("<carray_list xs.n='outputs' count='1'>", "<carray_list xs.n='outputs' count='1' xs.id='shared-target'>"),
+        ("<carray_list xs.n='vertices' count='3'>", "<carray_list xs.n='vertices' count='3' xs.id='shared-target'>"),
+        ("<GVector2 xs.n='position'>", "<GVector2 xs.n='position' xs.id='shared-target'>"),
+        ("<s xs.n='name'>", "<s xs.n='name' xs.id='shared-target'>"),
+        ("<i xs.n='settingFPS'>", "<i xs.n='settingFPS' xs.id='shared-target'>"),
+        ("<f xs.n='normalizedAngleValueMax'>", "<f xs.n='normalizedAngleValueMax' xs.id='shared-target'>"),
+        ("<CParameterGuid xs.n='source' uuid='parameter-guid'/>", "<CParameterGuid xs.n='source' xs.id='shared-target' uuid='parameter-guid'/>"),
+    ] {
+        let bytes = physics_bytes_sharing(needle, marked);
+        let original = soul2d_core::caff::CaffDocument::parse(&bytes).unwrap();
+        let xml = String::from_utf8(original.main_xml()).unwrap();
+        let document = roxmltree::Document::parse(&xml).unwrap();
+        let donor = document.descendants().find(|node| node.attribute("xs.id") == Some("shared-target")).unwrap();
+        let (mut session, revision, before, directory) = physics3_session(bytes.clone(), "shared.cmo3");
+        let response = request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+        result(&response);
+        let detached = session.snapshot();
+        assert_eq!(detached["revision"], revision + 1, "{needle}");
+        let mut old_model = before["model"].clone();
+        old_model["physicsSource"] = detached["model"]["physicsSource"].clone();
+        assert_eq!(old_model, detached["model"], "{needle}: other canonical fields must stay unchanged");
+        result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,
+            "group":0,"list":"inputs","index":0,"field":"source","value":"ParamTest"})));
+        let saved = directory.join("saved.cmo3");
+        result(&request(&mut session, json!({"op":"save","path":saved})));
+        let saved_xml = saved_main_xml(&saved);
+        let saved_doc = roxmltree::Document::parse(&saved_xml).unwrap();
+        let retained = saved_doc.descendants().find(|node| node.attribute("xs.id") == Some("shared-target")).unwrap();
+        assert_eq!(&saved_xml[retained.range()], &xml[donor.range()], "{needle}: donor bytes");
+        let container = soul2d_core::caff::CaffDocument::parse(&fs::read(&saved).unwrap()).unwrap();
+        for name in ["mesh.png", "opaque.bin"] { assert_eq!(container.entry_data(name), original.entry_data(name)); }
+        let mut reopened = Session::new();
+        result(&request(&mut reopened, json!({"op":"open","path":saved})));
+        assert_eq!(reopened.snapshot()["model"], session.snapshot()["model"]);
+        let clean = reopened.snapshot();
+        let clean_revision = clean["revision"].as_u64().unwrap();
+        result(&request(&mut reopened, json!({"op":"live2d.physics3.edit","expectedRevision":clean_revision,"detach":true})));
+        assert_eq!(reopened.snapshot(), clean, "{needle}: reopened no-op");
+        assert_eq!(fs::read(directory.join("shared.cmo3")).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_detach_resolves_a_shared_set_and_repeated_group_slots_independently() {
+    let xml = native_physics_xml();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    let set = document.descendants().find(|node| node.attribute("xs.n") == Some("physicsSettingsSourceSet")).unwrap();
+    let original_set = &xml[set.range()];
+    let group = set.descendants().find(|node| node.has_tag_name("CPhysicsSettingsSource")).unwrap();
+    let group_xml = xml[group.range()].replacen("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource xs.id='group-donor' xs.idx='17'><CPhysicsSettingsGuid xs.n='guid' uuid='parameter-guid'/>", 1)
+        .replacen("<CPhysicsInput>", "<CPhysicsInput xs.idx='9'><CPhysicsDataGuid xs.n='guid' uuid='old-physics-data-guid'/>", 1)
+        .replacen("<s xs.n='name'>", "<Future flag='keep'><!-- retained -->9.0000001</Future><s xs.n='name'>", 1);
+    let list = set.descendants().find(|node| node.attribute("xs.n") == Some("_sourceCubismPhysics")).unwrap();
+    let mut shared_set = original_set.to_owned();
+    shared_set.replace_range(list.range().start - set.range().start..list.range().end - set.range().start,
+        &format!("<carray_list xs.n='_sourceCubismPhysics' count='2'>{group_xml}<CPhysicsSettingsSource xs.ref='group-donor'/></carray_list>"));
+    let shared_set = shared_set.replacen("xs.n='physicsSettingsSourceSet'", "xs.id='set-donor'", 1);
+    let xml = xml.replacen(original_set, "<CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet' xs.ref='set-donor'/>", 1)
+        .replace("</root>", &format!("{shared_set}</root>"));
+    let (mut session, revision, before, directory) = physics3_session(authoring_bytes(&xml), "alias.cmo3");
+    let ordinary = json!({"op":"live2d.physics3.edit","expectedRevision":revision,"group":0,"field":"name","value":"x"});
+    assert!(physics3_refuse(&mut session, &before, &ordinary).contains("shared"));
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true})));
+    result(&request(&mut session, json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,"group":1,"field":"name","value":"Second"})));
+    let view = physics3_read(&mut session);
+    assert_eq!(view["groups"][0]["name"], "Sway");
+    assert_eq!(view["groups"][1]["name"], "Second");
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot["model"]["parameters"], before["model"]["parameters"]);
+    let active_xml = snapshot["model"]["physicsSource"].as_str().unwrap();
+    let active_doc = roxmltree::Document::parse(active_xml).unwrap();
+    let guids: Vec<_> = active_doc.descendants().filter(|node| node.has_tag_name("CPhysicsSettingsGuid") || node.has_tag_name("CPhysicsDataGuid"))
+        .map(|node| node.attribute("uuid").unwrap()).collect();
+    assert_eq!(guids.len(), 4);
+    assert_eq!(guids.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    assert!(guids.iter().all(|guid| *guid != "parameter-guid" && *guid != "old-physics-data-guid"));
+    let serials: Vec<u64> = active_doc.descendants().filter_map(|node| node.attribute("xs.idx")).map(|value| value.parse().unwrap()).collect();
+    assert_eq!(serials.len(), 4);
+    assert_eq!(serials.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    assert!(serials.iter().all(|serial| *serial > 17));
+    let saved = directory.join("saved.cmo3");
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    let written = saved_main_xml(&saved);
+    assert!(written.contains(&shared_set), "the external original set stays byte exact");
+    assert_eq!(session.snapshot()["model"]["physicsSource"].as_str().unwrap().matches("<Future flag='keep'><!-- retained -->9.0000001</Future>").count(), 2);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn physics3_detach_refusals_preserve_the_complete_snapshot() {
+    let (mut session, revision, before, directory) = physics3_session(native_physics_bytes(), "shape.cmo3");
+    for extra in [json!({"detach":false}), json!({"detach":"yes"}), json!({"detach":true,"group":0}),
+        json!({"detach":true,"list":"vertices"}), json!({"detach":true,"field":"fps","value":60}),
+        json!({"detach":true,"duplicate":false})] {
+        let mut edit = extra;
+        edit["op"] = json!("live2d.physics3.edit"); edit["expectedRevision"] = json!(revision);
+        assert!(physics3_refuse(&mut session, &before, &edit).contains("detach"));
+    }
+    assert!(physics3_refuse(&mut session, &before,
+        &json!({"op":"live2d.physics3.edit","expectedRevision":revision + 1,"detach":true})).contains("revision conflict"));
+    fs::remove_dir_all(directory).unwrap();
+    for (needle, replacement, expected) in [
+        ("<CPhysicsVertex xs.ref='shared-vertex'/>", "<CPhysicsVertex xs.ref='shared-vertex' future='keep'/>", "alias metadata"),
+        ("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource xs.idx='18446744073709551615'>", "serial overflow"),
+        ("<s xs.n='name'>Sway</s>", "<ACPhysics xs.n='super'><s xs.n='name'>Sway</s></ACPhysics>", "inherited fields"),
+        ("<CPhysicsSettingsSource>", "<CPhysicsSettingsSource xs.id='cross'><Future xs.ref='cross'/>", "opaque cross-reference"),
+    ] {
+        let bytes = physics_bytes_marked(needle, replacement);
+        let (mut session, revision, before, directory) = physics3_session(bytes, "refused.cmo3");
+        let message = physics3_refuse(&mut session, &before,
+            &json!({"op":"live2d.physics3.edit","expectedRevision":revision,"detach":true}));
+        assert!(message.contains(expected), "{expected}: {message}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn physics3_attribute_leaf_rejects_nonwhitespace_payload() {
     for (needle, marked, mut edit) in [
         ("<CPhysicsSourceType xs.n='type' v='SRC_TO_X'/>",

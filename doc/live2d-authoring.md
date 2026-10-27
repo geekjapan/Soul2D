@@ -1603,6 +1603,22 @@ and vertex lists, position normalization `-10, 0, 10` and angle normalization
 `-30, 0, 30`. This creates storage; simulation and Cubism acceptance require
 separate verification.
 
+Before editing shared storage, use `live2d.physics3.edit` with only
+`expectedRevision` and `detach: true`. The Physics groups panel exposes the same
+operation as **Make physics settings independent**. It copies the complete known
+physics ownership tree into private inline storage in one Undo step. Original
+shared definitions remain available to outside references. Parameter UUIDs,
+unknown markup and numeric spelling are preserved. Repeating the operation on
+private settings changes no state or history. Ordinary edits still refuse shared
+storage and never detach it implicitly.
+
+Detachment supports direct fields and one-hop references of the known physics classes. Alias chains, inherited fields,
+conflicting alias metadata, ambiguous opaque references into copied identities,
+ownership cycles and serial overflow refuse atomically. The copy is limited to
+16 MiB and 500,000 emitted XML nodes, in addition to the existing group/item
+limits. It does not add missing GUID fields or establish Y-input, X/Y-output,
+simulation or native vendor acceptance.
+
 The physics settings are exported with `live2d.physics3.export {path?}`
 (`live2d_physics3_export`), in the layout of `.physics3.json`. Each physics
 setting of the CMO3 becomes one entry of `PhysicsSettings` with its inputs,

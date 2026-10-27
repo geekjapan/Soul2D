@@ -6,7 +6,6 @@
 //! full-precision numbers survive and the strict `read(reopened) == candidate` gate still holds. Groups have no
 //! stable identity: callers address them by document order under `expectedRevision`. A new group is a copy of a
 //! stored one (`duplicate`), or the first group can be constructed in an existing empty inline settings list.
-//! Missing, null and shared settings sets remain outside the construction boundary.
 
 use crate::authoring_graph::Graph;
 use crate::authoring_values::{self as values, Budget};
@@ -704,10 +703,16 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "op" | "expectedRevision" | "group" | "list" | "index" | "insert" | "remove" | "field" | "value" | "duplicate"
+            "op" | "expectedRevision" | "group" | "list" | "index" | "insert" | "remove" | "field" | "value" | "duplicate" | "detach"
         ) {
             return Err(format!("authoring physics edit carries an unknown key {key:?}"));
         }
+    }
+    if let Some(detach) = object.get("detach") {
+        if detach != &json!(true) || object.keys().any(|key| !matches!(key.as_str(), "op" | "expectedRevision" | "detach")) {
+            return Err("authoring physics detach requires detach:true without another edit".into());
+        }
+        return detach_text(text, model);
     }
     let group_index = request_index(object, "group")?;
     let list_name = request_string(object, "list")?;
@@ -1616,8 +1621,280 @@ pub(crate) fn apply_preset(
     Ok(candidate)
 }
 
-/// `rewrite`'s half: with the candidate model's `physicsSource` differing, replace the inline set element's bytes
-/// with the stored string. Anything but inline storage refuses.
+#[derive(Clone, Copy, PartialEq)]
+enum OwnedRole {
+    Set,
+    Groups,
+    Group,
+    Inputs,
+    Outputs,
+    Vertices,
+    Input,
+    Output,
+    Vertex,
+    Position,
+    Leaf(&'static str),
+    Rate,
+    PhysicsGuid(&'static str),
+    Parameter,
+}
+
+impl OwnedRole {
+    fn tag(self, node: Node<'_, '_>) -> bool {
+        let tag = match self {
+            Self::Set => "CPhysicsSettingsSourceSet",
+            Self::Groups | Self::Inputs | Self::Outputs | Self::Vertices => "carray_list",
+            Self::Group => "CPhysicsSettingsSource",
+            Self::Input => "CPhysicsInput",
+            Self::Output => "CPhysicsOutput",
+            Self::Vertex => "CPhysicsVertex",
+            Self::Position => "GVector2",
+            Self::Leaf(tag) | Self::PhysicsGuid(tag) => tag,
+            Self::Rate => return node.has_tag_name("i") || node.has_tag_name("null"),
+            Self::Parameter => "CParameterGuid",
+        };
+        node.has_tag_name(tag)
+    }
+
+    fn fields(self) -> &'static [(&'static str, OwnedRole)] {
+        use OwnedRole::*;
+        match self {
+            Set => &[("settingFPS", Rate), ("_sourceCubismPhysics", Groups)],
+            Group => &[
+                ("guid", PhysicsGuid("CPhysicsSettingsGuid")), ("id", Leaf("CPhysicsSettingId")),
+                ("name", Leaf("s")), ("inputs", Inputs), ("outputs", Outputs), ("vertices", Vertices),
+                ("normalizedPositionValueMin", Leaf("f")), ("normalizedPositionDefaultValue", Leaf("f")),
+                ("normalizedPositionValueMax", Leaf("f")), ("normalizedAngleValueMin", Leaf("f")),
+                ("normalizedAngleDefaultValue", Leaf("f")), ("normalizedAngleValueMax", Leaf("f")),
+            ],
+            Input => &[("source", Parameter), ("type", Leaf("CPhysicsSourceType")),
+                ("guid", PhysicsGuid("CPhysicsDataGuid")), ("angleScale", Leaf("f")),
+                ("weight", Leaf("f")), ("isReverse", Leaf("b")), ("translationScale", Position)],
+            Output => &[("destination", Parameter), ("type", Leaf("CPhysicsSourceType")),
+                ("guid", PhysicsGuid("CPhysicsDataGuid")), ("angleScale", Leaf("f")),
+                ("weight", Leaf("f")), ("isReverse", Leaf("b")), ("vertexIndex", Leaf("i")),
+                ("translationScale", Position)],
+            Vertex => &[("position", Position), ("guid", PhysicsGuid("CPhysicsDataGuid")),
+                ("mobility", Leaf("f")), ("delay", Leaf("f")), ("acceleration", Leaf("f")), ("radius", Leaf("f"))],
+            Position => &[("x", Leaf("f")), ("y", Leaf("f"))],
+            _ => &[],
+        }
+    }
+
+    fn item(self) -> Option<Self> {
+        match self {
+            Self::Groups => Some(Self::Group), Self::Inputs => Some(Self::Input),
+            Self::Outputs => Some(Self::Output), Self::Vertices => Some(Self::Vertex), _ => None,
+        }
+    }
+}
+
+struct OwnedPhysics<'d, 'i> {
+    slot: Node<'d, 'i>,
+    node: Node<'d, 'i>,
+    role: OwnedRole,
+    children: Vec<OwnedPhysics<'d, 'i>>,
+    shared: bool,
+}
+
+const MAX_DETACH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DETACH_NODES: usize = 500_000;
+
+fn owned_physics<'d, 'i>(
+    graph: &Graph<'d, 'i>, slot: Node<'d, 'i>, role: OwnedRole, inbound: &HashSet<&str>,
+    active: &mut HashSet<roxmltree::NodeId>, nodes: &mut usize, bytes: &mut usize,
+) -> Result<OwnedPhysics<'d, 'i>, String> {
+    let node = graph.resolve(slot)?;
+    if !active.insert(node.id()) || active.len() > 32 {
+        return Err("authoring physics ownership cycle or depth limit".into());
+    }
+    if !role.tag(node) {
+        return Err(format!("authoring physics detach does not support {} in this ownership role", node.tag_name().name()));
+    }
+    if slot.attribute("xs.ref").is_some_and(|id| node.attribute("xs.id") != Some(id)) {
+        return Err("authoring physics detach refuses alias chains".into());
+    }
+    if slot.id() != node.id() && (slot.children().any(|child| !child.is_text() || !child.text().unwrap_or("").trim().is_empty())
+        || slot.attributes().any(|attribute| !matches!(attribute.name(), "xs.n" | "xs.ref" | "xs.id" | "xs.idx")))
+    {
+        return Err("authoring physics detach refuses alias metadata".into());
+    }
+    let shared = if role == OwnedRole::Parameter {
+        slot.id() == node.id() && slot.attribute("xs.id").is_some()
+    } else {
+        slot.id() != node.id() || referenced(slot, inbound) || referenced(node, inbound)
+    };
+    let mut children = Vec::new();
+    if let Some(item_role) = role.item() {
+        let slots = elements(node);
+        check_count(node, slots.len())?;
+        if slots.len() > if role == OwnedRole::Groups { MAX_GROUPS } else { MAX_ITEMS_PER_LIST } {
+            return Err("authoring physics detach exceeds list budget".into());
+        }
+        for slot in slots {
+            children.push(owned_physics(graph, slot, item_role, inbound, active, nodes, bytes)?);
+        }
+    } else {
+        for (name, child_role) in role.fields() {
+            let resolved = graph.field(node, name)?;
+            match (direct_field(node, name), resolved) {
+                (Some(slot), Some(_)) => children.push(owned_physics(graph, slot, *child_role, inbound, active, nodes, bytes)?),
+                (None, Some(_)) => return Err("authoring physics detach refuses inherited fields".into()),
+                _ => {},
+            }
+        }
+        if role.fields().is_empty() && node.children().any(|child| child.is_element()) {
+            return Err("authoring physics detach refuses structured scalar storage".into());
+        }
+    }
+    let excluded = |candidate: Node<'_, '_>| children.iter().any(|child| {
+        let range = child.slot.range();
+        range.start <= candidate.range().start && candidate.range().end <= range.end
+    });
+    *nodes = nodes.checked_add(node.descendants().filter(|candidate| !excluded(*candidate)).count())
+        .filter(|count| *count <= MAX_DETACH_NODES).ok_or("authoring physics detach exceeds node budget")?;
+    *bytes = bytes.checked_add(node.range().len() - children.iter().map(|child| child.slot.range().len()).sum::<usize>())
+        .filter(|count| *count <= MAX_DETACH_BYTES).ok_or("authoring physics detach exceeds byte budget")?;
+    active.remove(&node.id());
+    Ok(OwnedPhysics { slot, node, role, children, shared })
+}
+
+impl OwnedPhysics<'_, '_> {
+    fn needs_detach(&self) -> bool {
+        self.shared || self.children.iter().any(Self::needs_detach)
+    }
+
+    fn copied_ids(&self, ids: &mut HashSet<String>) {
+        ids.extend(self.node.descendants().filter_map(|node| node.attribute("xs.id").map(str::to_owned)));
+        for child in &self.children { child.copied_ids(ids); }
+    }
+
+    fn render(&self, text: &str, copied: &HashSet<String>, used: &mut HashSet<String>, next_idx: &mut u64) -> Result<String, String> {
+        let mut patches = Vec::new();
+        for child in &self.children {
+            patches.push(Patch { range: child.slot.range(), value: child.render(text, copied, used, next_idx)? });
+        }
+        let local = |node: Node<'_, '_>| !self.children.iter().any(|child| {
+            let range = child.slot.range();
+            range.start <= node.range().start && node.range().end <= range.end
+        });
+        let mut ids = HashMap::new();
+        for node in self.node.descendants().filter(|node| node.is_element() && local(*node) && node.id() != self.node.id()) {
+            if let Some(id) = node.attribute("xs.id") {
+                let fresh = format!("physics-detached-{}", crate::animation_source::new_guid()?);
+                if !used.insert(fresh.clone()) { return Err("authoring physics identity collision".into()); }
+                ids.insert(id, fresh);
+            }
+        }
+        for node in self.node.descendants().filter(|node| node.is_element() && local(*node)) {
+            for attribute in node.attributes() {
+                let replacement = match attribute.name() {
+                    "xs.id" if node.id() == self.node.id() => {
+                        patches.push(Patch { range: attribute.range(), value: String::new() });
+                        None
+                    },
+                    "xs.id" => ids.get(attribute.value()).cloned(),
+                    "xs.ref" => match ids.get(attribute.value()) {
+                        Some(id) => Some(id.clone()),
+                        None if copied.contains(attribute.value()) => return Err("authoring physics detach refuses an opaque cross-reference".into()),
+                        None => None,
+                    },
+                    "xs.idx" if node.id() == self.node.id() && matches!(self.role, OwnedRole::Leaf(_) | OwnedRole::Rate | OwnedRole::Parameter) => {
+                        patches.push(Patch { range: attribute.range(), value: String::new() });
+                        None
+                    },
+                    "xs.idx" => {
+                        *next_idx = next_idx.checked_add(1).ok_or("authoring physics serial overflow")?;
+                        Some(next_idx.to_string())
+                    },
+                    "uuid" if node.id() == self.node.id() && matches!(self.role, OwnedRole::PhysicsGuid(_)) => {
+                        let fresh = crate::animation_source::new_guid()?;
+                        if !used.insert(fresh.clone()) { return Err("authoring physics identity collision".into()); }
+                        Some(fresh)
+                    },
+                    "xs.n" if node.id() == self.node.id() => match self.slot.attribute("xs.n") {
+                        Some(name) => Some(escape_attribute(name)),
+                        None => {
+                            patches.push(Patch { range: attribute.range(), value: String::new() });
+                            None
+                        },
+                    },
+                    _ => None,
+                };
+                if let Some(value) = replacement { patches.push(Patch { range: attribute.range_value(), value }); }
+            }
+        }
+        if self.node.attribute("xs.n").is_none() {
+            if let Some(name) = self.slot.attribute("xs.n") {
+                let start = self.node.range().start + 1 + self.node.tag_name().name().len();
+                patches.push(Patch { range: start..start, value: format!(" xs.n='{}'", escape_attribute(name)) });
+            }
+        }
+        patches.sort_by_key(|patch| (patch.range.start, patch.range.end));
+        if patches.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
+            return Err("authoring physics detach produced overlapping changes".into());
+        }
+        let range = self.node.range();
+        let mut output = String::new();
+        let mut at = range.start;
+        for patch in patches {
+            output.push_str(&text[at..patch.range.start]);
+            output.push_str(&patch.value);
+            at = patch.range.end;
+            if output.len() > MAX_DETACH_BYTES { return Err("authoring physics detach exceeds byte budget".into()); }
+        }
+        output.push_str(&text[at..range.end]);
+        if output.len() > MAX_DETACH_BYTES { return Err("authoring physics detach exceeds byte budget".into()); }
+        Ok(output)
+    }
+}
+
+fn without_storage_flags(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(object) => {
+            object.remove("shared"); object.remove("editable");
+            for value in object.values_mut() { *value = without_storage_flags(value.take()); }
+        },
+        Value::Array(values) => for value in values { *value = without_storage_flags(value.take()); },
+        _ => {},
+    }
+    value
+}
+
+fn detach_text(text: &str, model: &Value) -> Result<(Value, String), String> {
+    let document = parse(text)?;
+    let graph = Graph::new(&document)?;
+    let inbound = inbound_refs(&document);
+    let owner = graph.model()?.ok_or("authoring source contains no model")?;
+    let slot = direct_field(owner, "physicsSettingsSourceSet").ok_or("authoring physics detach requires a direct settings field")?;
+    let plan = owned_physics(&graph, slot, OwnedRole::Set, &inbound, &mut HashSet::new(), &mut 0, &mut 0)?;
+    let (by_guid, _) = parameter_maps(model)?;
+    let before = view_document(&graph, &inbound, &by_guid)?;
+    if !plan.needs_detach() { return Ok((model.clone(), text.to_owned())); }
+    let mut copied = HashSet::new();
+    plan.copied_ids(&mut copied);
+    let mut used: HashSet<String> = document.descendants().flat_map(|node| [node.attribute("xs.id"), node.attribute("uuid")])
+        .flatten().map(str::to_owned).collect();
+    let mut next_idx = 0;
+    for value in document.descendants().filter_map(|node| node.attribute("xs.idx")) {
+        next_idx = next_idx.max(value.parse::<u64>().map_err(|_| "authoring physics has an invalid serial")?);
+    }
+    let body = plan.render(text, &copied, &mut used, &mut next_idx)?;
+    let mut candidate = model.clone();
+    candidate["physicsSource"] = json!(body);
+    let rewritten = splice_source(text, &text[plan.node.range()], candidate["physicsSource"].as_str().unwrap())?;
+    let after_document = parse(&rewritten)?;
+    let after_graph = Graph::new(&after_document)?;
+    let after_inbound = inbound_refs(&after_document);
+    let after_owner = after_graph.model()?.ok_or("authoring physics detach lost model")?;
+    let after_slot = direct_field(after_owner, "physicsSettingsSourceSet").ok_or("authoring physics detach lost settings")?;
+    let after_plan = owned_physics(&after_graph, after_slot, OwnedRole::Set, &after_inbound, &mut HashSet::new(), &mut 0, &mut 0)?;
+    if after_plan.needs_detach() || without_storage_flags(before) != without_storage_flags(view_document(&after_graph, &after_inbound, &by_guid)?) {
+        return Err("authoring physics detach changed values or retained shared ownership".into());
+    }
+    Ok((candidate, rewritten))
+}
+
 pub(crate) fn splice_source(
     text: &str,
     initial_xml: &str,
@@ -1625,19 +1902,32 @@ pub(crate) fn splice_source(
 ) -> Result<String, String> {
     let document = parse(text)?;
     let graph = Graph::new(&document)?;
-    let inbound = inbound_refs(&document);
     let model = graph.model()?.ok_or("authoring source contains no model")?;
     let field = direct_field(model, "physicsSettingsSourceSet")
-        .filter(|field| field.attribute("xs.ref").is_none() && !field.has_tag_name("null"))
-        .ok_or("authoring physics source is not inline model storage")?;
-    if field.attribute("xs.id").is_some_and(|id| inbound.contains(id)) {
-        return Err("authoring physics source is shared storage".into());
-    }
+        .filter(|field| !field.has_tag_name("null"))
+        .ok_or("authoring physics source is not direct model storage")?;
+    let resolved = graph.resolve(field)?;
     let range = field.range();
-    if text[range.clone()] != *initial_xml {
+    if text[resolved.range()] != *initial_xml {
         return Err("authoring physics source does not match the stored model".into());
     }
     let candidate = parse(candidate_xml)?;
+    let ids: HashSet<_> = candidate.descendants().filter_map(|node| node.attribute("xs.id")).collect();
+    let retained: Vec<_> = field.descendants().filter(|node| node.attribute("xs.id").is_some_and(|id| !ids.contains(id)))
+        .filter(|node| !node.ancestors().skip(1).take_while(|ancestor| range.start <= ancestor.range().start && ancestor.range().end <= range.end)
+            .any(|ancestor| ancestor.attribute("xs.id").is_some_and(|id| !ids.contains(id))))
+        .collect();
+    let mut retention = String::new();
+    for node in retained { retention.push_str(&text[node.range()]); }
+    let retention_at = if retention.is_empty() { range.end } else {
+        let root = document.root_element();
+        if root.id() == model.id() { return Err("authoring physics has no external definition storage".into()); }
+        let shared = root.children().find(|node| node.has_tag_name("shared"));
+        let container = shared.unwrap_or(root);
+        let (open, content) = element_spans(text, container)?;
+        if content.is_empty() && text[open].ends_with("/>") { return Err("authoring physics shared storage is self-closing".into()); }
+        content.end
+    };
     let root_start = document.root_element().range().start;
     let imports: Vec<_> = document.root().children().filter(|node| node.range().start < root_start)
         .filter_map(|node| node.pi())
@@ -1662,17 +1952,46 @@ pub(crate) fn splice_source(
         if imports.iter().any(|import| import.rsplit(['.', '$']).next() == Some(tag) && *import != class) {
             return Err(format!("authoring physics class import conflicts with {class}"));
         }
-        if !imports.contains(&class) && !field.descendants().any(|node| node.has_tag_name(tag)) {
+        if !imports.contains(&class) && !resolved.descendants().any(|node| node.has_tag_name(tag)) {
             missing.push_str(&format!("<?import {class}?>{newline}"));
         }
     }
-    Ok(format!("{}{}{}{}{}", &text[..root_start], missing, &text[root_start..range.start],
-        candidate_xml, &text[range.end..]))
+    let mut patches = vec![Patch { range, value: candidate_xml.to_owned() },
+        Patch { range: root_start..root_start, value: missing }];
+    if !retention.is_empty() { patches.push(Patch { range: retention_at..retention_at, value: retention }); }
+    patches.sort_by_key(|patch| (patch.range.start, patch.range.end));
+    if patches.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
+        return Err("authoring physics retention overlaps the active slot".into());
+    }
+    let mut output = text.to_owned();
+    for patch in patches.iter().rev() { output.replace_range(patch.range.clone(), &patch.value); }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detachment_bounds_emitted_occurrences_and_detects_ownership_cycles() {
+        let xml = "<root><CModelSource><CPhysicsSettingsSourceSet xs.n='physicsSettingsSourceSet' xs.id='set'>\
+            <carray_list xs.n='_sourceCubismPhysics' count='0'/></CPhysicsSettingsSourceSet></CModelSource></root>";
+        let document = parse(xml).unwrap();
+        let graph = Graph::new(&document).unwrap();
+        let inbound = inbound_refs(&document);
+        let slot = direct_field(graph.model().unwrap().unwrap(), "physicsSettingsSourceSet").unwrap();
+        for (mut nodes, mut bytes, expected) in [(MAX_DETACH_NODES, 0, "node budget"), (0, MAX_DETACH_BYTES, "byte budget")] {
+            let error = owned_physics(&graph, slot, OwnedRole::Set, &inbound, &mut HashSet::new(), &mut nodes, &mut bytes).err().unwrap();
+            assert!(error.contains(expected), "{error}");
+        }
+        let cyclic = xml.replace("<carray_list xs.n='_sourceCubismPhysics' count='0'/>",
+            "<carray_list xs.n='_sourceCubismPhysics' xs.ref='set'/>");
+        let document = parse(&cyclic).unwrap();
+        let graph = Graph::new(&document).unwrap();
+        let slot = direct_field(graph.model().unwrap().unwrap(), "physicsSettingsSourceSet").unwrap();
+        let error = owned_physics(&graph, slot, OwnedRole::Set, &inbound_refs(&document), &mut HashSet::new(), &mut 0, &mut 0).err().unwrap();
+        assert!(error.contains("ownership cycle"), "{error}");
+    }
 
     #[test]
     fn view_item_budgets_copied_parameter_ids() {

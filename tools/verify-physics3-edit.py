@@ -31,6 +31,7 @@ def load(name, filename):
 
 DRIVER = load("physics_bake_proof", "verify-animation-physics-bake.py")
 CAFF = load("caff_proof", "verify-caff-authoring.py")
+SOURCE = load("source_proof", "verify-cmo-source.py")
 
 
 def rpc(host, label, *arguments):
@@ -189,6 +190,61 @@ def verify(host, source):
     host.call("save-first-group", "save", {"path": str(first_path)})
     host.call("reopen-first-group", "open", {"path": str(first_path)})
     assert view(host, "first-group-reopened") == first
+    verify_detach(host, source)
+
+
+def verify_detach(host, source):
+    original = source.read_bytes()
+    entries, xml = CAFF.decode(original)
+    assert xml.count(b"<CPhysicsSettingsSourceSet ") == 1 and xml.count(b"</root>") == 1
+    shared_xml = xml.replace(b"<CPhysicsSettingsSourceSet ",
+                             b"<CPhysicsSettingsSourceSet xs.id='shared-physics-set' ", 1)
+    shared_xml = shared_xml.replace(b"</root>", b"<CPhysicsSettingsSourceSet xs.ref='shared-physics-set'/></root>")
+    updated = [(*entry[:-1], SOURCE.zip_main_xml(entry[-1], shared_xml))
+               if entry[0][0] == "main.xml" else entry for entry in entries]
+    shared_path = host.run / "shared.cmo3"
+    shared_path.write_bytes(SOURCE.encode_caff(original, updated))
+    shared_bytes = shared_path.read_bytes()
+    host.call("open-shared", "open", {"path": str(shared_path)})
+    before = host.call("shared-before", "snapshot", {})
+    before_view = view(host, "shared-view")
+    assert before_view["editable"] is False
+    host.call("refuse-implicit-detach", "live2d_physics3_edit", {
+        "expectedRevision": before["revision"], "group": 0, "field": "name", "value": "implicit"}, expected_error=True)
+    assert host.call("after-implicit-refusal", "snapshot", {}) == before
+    edit(host, "detach", detach=True)
+    detached = host.call("detached-snapshot", "snapshot", {})
+    detached_view = view(host, "detached-view")
+    assert detached["revision"] == before["revision"] + 1
+    assert detached["model"]["parameters"] == before["model"]["parameters"]
+    assert detached_view["editable"] is True
+    assert detached_view["groups"][0]["vertices"][1]["delay"] == 0.6
+    edit(host, "detach-again", detach=True)
+    assert host.call("detached-again-snapshot", "snapshot", {}) == detached
+    edit(host, "edit-detached", group=0, list="vertices", index=1, field="delay", value=0.75)
+    edited = host.call("detached-edited-snapshot", "snapshot", {})
+    assert view(host, "detached-edited-view")["groups"][0]["vertices"][1]["delay"] == 0.75
+    host.call("undo-detached-edit", "undo", {})
+    assert host.call("detached-edit-undone", "snapshot", {})["model"] == detached["model"]
+    host.call("undo-detach", "undo", {})
+    assert host.call("detach-undone", "snapshot", {})["model"] == before["model"]
+    host.call("redo-detach", "redo", {})
+    host.call("redo-detached-edit", "redo", {})
+    assert host.call("detached-edit-redone", "snapshot", {})["model"] == edited["model"]
+    saved = host.run / "shared-detached.cmo3"
+    host.call("save-detached", "save", {"path": str(saved)})
+    saved_entries, saved_xml = CAFF.decode(saved.read_bytes())
+    for old, new in zip(entries, saved_entries):
+        assert old[:4] == new[:4]
+        if old[0][0] != "main.xml":
+            assert old == new, "detachment changed an opaque CAFF entry"
+    start = shared_xml.index(b"<CPhysicsSettingsSourceSet xs.id='shared-physics-set'")
+    end = shared_xml.index(b"</CPhysicsSettingsSourceSet>", start) + len(b"</CPhysicsSettingsSourceSet>")
+    assert shared_xml[start:end] in saved_xml, "detachment lost the original shared definition"
+    host.call("reopen-detached", "open", {"path": str(saved)})
+    assert host.call("detached-reopened-snapshot", "snapshot", {})["model"] == edited["model"]
+    assert view(host, "detached-reopened-view")["groups"][0]["vertices"][1]["delay"] == 0.75
+    assert shared_path.read_bytes() == shared_bytes and source.read_bytes() == original
 
 
 def main():
@@ -209,6 +265,7 @@ def main():
         paths.extend(ROOT / name for name in [
             "rust/src/authoring_physics.rs", "rust/src/authoring_scene.rs",
             "rust/src/authoring_edit.rs", "rust/src/lib.rs", "rust/src/mcp.rs", "rust/Cargo.lock",
+            "tools/verify-cmo-source.py", "tools/verify-caff-authoring.py", "tools/verify-rust-core.py",
         ])
         result["inputHashes"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
         source = run / "source.cmo3"

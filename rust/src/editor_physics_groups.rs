@@ -170,6 +170,12 @@ impl PhysicsGroups {
             })
             .collect();
         let mut pending = None;
+        if ui.button("Make physics settings independent")
+            .on_hover_text("Copy the complete physics settings. Preserve original shared definitions. One undo step; already independent settings stay unchanged.")
+            .clicked()
+        {
+            pending = Some(json!({"op":"live2d.physics3.edit", "detach":true}));
+        }
         self.set_row(ui, &view, &mut pending);
         if view["groups"].as_array().is_some_and(Vec::is_empty)
             && ui.add_enabled(view["editable"] == true, egui::Button::new("Create first group")).clicked()
@@ -651,6 +657,30 @@ mod tests {
         fn revision(&self) -> u64 {
             self.controller.snapshot()["revision"].as_u64().unwrap()
         }
+    }
+
+    #[test]
+    fn the_panel_explicitly_detaches_shared_physics_in_one_undo_step() {
+        let container = soul2d_core::caff::CaffDocument::parse(&cmo3_physics_bytes()).unwrap();
+        let xml = String::from_utf8(container.main_xml()).unwrap()
+            .replacen("<CPhysicsVertex>", "<CPhysicsVertex xs.id='shared-physics-vertex'>", 1)
+            .replace("</root>", "<CPhysicsVertex xs.ref='shared-physics-vertex'/></root>");
+        let mut rig = Rig::new("physics-detach", container.replace_main_xml(xml.as_bytes()).unwrap());
+        let revision = rig.revision();
+        let before = rig.controller.snapshot()["model"].clone();
+        rig.draw();
+        assert_eq!(rig.view()["groups"][0]["vertices"][0]["shared"], true);
+        rig.click(Role::Button, "Make physics settings independent");
+        rig.draw();
+        assert_eq!(rig.revision(), revision + 1, "{:?}", rig.panel.error);
+        assert_eq!(rig.view()["groups"][0]["vertices"][0]["shared"], false);
+        let detached = rig.controller.snapshot().clone();
+        rig.click(Role::Button, "Make physics settings independent");
+        assert_eq!(rig.controller.snapshot(), &detached);
+        rig.controller.core_request(&json!({"op":"undo"}));
+        assert_eq!(rig.controller.snapshot()["model"], before);
+        rig.draw();
+        assert_eq!(rig.view()["groups"][0]["vertices"][0]["shared"], true);
     }
 
     #[test]
