@@ -58,38 +58,40 @@ is made from these results.
 
 ## Completed measurements on 2026-10-27
 
-[Run 40439454235](https://github.com/geekjapan/Soul2D/actions/runs/40439454235)
-at `9b689c8a0d853505c5653885aeaf3f80034793f9` completed the original five
-workloads on all three targets, with five fresh processes per case and target.
-All 75 processes passed their assertions. The keyed-parameter workload was added
-later and is not covered by this receipt.
+[Run 40444207528](https://github.com/geekjapan/Soul2D/actions/runs/40444207528)
+at `b0408afd39e547f43d2bf334b9381d4bfdea47f2` completed all six workloads on
+all three targets, with five fresh processes per case and target. All 90 processes
+passed their assertions. The earlier [75-process run](https://github.com/geekjapan/Soul2D/actions/runs/40439454235)
+at `9b689c8` covered the original five workloads; its measurements are separate.
 
 | Runner | CPU / logical CPUs | Physical RAM | Image version |
 | --- | --- | --- | --- |
-| Linux x64, Ubuntu 24.04 | AMD EPYC 7763 / 4 | 15.615 GiB | `ubuntu24 / 20261023.334.3` |
-| Windows x64, Server 2025 | AMD EPYC 9V45 / 4 | 15.995 GiB | `win25-vs2026 / 20261021.278.1` |
-| macOS ARM64, 15.7.9 | Apple M1 Virtual / 3 | 7 GiB | `macos15 / 20260907.0337.1` |
+| Linux x64, Ubuntu 24.04 | AMD EPYC 7763 64-Core Processor / 4 | 15.619 GiB | `ubuntu24 / 20261023.334.3` |
+| Windows x64, Server 2025 | AMD EPYC 7763 64-Core Processor / 4 | 15.995 GiB | `win25-vs2026 / 20261021.278.1` |
+| macOS ARM64, 15.7.9 | Apple M1 (Virtual) / 3 | 7.000 GiB | `macos15 / 20260907.0337.1` |
 
 Each cell below gives the median and `[min, max]` for five runs. MiB means
 1,048,576 bytes. Memory is the OS counter described above, including fixture
 construction and assertions. These are independent host observations, not a
-platform ranking. macOS load averages at startup were 1.562, 2.148 and 4.305;
-Linux values were 1.000, 1.008 and 0.958. Windows does not supply this counter.
+platform ranking. Startup load averages were 1.000, 1.004 and 0.957 on Linux,
+and 3.551, 2.539 and 5.395 on macOS. Windows does not supply this counter.
 
 | Workload | Linux seconds / MiB | Windows seconds / MiB | macOS seconds / MiB |
 | --- | --- | --- | --- |
-| 2,000 added meshes, 1,000 added parameters, 100x100 warp | 2.113 [2.094, 2.137] / 385.145 [385.137, 385.539] | 2.253 [2.184, 2.414] / 355.051 [354.816, 355.820] | 1.342 [1.214, 1.786] / 415.953 [401.750, 421.188] |
-| 1,000 added textures/meshes, 500 warps, 500 rotations | 3.264 [3.259, 3.285] / 502.051 [501.895, 502.199] | 3.552 [3.329, 3.649] / 449.523 [449.395, 449.992] | 2.124 [2.014, 2.542] / 513.922 [509.359, 531.078] |
-| CAN3 20,000-key curve | 5.764 [5.700, 5.823] / 910.527 [906.785, 911.742] | 6.764 [6.581, 6.779] / 835.410 [835.090, 835.574] | 4.248 [3.344, 4.871] / 961.266 [922.797, 969.734] |
-| Four 2048x2048 RGBA textures | 0.383 [0.382, 0.384] / 91.363 [91.305, 91.590] | 0.351 [0.348, 0.358] / 74.941 [74.859, 75.055] | 0.353 [0.304, 0.398] / 78.703 [76.172, 79.688] |
-| Texture refusal and recovery | 0.041 [0.041, 0.041] / 75.555 [75.320, 75.691] | 0.039 [0.037, 0.040] / 72.605 [72.586, 72.641] | 0.108 [0.065, 0.199] / 73.812 [72.734, 74.703] |
+| 2,000 added meshes, 1,000 added parameters, 100x100 warp | 2.031 [2.011, 2.051] / 385.320 [385.133, 385.457] | 3.014 [2.997, 3.569] / 355.383 [355.027, 355.793] | 1.261 [1.162, 1.843] / 408.547 [385.156, 424.172] |
+| 1,000 added textures/meshes, 500 warps, 500 rotations | 3.177 [3.157, 3.221] / 502.113 [501.734, 503.102] | 4.587 [4.531, 4.638] / 449.605 [449.254, 449.934] | 2.040 [1.718, 2.746] / 514.203 [507.656, 525.719] |
+| CAN3 20,000-key curve | 5.670 [5.594, 5.750] / 910.594 [910.266, 913.012] | 8.230 [8.201, 8.354] / 834.832 [834.762, 835.250] | 3.403 [3.083, 3.774] / 917.141 [896.344, 957.328] |
+| Four 2048x2048 RGBA textures | 0.382 [0.382, 0.403] / 91.582 [91.328, 91.598] | 0.517 [0.504, 0.523] / 74.918 [74.805, 75.008] | 0.362 [0.300, 0.378] / 78.297 [77.359, 79.312] |
+| 1,027 keyed parameters, 5,337 forms | 7.790 [7.724, 7.855] / 603.473 [601.750, 603.801] | 12.875 [12.808, 12.996] / 559.078 [558.645, 559.691] | 4.993 [4.828, 5.469] / 703.500 [694.297, 723.922] |
+| Texture refusal and recovery | 0.041 [0.041, 0.041] / 75.578 [75.250, 75.738] | 0.049 [0.046, 0.062] / 72.645 [72.613, 72.656] | 0.067 [0.050, 0.164] / 74.500 [73.609, 74.859] |
 
 All targets used Rust/Cargo 1.99.1. Independent artifact readback checked all
-logs, exact test commands, summary arithmetic, source/lock hashes and optimized
-Cargo receipts. The executable SHA-256 is recorded, but executable bytes are not
-retained for independent hash recomputation. Raw workflow artifacts expire after
-14 days. No absolute wall-time or RSS acceptance threshold was chosen from these
-observations.
+logs, exact test commands, summary arithmetic, source/lock hashes against the
+pinned commit and optimized Cargo receipts. Each job log also confirms the
+child-memory/failure/timeout self-check ran. The executable SHA-256 is recorded,
+but executable bytes are not retained for independent hash recomputation.
+Raw workflow artifacts expire after 14 days. No absolute wall-time or RSS
+acceptance threshold was chosen from these observations.
 
 ## Defensive boundaries
 
@@ -112,8 +114,8 @@ The capacity workflow retains failure logs instead of labelling such cases PASS.
 
 Results must be read from a completed run at the reviewed commit. The successful
 tested sizes establish a synthetic envelope, not the maximum possible document.
-The keyed-parameter and dense-grid workload, larger image sets and interactive
-GUI workloads need separate representative measurements.
+The keyed-parameter and dense-grid workload is covered by the 90-process receipt.
+Representative interactive GUI workloads still need separate measurements.
 Target hardware and acceptable interactive time/memory budgets remain unfrozen
 in `vendor-comparison-contract.md`. No value in this document substitutes a
 chosen user workload or establishes Cubism interoperability.
