@@ -3214,6 +3214,171 @@ fn physics3_read(session: &mut Session) -> Value {
     result(&request(session, json!({"op":"live2d.physics3.read"}))).clone()
 }
 
+fn physics3_output_scale_xml(kind: &str, referenced_type: bool) -> String {
+    let mut xml = native_physics_xml();
+    let start = xml.find("<CPhysicsOutput>").unwrap();
+    let end = start + xml[start..].find("</CPhysicsOutput>").unwrap() + "</CPhysicsOutput>".len();
+    let mut output = xml[start..end].replace("<f xs.n='angleScale'>10.0</f>",
+        "<f xs.n='angleScale'>111.125</f>");
+    let type_start = output.find("<CPhysicsSourceType").unwrap();
+    let type_end = type_start + output[type_start..].find("/>").unwrap() + 2;
+    let field = if kind.is_empty() { String::new() }
+        else if referenced_type { "<CPhysicsSourceType xs.n='type' xs.ref='output-scale-type'/>".into() }
+        else { format!("<CPhysicsSourceType xs.n='type' v='{kind}'/>") };
+    output.replace_range(type_start..type_end, &field);
+    output = output.replace("</CPhysicsOutput>",
+        "<GVector2 xs.n='translationScale'><f xs.n='x'>22.25</f><f xs.n='y'>-37.5</f></GVector2>\
+         <s xs.n='futureOutputField'>keep exactly</s></CPhysicsOutput>");
+    xml.replace_range(start..end, &output);
+    if referenced_type {
+        xml = xml.replace("<Opaque xs.id='future-data'>", &format!(
+            "<CPhysicsSourceType xs.id='output-scale-type' v='{kind}'/><Opaque xs.id='future-data'>"));
+    }
+    xml
+}
+
+fn physics3_output_scale_refusal(insert: bool) {
+    for (kind, referenced) in [("SRC_TO_X", false), ("SRC_TO_Y", false), ("SRC_FUTURE", false),
+        ("", false), ("SRC_TO_X", true), ("SRC_TO_Y", true)] {
+        let original = authoring_bytes(&physics3_output_scale_xml(kind, referenced));
+        let (mut session, revision, _, directory) = physics3_session(original.clone(), "output-scale.cmo3");
+        result(&request(&mut session, json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+            "group":0, "field":"name", "value":"Redo survives refusal"})));
+        result(&request(&mut session, json!({"op":"undo"})));
+        let before = session.snapshot();
+        let revision = before["revision"].as_u64().unwrap();
+        let view = physics3_read(&mut session);
+        assert_eq!(view["groups"][0]["outputs"][0]["editable"], false);
+        assert_eq!(view["groups"][0]["outputs"][0]["scale"], 111.125);
+        for scale in [None, Some(111.125), Some(7.5)] {
+            if !insert && scale.is_none() { continue; }
+            let mut args = json!({"expectedRevision":revision, "group":0, "list":"outputs"});
+            if insert {
+                args["insert"] = json!(1);
+                args["value"] = json!({"destination":"ParamTest", "vertexIndex":1});
+                if let Some(scale) = scale { args["value"]["scale"] = json!(scale); }
+            } else {
+                args["index"] = json!(0); args["field"] = json!("scale"); args["value"] = json!(scale.unwrap());
+            }
+            let response = session.handle_mcp(&json!({"jsonrpc":"2.0", "id":7, "method":"tools/call",
+                "params":{"name":"live2d_physics3_edit", "arguments":args}})).unwrap();
+            assert_eq!(response["result"]["isError"], true, "{kind:?}/{referenced}/{args}: unsupported scale was accepted");
+            assert!(response["result"]["content"][0]["text"].as_str().unwrap()
+                .contains("output scale requires Angle"), "{response}");
+            assert_eq!(session.snapshot(), before);
+            assert_eq!(physics3_read(&mut session), view);
+            assert_eq!(fs::read(directory.join("output-scale.cmo3")).unwrap(), original);
+        }
+        result(&request(&mut session, json!({"op":"redo"})));
+        assert_eq!(physics3_read(&mut session)["groups"][0]["name"], "Redo survives refusal");
+        result(&request(&mut session, json!({"op":"undo"})));
+        assert_eq!(session.snapshot()["model"], before["model"]);
+        let saved = directory.join("saved.cmo3");
+        result(&request(&mut session, json!({"op":"save", "path":saved})));
+        let old = soul2d_core::caff::CaffDocument::parse(&original).unwrap();
+        let bytes = fs::read(&saved).unwrap();
+        let new = soul2d_core::caff::CaffDocument::parse(&bytes).unwrap();
+        assert_eq!(new.main_xml(), old.main_xml());
+        for entry in old.entries().iter().filter(|entry| entry.name != "main.xml") {
+            assert_eq!(new.entry_data(&entry.name), old.entry_data(&entry.name));
+        }
+        let mut reopened = Session::new(); result(&request(&mut reopened, json!({"op":"open", "path":saved})));
+        assert_eq!(reopened.snapshot()["model"], before["model"]);
+        assert_eq!(physics3_read(&mut reopened), view);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_output_scale_refuses_non_angle_edits_without_mutating_source_or_history() {
+    physics3_output_scale_refusal(false);
+}
+
+#[test]
+fn physics3_output_scale_refuses_non_angle_donor_insertion_without_mutating_source_or_history() {
+    physics3_output_scale_refusal(true);
+}
+
+#[test]
+fn physics3_output_scale_keeps_inline_and_referenced_angle_edits_insertion_and_roundtrip() {
+    for referenced in [false, true] {
+        let original = authoring_bytes(&physics3_output_scale_xml("SRC_TO_G_ANGLE", referenced));
+        let (mut session, revision, before, directory) = physics3_session(original.clone(), "angle-scale.cmo3");
+        let edit = |revision, value| json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+            "group":0, "list":"outputs", "index":0, "field":"scale", "value":value});
+        assert_eq!(physics3_read(&mut session)["groups"][0]["outputs"][0]["editable"], true);
+        result(&request(&mut session, edit(revision, 7.5)));
+        let mut expected = before["model"].clone();
+        expected["physicsSource"] = json!(expected["physicsSource"].as_str().unwrap()
+            .replacen("<f xs.n='angleScale'>111.125</f>", "<f xs.n='angleScale'>7.5</f>", 1));
+        assert_eq!(session.snapshot()["model"], expected);
+        assert_eq!(session.snapshot()["revision"], revision + 1);
+        assert_eq!(session.snapshot()["history"]["count"], 1);
+        let current = session.snapshot();
+        result(&request(&mut session, edit(revision + 1, 7.5)));
+        assert_eq!(session.snapshot(), current);
+        physics3_refuse(&mut session, &current, &edit(revision, 8.5));
+        result(&request(&mut session, json!({"op":"undo"})));
+        assert_eq!(session.snapshot()["model"], before["model"]);
+        result(&request(&mut session, json!({"op":"redo"})));
+        assert_eq!(session.snapshot()["model"], expected);
+
+        for (kind, scale) in [("X", 2.25), ("Y", 3.25), ("Angle", 4.25)] {
+            let revision = session.snapshot()["revision"].as_u64().unwrap();
+            result(&request(&mut session, json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+                "group":0, "list":"inputs", "index":0, "field":"type", "value":kind})));
+            let revision = session.snapshot()["revision"].as_u64().unwrap();
+            result(&request(&mut session, json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+                "group":0, "list":"inputs", "index":0, "field":"scale", "value":scale})));
+            let view = physics3_read(&mut session);
+            assert_eq!(view["groups"][0]["inputs"][0]["type"], kind);
+            assert_eq!(view["groups"][0]["inputs"][0]["scale"], scale);
+        }
+        let revision = session.snapshot()["revision"].as_u64().unwrap();
+        result(&request(&mut session, json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+            "group":0, "list":"outputs", "insert":1, "value":{"destination":"ParamTest", "vertexIndex":1}})));
+        let view = physics3_read(&mut session);
+        assert_eq!(view["groups"][0]["outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(view["groups"][0]["outputs"][0]["scale"], 7.5);
+        assert_eq!(view["groups"][0]["outputs"][1]["scale"], 10.0);
+        assert_eq!(view["groups"][0]["outputs"][1]["type"], "Angle");
+        let expected = session.snapshot()["model"].clone();
+        let source = expected["physicsSource"].as_str().unwrap();
+        assert_eq!(source.matches("<s xs.n='futureOutputField'>keep exactly</s>").count(), 2);
+        assert_eq!(source.matches("<f xs.n='x'>22.25</f><f xs.n='y'>-37.5</f>").count(), 2);
+        if referenced { assert_eq!(source.matches("xs.ref='output-scale-type'").count(), 2); }
+        let saved = directory.join("saved.cmo3"); result(&request(&mut session, json!({"op":"save", "path":saved})));
+        let old = soul2d_core::caff::CaffDocument::parse(&original).unwrap();
+        let bytes = fs::read(&saved).unwrap(); let new = soul2d_core::caff::CaffDocument::parse(&bytes).unwrap();
+        assert_eq!(String::from_utf8(new.main_xml()).unwrap(), String::from_utf8(old.main_xml()).unwrap()
+            .replace(before["model"]["physicsSource"].as_str().unwrap(), expected["physicsSource"].as_str().unwrap()));
+        for entry in old.entries().iter().filter(|entry| entry.name != "main.xml") {
+            assert_eq!(new.entry_data(&entry.name), old.entry_data(&entry.name));
+        }
+        let mut reopened = Session::new(); result(&request(&mut reopened, json!({"op":"open", "path":saved})));
+        assert_eq!(reopened.snapshot()["model"], expected); assert_eq!(physics3_read(&mut reopened), view);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn physics3_output_scale_guard_keeps_other_imported_output_fields_editable() {
+    for kind in ["SRC_TO_X", "SRC_TO_Y"] {
+        let (mut session, revision, before, directory) = physics3_session(
+            authoring_bytes(&physics3_output_scale_xml(kind, false)), "imported-output.cmo3");
+        result(&request(&mut session, json!({"op":"live2d.physics3.edit", "expectedRevision":revision,
+            "group":0, "list":"outputs", "index":0, "field":"weight", "value":50.0})));
+        let mut expected = before["model"].clone();
+        expected["physicsSource"] = json!(expected["physicsSource"].as_str().unwrap()
+            .replacen("<f xs.n='weight'>100.0</f>", "<f xs.n='weight'>50</f>", 1));
+        assert_eq!(session.snapshot()["model"], expected);
+        assert_eq!(physics3_read(&mut session)["groups"][0]["outputs"][0]["weight"], 50.0);
+        result(&request(&mut session, json!({"op":"undo"})));
+        assert_eq!(session.snapshot()["model"], before["model"]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[test]
 fn physics3_first_group_is_created_through_mcp_and_roundtrips_in_one_undo_step() {
     for (list, selection) in [("<carray_list xs.n='_sourceCubismPhysics' count='0'/>", ""),

@@ -1684,6 +1684,15 @@ The sample comparison below predates this support and contains no Y inputs.
 Cubism GUI round-trip and visual parity for authored Y inputs remain unverified.
 This does not add translation-output editing or reinterpret `translationScale`.
 
+Output `scale` edits require a known Angle type, including an Angle type stored
+through a reference. Imported X/Y, unknown and missing output types refuse this
+edit instead of changing an ineffective `angleScale`. Insertion using a selected
+non-Angle output donor also refuses, including when scale uses its default.
+Refusal preserves the source, revision and undo/redo history. It never normalizes
+the imported type, changes `translationScale` or silently chooses another layout.
+Other field edits keep their existing storage checks; this is not a blanket
+refusal for every field of a row marked noneditable by the native panel.
+
 `tools/verify-physics3-export.py <directories>` compares the export with a
 derivation written apart from it and with the vendor files, after parsing. On
 the supplied samples the export equals the derivation for the 83 CMO3 files

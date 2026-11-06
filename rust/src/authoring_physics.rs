@@ -359,14 +359,15 @@ fn parameter_leaf_patch(
 /// A new list item written as a copy of `donor`, a stored item of the same list, with the requested values (and the
 /// defaults of `item_insert`) and new GUIDs. Fields the view does not show keep the donor's values.
 #[allow(clippy::too_many_arguments)]
-fn cloned_item(
+fn cloned_item<'d, 'i>(
     text: &str,
+    graph: &Graph<'d, 'i>,
     inbound: &HashSet<&str>,
     by_id: &HashMap<String, String>,
     guid_objects: &HashMap<&str, &str>,
-    group: Node<'_, '_>,
+    group: Node<'d, 'i>,
     list: &str,
-    donor: Node<'_, '_>,
+    donor: Node<'d, 'i>,
     value: &Value,
 ) -> Result<String, String> {
     let mut values = value.as_object().cloned().unwrap_or_default();
@@ -377,7 +378,7 @@ fn cloned_item(
     }
     let mut patches = Vec::new();
     for (field, value) in &values {
-        item_scalar(inbound, by_id, guid_objects, group, list, donor, field, value, &mut patches)?;
+        item_scalar(graph, inbound, by_id, guid_objects, group, list, donor, field, value, &mut patches)?;
     }
     for node in donor.descendants().filter(|node| node.attribute("xs.n") == Some("guid")) {
         if let Some(attribute) = node.attributes().find(|attribute| attribute.name() == "uuid") {
@@ -1016,7 +1017,7 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
                 (Some(index), None, false, Some(field), Some(value)) => {
                     let item = inline_slot(&graph, &inbound, &items, index, "list item")?;
                     let key = item_scalar(
-                        &inbound, &by_id, &guid_objects, group_node, list_name, item, field, value, &mut patches,
+                        &graph, &inbound, &by_id, &guid_objects, group_node, list_name, item, field, value, &mut patches,
                     )?;
                     Verify::Value {
                         path: vec![
@@ -1064,7 +1065,7 @@ fn edit_text(text: &str, model: &Value, request: &Value) -> Result<(Value, Strin
                         })
                     }).next();
                     let element = match donor {
-                        Some(donor) => cloned_item(text, &inbound, &by_id, &guid_objects, group_node, list_name, donor, value)?,
+                        Some(donor) => cloned_item(text, &graph, &inbound, &by_id, &guid_objects, group_node, list_name, donor, value)?,
                         None => element,
                     };
                     if item_insert_offset(text, list_node, &items, insert, &mut patches, &element)? {
@@ -1140,13 +1141,14 @@ fn json_key(list: &str, field: &str) -> String {
 }
 
 /// One scalar edit inside an `inputs`, `outputs` or `vertices` item. Returns the view key of the edited field.
-fn item_scalar(
+fn item_scalar<'d, 'i>(
+    graph: &Graph<'d, 'i>,
     inbound: &HashSet<&str>,
     by_id: &HashMap<String, String>,
     guid_objects: &HashMap<&str, &str>,
-    group: Node<'_, '_>,
+    group: Node<'d, 'i>,
     list: &str,
-    item: Node<'_, '_>,
+    item: Node<'d, 'i>,
     field: &str,
     value: &Value,
     patches: &mut Vec<Patch>,
@@ -1185,6 +1187,9 @@ fn item_scalar(
             )?);
         }
         ("inputs" | "outputs", "scale") => {
+            if list == "outputs" && graph.field(item, "type")?.and_then(|kind| kind.attribute("v")) != Some("SRC_TO_G_ANGLE") {
+                return Err("authoring physics output scale requires Angle".into());
+            }
             let scale = native_finite(value, "scale")?;
             patches.push(scalar_patch(target("angleScale")?, "f", "angleScale", number_text(scale), inbound)?);
         }
