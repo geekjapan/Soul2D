@@ -51,6 +51,7 @@ def main():
     generation = 0
     seen = set()
     workers = []
+    protocol = {method: 0 for method in ['initialize', 'session/new', 'session/prompt', 'session/cancel']}
 
     def rpc(command, receipt, endpoint, headers):
         request = command['request']
@@ -91,8 +92,12 @@ def main():
         except queue.Empty:
             message = {}
         if message is None:
+            write(run / 'eof.json', {'stdinClosed': True})
             return
         method = message.get('method')
+        if method in protocol:
+            protocol[method] += 1
+            write(run / 'protocol.json', protocol)
         if method == 'initialize':
             BASE.send(BASE.init_result(message['id'], True))
         elif method == 'session/new':

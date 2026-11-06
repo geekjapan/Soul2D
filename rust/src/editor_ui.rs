@@ -317,6 +317,75 @@ const AGENT_CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_SET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_DRAFT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_NEW_SESSION_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum AgentNewSessionOutcome {
+    Applied(crate::editor_agent::AgentRestartResult),
+    Refused(crate::editor_agent::NewSessionRefusal),
+    EditorClosing,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+enum RemoteAgentNewSession {
+    Idle,
+    Reviewing { attempt:u64, target:crate::editor_agent::NewSessionTarget },
+    Waiting { attempt:u64, target:crate::editor_agent::NewSessionTarget,
+        receipt:Receiver<Result<(), String>>, deadline:Instant },
+    Finished { attempt:u64, outcome:AgentNewSessionOutcome, invalid_invocation:Option<crate::editor_agent::AcpInvocation> },
+}
+
+impl RemoteAgentNewSession {
+    fn attempt(&self) -> u64 {
+        match self {
+            Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt,
+        }
+    }
+
+    fn state(&self) -> Value {
+        use crate::editor_agent::{AgentRestartPhase, NewSessionRefusal, StopResult};
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Reviewing { attempt, .. } => json!({"state":"awaiting_human", "attempt":attempt}),
+            Self::Waiting { attempt, .. } => json!({"state":"waiting_for_reply", "attempt":attempt}),
+            Self::Finished { attempt, outcome, .. } => {
+                let state = match outcome {
+                    AgentNewSessionOutcome::Applied(result) => match result.phase {
+                        AgentRestartPhase::Disabled => "disabled",
+                        AgentRestartPhase::ShutdownFailedRetained => "shutdown_failed_retained",
+                        AgentRestartPhase::StartFailed => "start_failed",
+                        AgentRestartPhase::InitializeWriteFailedRetained => "initialize_write_failed_retained",
+                        AgentRestartPhase::InitializationRequested => "initialization_requested",
+                    },
+                    AgentNewSessionOutcome::Refused(NewSessionRefusal::Disabled) => "disabled",
+                    AgentNewSessionOutcome::Refused(NewSessionRefusal::IdentityUnavailable) => "identity_unavailable",
+                    AgentNewSessionOutcome::Refused(NewSessionRefusal::StaleTarget) => "stale_target",
+                    AgentNewSessionOutcome::Refused(NewSessionRefusal::ConfigurationChanged) => "configuration_changed",
+                    AgentNewSessionOutcome::Refused(NewSessionRefusal::ConsentInvalid) => "consent_invalid",
+                    AgentNewSessionOutcome::EditorClosing => "editor_closing",
+                    AgentNewSessionOutcome::ReplyNotProduced => "reply_not_produced",
+                    AgentNewSessionOutcome::ReplyFailed => "reply_failed",
+                    AgentNewSessionOutcome::ReplyLost => "reply_lost",
+                    AgentNewSessionOutcome::ReplyExpired => "reply_expired",
+                };
+                let mut value = json!({"state":state, "attempt":attempt});
+                if let AgentNewSessionOutcome::Applied(result) = outcome {
+                    let (stop, failed) = match &result.stop {
+                        None => ("not_needed", None),
+                        Some(StopResult::Stopped { approval_reply_failed }) => ("stopped", Some(*approval_reply_failed)),
+                        Some(StopResult::FailedRetained { approval_reply_failed }) => ("failed_retained", Some(*approval_reply_failed)),
+                    };
+                    value["stop"] = json!(stop);
+                    if let Some(failed) = failed { value["approval_reply_failed"] = json!(failed); }
+                }
+                value
+            }
+        }
+    }
+}
 
 enum AgentDraftOutcome {
     Applied,
@@ -596,6 +665,7 @@ struct EditorView<'a> {
     agent_stop_owner: Option<crate::editor_agent::StopOwner>,
     agent_set: &'a mut RemoteAgentSet,
     agent_set_snapshot: Result<crate::editor_agent::AgentSetSnapshot, String>,
+    agent_new_session: &'a mut RemoteAgentNewSession,
     agent_draft: &'a mut RemoteAgentDraft,
     agent_draft_snapshot: crate::editor_agent::DraftSnapshot,
     animation_draft: &'a mut AnimationDraft,
@@ -671,6 +741,7 @@ macro_rules! editor_view {
             agent_stop_owner: $app.agent.stop_owner(),
             agent_set: &mut $app.agent_set,
             agent_set_snapshot: $app.agent.set_snapshot(),
+            agent_new_session: &mut $app.agent_new_session,
             agent_draft: &mut $app.agent_draft,
             agent_draft_snapshot: $app.agent.draft_snapshot(),
             animation_draft: &mut $app.animation_draft,
@@ -804,6 +875,23 @@ impl EditorView<'_> {
                 _ => self.agent_set.attempt().checked_add(1).map(|_| target).ok_or("Coding agent Set identity exhausted".into()),
             }
         });
+        let new_session_target: Result<crate::editor_agent::NewSessionTarget, String> = (|| {
+            if message["method"] != "tools/call" || message["params"]["name"] != "editor_coding_agent_new_session" {
+                return Err("Not a New session request".into());
+            }
+            if !identified_stop { return Err("New session requires an identified request with a reply writer".into()); }
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_)) { return Err(CLOSING_MESSAGE.into()); }
+            let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
+            let target = self.agent_set_snapshot.clone().map_err(|_| "New session identity unavailable".to_owned())?
+                .new_session_target(&self.tools.store, approval)?;
+            match &*self.agent_new_session {
+                RemoteAgentNewSession::Reviewing { target:original, .. } if original == &target && target.invocation().is_some() => Ok(target),
+                RemoteAgentNewSession::Reviewing { .. } | RemoteAgentNewSession::Waiting { .. } => Err("Coding-agent New session already pending; read editor state".into()),
+                RemoteAgentNewSession::Finished { invalid_invocation:Some(invalid), .. } if target.invocation() == Some(invalid) =>
+                    Err("This original New session request was invalidated; make a fresh request".into()),
+                _ => self.agent_new_session.attempt().checked_add(1).map(|_| target).ok_or("New session identity exhausted".into()),
+            }
+        })();
         let draft_target: Result<crate::editor_agent::DraftTarget, String> = (|| {
             if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_)) { return Err(CLOSING_MESSAGE.into()); }
             let expected = message["params"]["arguments"]["expectedDraftIdentity"].as_str().ok_or("expectedDraftIdentity must be a string")?;
@@ -845,6 +933,7 @@ impl EditorView<'_> {
                 }
             });
         let mut draft_receipt = None;
+        let mut new_session_receipt = None;
         let mut set_receipt = None;
         let mut quit_receipt = None;
         let mut cancel_receipt = None;
@@ -868,6 +957,12 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.coding_agent.new_session" {
+                    if !identified_stop { return Err("New session requires an identified request with a reply writer".into()); }
+                    let target = new_session_target.clone()?;
+                    let review = target.review().ok_or("ACP New session requires its original authenticated invocation")?;
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::CodingAgentNewSession(review)), None);
+                }
                 if call["op"] == "editor.coding_agent.prompt.set" {
                     if !identified_stop { return Err("Draft editing requires an identified request with a reply writer".into()); }
                     let target = draft_target.clone()?;
@@ -1010,6 +1105,23 @@ impl EditorView<'_> {
             }
             Ok(())
         }, &mut |controller, call| {
+            if call["op"] == "editor.coding_agent.new_session" {
+                if !identified_stop { return Err("New session requires an identified request with a reply writer".into()); }
+                let target = new_session_target.clone()?;
+                let attempt = if target.invocation().is_some() {
+                    match &*self.agent_new_session {
+                        RemoteAgentNewSession::Reviewing { attempt, target:original } if original == &target => *attempt,
+                        _ => return Err("The original New session review is no longer valid".into()),
+                    }
+                } else { self.agent_new_session.attempt().checked_add(1).ok_or("New session identity exhausted")? };
+                let (sender, receipt) = sync_channel(1);
+                *self.agent_new_session = RemoteAgentNewSession::Waiting { attempt, target, receipt,
+                    deadline:Instant::now() + AGENT_NEW_SESSION_REPLY_TIMEOUT };
+                let admitted = json!({"codingAgentNewSession":{"state":"admitted", "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_owner_and_configuration"}});
+                new_session_receipt = Some((sender, admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.coding_agent.prompt.set" {
                 if !identified_stop { return Err("Draft editing requires an identified request with a reply writer".into()); }
                 let target = draft_target.clone()?;
@@ -1112,6 +1224,16 @@ impl EditorView<'_> {
             self.handle(controller, call)
         });
         if let McpOrigin::Agent(approval) = &origin {
+            if let Ok(target) = &new_session_target {
+                if target.review().is_some() && approval.new_session_review() == target.review()
+                    && !matches!(&*self.agent_new_session, RemoteAgentNewSession::Reviewing { .. } | RemoteAgentNewSession::Waiting { .. })
+                    && !matches!(&*self.agent_new_session, RemoteAgentNewSession::Finished { invalid_invocation:Some(invalid), .. }
+                        if target.invocation() == Some(invalid)) {
+                    if let Some(attempt) = self.agent_new_session.attempt().checked_add(1) {
+                        *self.agent_new_session = RemoteAgentNewSession::Reviewing { attempt, target:target.clone() };
+                    }
+                }
+            }
             if let Some(target) = approval.draft_review() {
                 if !matches!(&*self.agent_draft, RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. })
                     && !matches!(&*self.agent_draft, RemoteAgentDraft::Finished { invalid_invocation:Some(invalid), .. }
@@ -1159,6 +1281,20 @@ impl EditorView<'_> {
         }
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
+        if let Some((receipt, admitted)) = new_session_receipt {
+            if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteAgentNewSession::Waiting { deadline, .. } = self.agent_new_session {
+                    *deadline = Instant::now() + AGENT_NEW_SESSION_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            let pending = std::mem::replace(self.agent_new_session, RemoteAgentNewSession::Idle);
+            let RemoteAgentNewSession::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            *self.agent_new_session = RemoteAgentNewSession::Finished { attempt, outcome:AgentNewSessionOutcome::ReplyNotProduced,
+                invalid_invocation:target.invocation().cloned() };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, admitted)) = draft_receipt {
             if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == admitted) {
@@ -1236,6 +1372,9 @@ impl EditorView<'_> {
 
     fn quit_work_refusal(&self, controller: &EditorController) -> Option<String> {
         let reason = if *self.closing { "The editor is closing" }
+        else if matches!(&*self.agent_new_session, RemoteAgentNewSession::Reviewing { .. } | RemoteAgentNewSession::Waiting { .. }) {
+            "Quit refused: a coding-agent New session request is pending"
+        }
         else if self.dialog_waits() || self.windows.quit_pending(&self.tools.store) { DIALOG_PENDING_MESSAGE }
         else if !controller.can_close() { "Quit refused: save the document and apply or cancel its drafts first" }
         else if self.mesh_tools.editing() || self.depth_tools.editing() || self.tool_edits()
@@ -1856,6 +1995,7 @@ impl EditorView<'_> {
             "codingAgentCancel": self.agent_cancel.state(),
             "codingAgentStop": self.agent_stop.state(),
             "codingAgentSet": self.agent_set.state(),
+            "codingAgentNewSession": self.agent_new_session.state(),
             "codingAgentDraft": {"identity":self.agent_draft_snapshot.identity(),
                 "editable":self.agent_draft_snapshot.editable() && !*self.closing
                     && self.agent_draft.attempt() != u64::MAX
@@ -1938,6 +2078,7 @@ pub struct EditorApp {
     agent_cancel: RemoteAgentCancel,
     agent_stop: RemoteAgentStop,
     agent_set: RemoteAgentSet,
+    agent_new_session: RemoteAgentNewSession,
     agent_draft: RemoteAgentDraft,
     #[cfg(test)]
     hold_quit_receipt_for_test: bool,
@@ -2070,6 +2211,7 @@ impl EditorApp {
             agent_cancel: RemoteAgentCancel::Idle,
             agent_stop: RemoteAgentStop::Idle,
             agent_set: RemoteAgentSet::Idle,
+            agent_new_session: RemoteAgentNewSession::Idle,
             agent_draft: RemoteAgentDraft::Idle,
             #[cfg(test)]
             hold_quit_receipt_for_test: false,
@@ -2465,8 +2607,54 @@ impl EditorApp {
         self.agent_set = RemoteAgentSet::Finished { attempt, outcome, invalid:target };
     }
 
+    fn finish_agent_new_session(&mut self, ctx: &egui::Context) {
+        let closing = self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_));
+        if let RemoteAgentNewSession::Reviewing { attempt, target } = &self.agent_new_session {
+            let failure = if closing { Some(AgentNewSessionOutcome::EditorClosing) }
+                else { self.agent.new_session_status(target, &self.tools.store, false).err().map(AgentNewSessionOutcome::Refused) };
+            if let Some(outcome) = failure {
+                let (attempt, invocation, review) = (*attempt, target.invocation().cloned(), target.review());
+                if let Some(review) = review { self.agent.invalidate_new_session_review(&review); }
+                self.agent_new_session = RemoteAgentNewSession::Finished { attempt, outcome, invalid_invocation:invocation };
+            }
+            return;
+        }
+        let RemoteAgentNewSession::Waiting { receipt, deadline, .. } = &mut self.agent_new_session else { return };
+        let failure = if closing { Some(AgentNewSessionOutcome::EditorClosing) }
+            else if Instant::now() >= *deadline { Some(AgentNewSessionOutcome::ReplyExpired) } else {
+                match receipt.try_recv() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(_)) => Some(AgentNewSessionOutcome::ReplyFailed),
+                    Err(TryRecvError::Disconnected) => Some(AgentNewSessionOutcome::ReplyLost),
+                    Err(TryRecvError::Empty) => {
+                        ctx.request_repaint_after(Duration::from_millis(10));
+                        return;
+                    }
+                }
+            };
+        let pending = std::mem::replace(&mut self.agent_new_session, RemoteAgentNewSession::Idle);
+        let RemoteAgentNewSession::Waiting { attempt, target, .. } = pending else { unreachable!() };
+        let invalid_invocation = target.invocation().cloned();
+        let review = target.review();
+        let outcome = failure.unwrap_or_else(|| match self.agent.new_session_if_current(&target, &self.tools.store) {
+            Ok(result) => AgentNewSessionOutcome::Applied(result),
+            Err(refusal) => AgentNewSessionOutcome::Refused(refusal),
+        });
+        if let Some(review) = review { self.agent.invalidate_new_session_review(&review); }
+        self.agent_new_session = RemoteAgentNewSession::Finished { attempt, outcome, invalid_invocation };
+    }
+
     fn begin_closing(&mut self) {
         self.closing = true;
+        let pending = std::mem::replace(&mut self.agent_new_session, RemoteAgentNewSession::Idle);
+        self.agent_new_session = match pending {
+            RemoteAgentNewSession::Reviewing { attempt, target } | RemoteAgentNewSession::Waiting { attempt, target, .. } => {
+                if let Some(review) = target.review() { self.agent.close_new_session_review(&review); }
+                RemoteAgentNewSession::Finished { attempt, outcome:AgentNewSessionOutcome::EditorClosing,
+                    invalid_invocation:target.invocation().cloned() }
+            }
+            other => other,
+        };
         let pending = std::mem::replace(&mut self.agent_draft, RemoteAgentDraft::Idle);
         self.agent_draft = match pending {
             RemoteAgentDraft::Reviewing { attempt, target } | RemoteAgentDraft::Waiting { attempt, target, .. } => {
@@ -7298,6 +7486,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_new_session(ctx);
         self.finish_agent_draft(ctx);
         self.agent.pump();
         self.observe_remote_quit(ctx);
@@ -7332,6 +7521,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_new_session(ctx);
         self.finish_agent_draft(ctx);
         self.agent.tick(ctx);
         let controller = &mut self.controller;
@@ -7340,6 +7530,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_new_session(ctx);
         self.finish_agent_draft(ctx);
         self.agent.host_approval_window(ctx, approval_path.as_deref());
         self.handle_shortcuts(ctx);
@@ -16702,6 +16893,632 @@ mod editor_state_tests {
         let request = json!({"jsonrpc":"2.0", "id":"set-admission", "method":"tools/call",
             "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":enabled}}});
         CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+    }
+
+    fn new_session_message() -> Value {
+        json!({"jsonrpc":"2.0", "id":"new-session-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_new_session", "arguments":{}}})
+    }
+
+    fn request_agent_new_session(app: &mut EditorApp) -> RpcReply {
+        CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &new_session_message(), McpOrigin::Client))
+    }
+
+    fn finish_agent_new_session(app: &mut EditorApp) { CTX.with(|ctx| app.finish_agent_new_session(ctx)); }
+
+    #[test]
+    fn coding_agent_new_session_strict_arguments_ids_origins_disabled_and_counter_refuse() {
+        let mut app = app("coding-agent-new-session-boundary");
+        assert!(refused(&mut app, "editor_coding_agent_new_session", json!({})).contains("Enable"));
+        app.agent.set_enabled(true);
+        for args in [Value::Null, json!([]), json!({"extra":true})] {
+            let _ = refused(&mut app, "editor_coding_agent_new_session", args);
+        }
+        for id in [Value::Null, json!(false), json!([]), json!({}), json!(0.5)] {
+            let mut message = new_session_message(); message["id"] = id;
+            let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &message, McpOrigin::Client));
+            if let Some(reply) = reply.into_message() { assert!(reply["result"]["isError"] == true || reply.get("error").is_some()); }
+        }
+        for version in [Value::Null, json!("1.0")] {
+            let mut message = new_session_message(); message["jsonrpc"] = version;
+            let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &message, McpOrigin::Client));
+            if let Some(reply) = reply.into_message() { assert!(reply["result"]["isError"] == true || reply.get("error").is_some()); }
+        }
+        let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &new_session_message(), McpOrigin::Internal)).into_message().unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        let mut notification = new_session_message(); notification.as_object_mut().unwrap().remove("id");
+        assert!(CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &notification, McpOrigin::Client)).into_message().is_none());
+        finish_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"], json!({"state":"idle"}));
+        app.agent_new_session = RemoteAgentNewSession::Finished { attempt:u64::MAX,
+            outcome:AgentNewSessionOutcome::ReplyLost, invalid_invocation:None };
+        assert!(refused(&mut app, "editor_coding_agent_new_session", json!({})).contains("identity exhausted"));
+        assert!(!app.agent.state().has_client && app.agent.error().is_none());
+    }
+
+    #[test]
+    fn coding_agent_new_session_failed_flush_lost_consumed_and_expired_replies_never_launch() {
+        struct BadWriter { flush_only:bool }
+        impl std::io::Write for BadWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush_only { Ok(bytes.len()) } else { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+        }
+        for case in ["failed", "flush", "lost", "consumed", "expired"] {
+            let mut app = app(&format!("coding-agent-new-session-reply-{case}")); app.agent.set_enabled(true);
+            app.tools.store.set("ACP.Command", "owned-unused-reply-sentinel".to_owned()).unwrap();
+            app.agent.set_prompt_for_test("private retained unsent".into());
+            let identity = app.agent.draft_snapshot().identity().unwrap().to_owned();
+            let before = app.controller.snapshot().clone();
+            let reply = request_agent_new_session(&mut app);
+            finish_agent_new_session(&mut app);
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "waiting_for_reply");
+            assert!(refused(&mut app, "editor_coding_agent_new_session", json!({})).contains("already pending"));
+            match case {
+                "failed" | "flush" => assert!(reply.write_line(&mut BadWriter { flush_only:case == "flush" }).is_err()),
+                "lost" => drop(reply),
+                "consumed" => { let _ = reply.into_message(); },
+                _ => {
+                    reply.write_line(&mut Vec::new()).unwrap();
+                    let RemoteAgentNewSession::Waiting { deadline, .. } = &mut app.agent_new_session else { panic!() };
+                    *deadline = Instant::now() - Duration::from_millis(1);
+                }
+            }
+            finish_agent_new_session(&mut app);
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentNewSession"]["state"], match case {
+                "flush" => "reply_failed".to_owned(), "consumed" => "reply_lost".to_owned(), _ => format!("reply_{case}"),
+            });
+            assert!(!app.agent.state().has_client && app.agent.mcp_url().is_none() && app.agent.error().is_none());
+            assert_eq!(app.agent.prompt_text_for_test(), "private retained unsent");
+            assert_eq!(app.agent.draft_snapshot().identity(), Some(identity.as_str()));
+            assert_eq!(app.controller.snapshot(), &before);
+            assert!(!observed.to_string().contains("private retained unsent") && !observed.to_string().contains("owned-unused-reply-sentinel"));
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_held_reply_rechecks_configuration_and_opt_in_before_any_launch() {
+        for case in ["configuration", "opt-in"] {
+            let mut app = app(&format!("coding-agent-new-session-held-{case}")); app.agent.set_enabled(true);
+            let reply = request_agent_new_session(&mut app);
+            if case == "configuration" { app.tools.store.set("MCP.Headers", "owned changed malformed config".to_owned()).unwrap(); }
+            else { app.agent.set_enabled(false); app.agent.set_enabled(true); }
+            reply.write_line(&mut Vec::new()).unwrap(); finish_agent_new_session(&mut app);
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], if case == "configuration" { "configuration_changed" } else { "stale_target" });
+            assert!(!app.agent.state().has_client && app.agent.error().is_none());
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_ownerless_failure_preserves_document_draft_settings_and_unsent_edits() {
+        let mut app = app("coding-agent-new-session-preserves"); app.agent.set_enabled(true);
+        let path = app.tools.store_path.clone().unwrap();
+        std::fs::write(&path, b"{\"ownedSentinel\":true}").unwrap();
+        app.select_node_draft(2); app.controller.set_draft_name("Unapplied name".into());
+        let before = app.controller.snapshot().clone();
+        app.agent.set_prompt_for_test("before admission".into());
+        let reply = request_agent_new_session(&mut app);
+        app.agent.set_prompt_for_test("new native unsent text".into());
+        let identity = app.agent.draft_snapshot().identity().unwrap().to_owned();
+        app.tools.store.set("Outline.visible", false).unwrap();
+        reply.write_line(&mut Vec::new()).unwrap(); finish_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"], json!({"state":"start_failed", "attempt":1, "stop":"not_needed"}));
+        assert_eq!(state(&mut app)["codingAgent"].as_object().unwrap().len(), 7);
+        assert_eq!(app.agent.prompt_text_for_test(), "new native unsent text");
+        assert_eq!(app.agent.draft_snapshot().identity(), Some(identity.as_str()));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Unapplied name"));
+        assert_eq!(std::fs::read(path).unwrap(), b"{\"ownedSentinel\":true}");
+    }
+
+    #[test]
+    fn coding_agent_new_session_pending_blocks_quit_and_closing_cancels_ownerless_delivery() {
+        let mut app = app("coding-agent-new-session-close"); app.agent.set_enabled(true);
+        let reply = request_agent_new_session(&mut app);
+        assert!(refused(&mut app, "editor_quit", json!({})).contains("New session request is pending"));
+        app.begin_closing();
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "editor_closing");
+        reply.write_line(&mut Vec::new()).unwrap(); finish_agent_new_session(&mut app);
+        assert!(!app.agent.state().has_client && app.agent.error().is_none());
+        assert!(refused(&mut app, "editor_coding_agent_new_session", json!({})).contains("closing"));
+    }
+
+    fn configure_owned_new_session_fixture(app: &mut EditorApp, name: &str) -> PathBuf {
+        let run_dir = temp_dir(name);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/acp-panel-approval-fixture.py");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let probe = std::process::Command::new(python).args(["-I", "-c", "import sys; print(sys.executable)"]).output().unwrap();
+        assert!(probe.status.success());
+        let interpreter = String::from_utf8(probe.stdout).unwrap().trim().to_owned();
+        assert!(!interpreter.is_empty());
+        app.tools.store.set("ACP.Command", format!("\"{}\" -I \"{}\" --run-dir \"{}\"",
+            interpreter, fixture.display(), run_dir.display())).unwrap();
+        app.tools.store.set("ACP.Workdir", env!("CARGO_MANIFEST_DIR").to_owned()).unwrap();
+        app.tools.store.set("Outline.visible", false).unwrap();
+        app.agent.set_enabled(true);
+        run_dir
+    }
+
+    #[test]
+    fn coding_agent_new_session_replaces_an_actual_owned_child_with_initialize_only_and_fresh_endpoint() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-new-session-owned");
+        let run_dir = configure_owned_new_session_fixture(&mut app, "coding-agent-new-session-owned-peer");
+        app.agent.start(&app.tools.store);
+        let mut harness = Harness::new(); let mut frame = eframe::Frame::_new_kittest();
+        let instances = || -> Vec<PathBuf> {
+            std::fs::read_dir(run_dir.join("instances")).ok().into_iter().flatten()
+                .filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.is_dir()).collect()
+        };
+        let protocol = |path:&Path| -> Result<Value, String> {
+            serde_json::from_str(&std::fs::read_to_string(path.join("protocol.json")).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        };
+        let result = (|| -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !app.agent.state().ready {
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if Instant::now() >= deadline || app.agent.state().closed { return Err("owned fixture initialization failed".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let old_instances = instances();
+            if old_instances.len() != 1 { return Err("expected exactly one original owned fixture".into()); }
+            let old_instance = old_instances[0].clone();
+            let counts = json!({"initialize":1, "session/new":0, "session/prompt":0, "session/cancel":0});
+            if protocol(&old_instance)? != counts { return Err("original fixture unexpectedly received a session or prompt".into()); }
+            let old_owner = app.agent.owner().ok_or("missing original owner")?;
+            let old_token = app.agent.mcp_token_for_test().ok_or("missing original endpoint")?.to_owned();
+            let old_url = app.agent.mcp_url().unwrap().to_owned();
+            app.agent.set_prompt_for_test("  preserved unsent 日本語  ".into());
+            let draft = app.agent.draft_snapshot();
+            app.select_node_draft(2); app.controller.set_draft_name("Owned restart unapplied draft".into());
+            let before = app.controller.snapshot().clone();
+            let settings = app.tools.store.clone();
+            let reply = request_agent_new_session(&mut app);
+            finish_agent_new_session(&mut app);
+            if app.agent.owner() != Some(old_owner) || instances().len() != 1 { return Err("restart executed before reply delivery".into()); }
+            let mut bytes = Vec::new(); reply.write_line(&mut bytes).map_err(|e|e.to_string())?;
+            let response:Value = serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+            if response["result"]["structuredContent"]["codingAgentNewSession"]["state"] != "admitted" {
+                return Err("owned restart admission was not produced".into());
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if app.agent.state().ready && app.agent.owner() != Some(old_owner) && instances().len() == 2 { break; }
+                if Instant::now() >= deadline { return Err("owned replacement did not initialize exactly once".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let replacement = instances().into_iter().find(|path| path != &old_instance).ok_or("replacement instance absent")?;
+            if protocol(&replacement)? != counts { return Err("replacement received more than initialization".into()); }
+            if app.agent.mcp_token_for_test() == Some(old_token.as_str()) { return Err("replacement endpoint reused its credential".into()); }
+            if app.agent.mcp_url() != Some(old_url.as_str()) {
+                let address = old_url.strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+                if std::net::TcpStream::connect(address).is_ok() { return Err("released endpoint still accepts connections".into()); }
+            }
+            for _ in 0..5 { harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame)); }
+            if instances().len() != 2 || protocol(&replacement)? != counts { return Err("restart or Send repeated on later frames".into()); }
+            if app.agent.draft_snapshot() != draft || app.agent.prompt_text_for_test() != "  preserved unsent 日本語  "
+                || app.controller.snapshot() != &before || app.tools.store != settings {
+                return Err("owned restart changed unsent identity, document or settings".into());
+            }
+            if !matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Owned restart unapplied draft") {
+                return Err("owned restart discarded the document draft".into());
+            }
+            let observed = state(&mut app);
+            if observed["codingAgentNewSession"] != json!({"state":"initialization_requested", "attempt":1,
+                "stop":"stopped", "approval_reply_failed":false}) { return Err("owned restart outcome differs".into()); }
+            if observed.to_string().contains(&old_token) { return Err("owned endpoint credential escaped into state".into()); }
+            Ok(())
+        })();
+        app.agent.stop();
+        assert!(!app.agent.state().has_client);
+        assert!(result.is_ok(), "{result:?}");
+        std::fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn coding_agent_new_session_original_authenticated_review_survives_duplicates_and_unsaved_work() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-new-session-original"); app.tools.store.set("Outline.visible", false).unwrap();
+        let (mut peer, token) = draft_peer(&mut app);
+        app.tools.store.set("MCP.Headers", "owned-private-malformed-config".to_owned()).unwrap();
+        app.agent.set_prompt_for_test("retained human message".into());
+        let draft = app.agent.draft_snapshot();
+        let request = new_session_message();
+        let original = draft_http(&app, &token, &request);
+        let duplicate = draft_http(&app, &token, &request);
+        serve_agent_requests(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "awaiting_human");
+        assert_eq!(lifecycle_http_result(duplicate, "new-session-admission")["isError"], true);
+        assert!(app.agent.state().has_client && app.agent.state().turn_active);
+        assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":"Owned edit during restart review"}))["succeeded"], true);
+        app.select_node_draft(2); app.controller.set_draft_name("Unapplied restart review draft".into());
+        let before = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        let late = draft_http(&app, &token, &request);
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(lifecycle_http_result(original, "new-session-admission")["structuredContent"]["codingAgentNewSession"]["state"], "admitted");
+        assert_eq!(lifecycle_http_result(late, "new-session-admission")["isError"], true);
+        finish_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"], json!({"state":"start_failed", "attempt":1,
+            "stop":"stopped", "approval_reply_failed":false}));
+        assert_eq!(app.agent.draft_snapshot(), draft);
+        assert_eq!(app.controller.snapshot(), &before);
+        assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Unapplied restart review draft"));
+        assert!(!state(&mut app).to_string().contains("owned-private-malformed-config"));
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_new_session_denied_expired_changed_or_closed_review_never_releases() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["denied", "expired", "configuration", "closing"] {
+            let mut app = app(&format!("coding-agent-new-session-review-{case}"));
+            let (mut peer, token) = draft_peer(&mut app);
+            let original = draft_http(&app, &token, &new_session_message());
+            serve_agent_requests(&mut app);
+            let owner = app.agent.owner();
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "awaiting_human");
+            match case {
+                "denied" => {
+                    let path = app.tools.store_path.clone();
+                    Harness::new().click(Role::Button, "Deny changes this turn", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+                }
+                "expired" => app.agent.expire_host_approval_for_test(),
+                "configuration" => app.tools.store.set("MCP.Headers", "owned changed review config".to_owned()).unwrap(),
+                _ => app.begin_closing(),
+            }
+            finish_agent_new_session(&mut app);
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(original, "new-session-admission")["isError"], true);
+            assert_eq!(app.agent.owner(), owner);
+            assert!(app.agent.state().has_client && app.agent.state().turn_active);
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], match case {
+                "closing" => "editor_closing", "configuration" => "configuration_changed", _ => "consent_invalid",
+            });
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_preserves_owner_observed_completion_and_reader_permission_cutoffs() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["decoded_completion", "observed_completion", "new_prompt", "permission", "cancel", "disconnect"] {
+            let mut app = app(&format!("coding-agent-new-session-cutoff-{case}"));
+            let (mut peer, token) = draft_peer(&mut app);
+            let original = draft_http(&app, &token, &new_session_message());
+            serve_agent_requests(&mut app);
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(original, "new-session-admission")["structuredContent"]["codingAgentNewSession"]["state"], "admitted");
+            match case {
+                "permission" => peer.enqueue(lifecycle_permission()),
+                "cancel" => { app.agent.cancel(); },
+                "disconnect" => {
+                    peer.frames.take();
+                    let RemoteAgentNewSession::Waiting { target, .. } = &app.agent_new_session else { panic!() };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.agent.new_session_status(target, &app.tools.store, true).is_ok() {
+                        assert!(Instant::now() < deadline); std::thread::yield_now();
+                    }
+                }
+                _ => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    if case != "decoded_completion" { app.agent.pump(); }
+                    if case == "new_prompt" { app.agent.set_prompt_for_test("Fresh owned fixture turn".into()); app.agent.send(); }
+                }
+            }
+            if case == "decoded_completion" {
+                let mut frame = eframe::Frame::_new_kittest();
+                Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "start_failed");
+                assert!(!app.agent.state().has_client);
+            } else {
+                finish_agent_new_session(&mut app);
+                assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "consent_invalid");
+                assert!(app.agent.state().has_client);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_external_admission_matches_every_native_retained_lifecycle_state() {
+        for case in ["initializing", "ready", "queued", "running", "cancelling", "permission", "closed"] {
+            let mut app = app(&format!("coding-agent-new-session-state-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            if matches!(case, "running" | "cancelling" | "permission" | "closed") { lifecycle_prompt(&mut app, &peer); }
+            else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued fixture".into()); app.agent.send(); }
+            if case == "cancelling" { app.agent.cancel(); }
+            if case == "permission" { peer.enqueue(lifecycle_permission()); app.agent.pump(); assert!(app.agent.permission().is_some()); }
+            if case == "closed" {
+                peer.frames.take();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.agent.state().closed { assert!(Instant::now() < deadline); app.agent.pump(); std::thread::yield_now(); }
+            }
+            app.agent.set_prompt_for_test("Retained through native New session".into());
+            let draft = app.agent.draft_snapshot();
+            request_agent_new_session(&mut app).write_line(&mut Vec::new()).unwrap();
+            finish_agent_new_session(&mut app);
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "start_failed", "{case}");
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["stop"], "stopped");
+            assert_eq!(app.agent.draft_snapshot(), draft);
+            assert_eq!(app.agent.prompt_text_for_test(), "Retained through native New session");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_follows_stop_set_and_preserves_only_external_pending_drafts() {
+        use crate::editor_test_support::Harness;
+        for case in ["stop", "disable", "noop-set", "external-draft"] {
+            let mut app = app(&format!("coding-agent-new-session-order-{case}"));
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None); lifecycle_prompt(&mut app, &peer);
+            request_agent_new_session(&mut app).write_line(&mut Vec::new()).unwrap();
+            match case {
+                "stop" => request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap(),
+                "disable" => request_agent_set(&mut app, false).write_line(&mut Vec::new()).unwrap(),
+                "noop-set" => request_agent_set(&mut app, true).write_line(&mut Vec::new()).unwrap(),
+                _ => request_agent_draft(&mut app, "External draft survives restart").write_line(&mut Vec::new()).unwrap(),
+            }
+            let mut frame = eframe::Frame::_new_kittest();
+            Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], match case {
+                "stop" => "stale_target", "disable" => "disabled", _ => "start_failed",
+            });
+            if case == "external-draft" {
+                assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "applied");
+                assert_eq!(app.agent.prompt_text_for_test(), "External draft survives restart");
+            }
+            peer.finish(&mut app);
+        }
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-new-session-old-acp-draft");
+        let (mut peer, token) = draft_peer(&mut app);
+        app.agent.set_prompt_for_test("Original draft".into());
+        let request = draft_message(&app, "Old ACP draft must not follow restart");
+        let original = draft_http(&app, &token, &request); serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], false);
+        request_agent_new_session(&mut app).write_line(&mut Vec::new()).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "consent_invalid");
+        assert_eq!(app.agent.prompt_text_for_test(), "Original draft");
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_new_session_request_cancels_an_older_pending_quit_without_closing() {
+        let mut app = app("coding-agent-new-session-earlier-quit"); app.agent.set_enabled(true);
+        let quit = request_quit(&mut app);
+        assert_eq!(state(&mut app)["quit"]["state"], "waiting_for_reply");
+        let restart = request_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["quit"]["state"], "cancelled");
+        quit.write_line(&mut Vec::new()).unwrap();
+        drop(restart); finish_agent_new_session(&mut app);
+        CTX.with(|ctx| app.finish_remote_quit(ctx));
+        assert!(!app.closing && !app.agent.state().has_client);
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "reply_lost");
+    }
+
+    #[test]
+    fn coding_agent_new_session_ordinary_http_delivers_admission_before_release() {
+        use std::io::Write;
+        let mut app = app("coding-agent-new-session-http");
+        let mut peer = LifecyclePeer::attach(&mut app, None); lifecycle_prompt(&mut app, &peer);
+        let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
+        let token = "owned-new-session-http-token";
+        let server = mcp_listener::McpServer::start(&settings, Some(token.into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap(); stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = new_session_message().to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server); CTX.with(|ctx| app.serve_mcp(ctx));
+        assert_eq!(lifecycle_http_result(stream, "new-session-admission")["structuredContent"]["codingAgentNewSession"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        finish_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "start_failed");
+        assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_new_session_stdio_worker_flushes_admission_before_release() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct Output(Arc<Mutex<Vec<u8>>>, std::sync::mpsc::SyncSender<()>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { self.1.send(()).unwrap(); Ok(()) }
+        }
+        let mut app = app("coding-agent-new-session-stdio");
+        let mut peer = LifecyclePeer::attach(&mut app, None); lifecycle_prompt(&mut app, &peer);
+        let (input, mut writer) = std::io::pipe().unwrap();
+        let (host, receive) = std::sync::mpsc::sync_channel(1);
+        let (flushed, flush) = std::sync::mpsc::sync_channel(1);
+        let bytes = Arc::new(Mutex::new(Vec::new())); let output = Output(bytes.clone(), flushed);
+        let worker = std::thread::spawn(move || crate::editor_stdio::serve_lines(
+            std::io::BufReader::new(input), output, &host, &egui::Context::default()));
+        app.host_rx = Some(receive); writeln!(writer, "{}", new_session_message()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.agent_new_session, RemoteAgentNewSession::Waiting { .. }) {
+            assert!(Instant::now() < deadline); CTX.with(|ctx| app.drain_host(ctx)); std::thread::yield_now();
+        }
+        flush.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response:Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "new-session-admission");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentNewSession"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        while !matches!(app.agent_new_session, RemoteAgentNewSession::Finished { .. }) {
+            assert!(Instant::now() < deadline); finish_agent_new_session(&mut app); std::thread::yield_now();
+        }
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "start_failed");
+        assert!(!app.agent.state().has_client);
+        drop(writer); worker.join().unwrap(); peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_new_session_reader_permission_in_a_decoded_batch_survives_full_queue_backpressure() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-new-session-backpressure");
+        let (mut peer, token) = draft_peer(&mut app);
+        let original = draft_http(&app, &token, &new_session_message()); serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(original, "new-session-admission")["isError"], false);
+        for _ in 0..soul2d_core::acp::EVENT_QUEUE_LEN { peer.enqueue(json!({})); }
+        let mut batch = b"{}\n".to_vec(); batch.extend_from_slice(format!("{}\n", lifecycle_permission()).as_bytes());
+        assert!(batch.len() < 4096, "both frames must fit in the reader's single decoded chunk");
+        peer.frames.as_ref().unwrap().send(batch).unwrap();
+        let RemoteAgentNewSession::Waiting { target, .. } = &app.agent_new_session else { panic!() };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.agent.new_session_status(target, &app.tools.store, true).is_ok() {
+            assert!(Instant::now() < deadline); std::thread::yield_now();
+        }
+        assert!(app.agent.permission().is_none());
+        finish_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "consent_invalid");
+        assert!(app.agent.state().has_client && app.agent.state().turn_active);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_new_session_preserves_actual_inx_cmo3_can3_history_drafts_settings_and_dialogs() {
+        for format in ["inx", "live2d.cmo3", "live2d.can3"] {
+            let mut app = match format {
+                "live2d.cmo3" => runtime_export_app("coding-agent-new-session-cmo3", false),
+                "live2d.can3" => can3_scene_app("coding-agent-new-session-can3"),
+                _ => app("coding-agent-new-session-inx"),
+            };
+            let mut models = vec![app.controller.snapshot()["model"].clone()];
+            for name in ["First", "Second"] {
+                let revision = app.controller.snapshot()["revision"].clone();
+                let edit = match format {
+                    "inx" => json!({"op":"node.rename", "id":2, "name":name}),
+                    "live2d.cmo3" => json!({"op":"live2d.rename", "guid":"parameter-guid", "name":name, "expectedRevision":revision}),
+                    _ => json!({"op":"live2d.animation.scene.set", "sceneGuid":"scene-guid", "name":name, "expectedRevision":revision}),
+                };
+                assert_eq!(app.controller.core_request(&edit)["succeeded"], true);
+                models.push(app.controller.snapshot()["model"].clone());
+            }
+            assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+            if format == "inx" { app.select_node_draft(2); app.controller.set_draft_name("Retained restart draft".into()); }
+            app.unsaved = Some(unsaved_dialog()); app.tools.prompt = Some(restore_prompt());
+            let dialog = app.unsaved.as_ref().unwrap().dialog.clone(); let restore = app.tools.prompt.clone();
+            let settings_path = app.tools.store_path.clone().unwrap();
+            std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+            std::fs::write(&settings_path, b"{\"DarkMode\":true}").unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None); lifecycle_prompt(&mut app, &peer);
+            let private = "owned-private-restart-sentinel";
+            app.agent.set_prompt_for_test(private.into()); app.agent.set_briefing(Some(private.into()));
+            app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
+            app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
+            let draft = app.agent.draft_snapshot(); let _ = state(&mut app);
+            let before = app.controller.snapshot().clone();
+            let project = app.controller.project_path().unwrap().to_owned(); let bytes_before = std::fs::read(&project).unwrap();
+            let mut reply = Vec::new(); request_agent_new_session(&mut app).write_line(&mut reply).unwrap();
+            assert!(!String::from_utf8(reply).unwrap().contains(private)); finish_agent_new_session(&mut app);
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentNewSession"]["state"], "start_failed");
+            assert_eq!(observed["codingAgentNewSession"]["stop"], "stopped");
+            assert!(!observed.to_string().contains(private));
+            assert_eq!(app.controller.snapshot(), &before); assert_eq!(app.agent.draft_snapshot(), draft);
+            assert_eq!(app.agent.prompt_text_for_test(), private);
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog); assert_eq!(app.tools.prompt, restore);
+            assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
+            assert_eq!(std::fs::read(project).unwrap(), bytes_before);
+            if format == "inx" {
+                assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Retained restart draft"));
+                app.controller.discard_draft();
+            }
+            for (op, model) in [("redo", &models[2]), ("undo", &models[1]), ("undo", &models[0])] {
+                assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"], true);
+                assert_eq!(&app.controller.snapshot()["model"], model);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_owned_acp_self_restart_requires_human_and_never_sends_the_preserved_draft() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-new-session-owned-self");
+        let run_dir = configure_owned_new_session_fixture(&mut app, "coding-agent-new-session-owned-self-peer");
+        app.agent.start(&app.tools.store);
+        let mut harness = Harness::new(); let mut frame = eframe::Frame::_new_kittest();
+        let instances = || -> Vec<PathBuf> {
+            std::fs::read_dir(run_dir.join("instances")).ok().into_iter().flatten()
+                .filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.is_dir()).collect()
+        };
+        let result = (|| -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !app.agent.state().ready {
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if Instant::now() >= deadline { return Err("owned self-restart fixture did not initialize".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let old = app.agent.owner();
+            app.agent.set_prompt_for_test("Deterministic owned self-restart fixture".into()); app.agent.send();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let instance = loop {
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if let Some(path) = instances().into_iter().find(|path| path.join("prompt-ready.json").exists()) { break path; }
+                if Instant::now() >= deadline { return Err("owned initiating prompt was not transmitted".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            app.agent.set_prompt_for_test("Unsent self-restart draft".into()); let draft = app.agent.draft_snapshot();
+            let before = app.controller.snapshot().clone();
+            std::fs::write(instance.join("commands/001.tmp"), json!({"request":new_session_message()}).to_string()).map_err(|e|e.to_string())?;
+            std::fs::rename(instance.join("commands/001.tmp"), instance.join("commands/001.json")).map_err(|e|e.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let output = harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if crate::editor_test_support::has(&output, Role::Label, "Tool: editor_coding_agent_new_session") { break; }
+                if Instant::now() >= deadline { return Err("owned original call did not reach human review".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if app.agent.owner() != old || instances().len() != 1 { return Err("owned self-restart ran before human consent".into()); }
+            let path = app.tools.store_path.clone();
+            harness.click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                if app.agent.state().ready && app.agent.owner() != old && instances().len() == 2 { break; }
+                if Instant::now() >= deadline { return Err("owned self-restart replacement was not initialized".into()); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let replacement = instances().into_iter().find(|path| path != &instance).ok_or("owned replacement absent")?;
+            for _ in 0..5 { harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame)); }
+            let protocol:Value = serde_json::from_str(&std::fs::read_to_string(replacement.join("protocol.json")).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            if protocol != json!({"initialize":1, "session/new":0, "session/prompt":0, "session/cancel":0}) || instances().len() != 2 {
+                return Err("owned replacement sent a prompt/session or restarted again".into());
+            }
+            if app.agent.draft_snapshot() != draft || app.agent.prompt_text_for_test() != "Unsent self-restart draft"
+                || app.controller.snapshot() != &before { return Err("owned self-restart changed authored or unsent work".into()); }
+            let observed = state(&mut app);
+            if observed["codingAgentNewSession"] != json!({"state":"initialization_requested", "attempt":1,
+                "stop":"stopped", "approval_reply_failed":false}) { return Err("owned self-restart did not execute once after reply".into()); }
+            Ok(())
+        })();
+        app.agent.stop(); assert!(!app.agent.state().has_client);
+        assert!(result.is_ok(), "{result:?}"); std::fs::remove_dir_all(run_dir).unwrap();
     }
 
     fn draft_message(app: &EditorApp, text: &str) -> Value {

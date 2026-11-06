@@ -133,6 +133,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_coding_agent_cancel", &[
         "Coding agent > Cancel",
     ]),
+    ("editor_coding_agent_new_session", &[
+        "Coding agent > New session",
+    ]),
     ("editor_coding_agent_prompt_set", &[
         "Coding agent > User message",
     ]),

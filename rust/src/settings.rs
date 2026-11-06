@@ -320,6 +320,10 @@ impl Settings {
         self.values.contains_key(name)
     }
 
+    pub fn raw(&self, name: &str) -> Option<&Value> {
+        self.values.get(name)
+    }
+
     /// Value or `T::default()` when absent. A present value of the wrong type is an error (D throws).
     pub fn get<T: SettingValue>(&self, name: &str) -> Result<T, String> {
         self.get_or(name, T::default())

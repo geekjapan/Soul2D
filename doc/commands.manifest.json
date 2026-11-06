@@ -11879,6 +11879,25 @@
       ]
     },
     {
+      "description": "Action: admit native New session after identified local reply delivery and matching owner, opt-in and launch configuration. Stops the old owned process before resolving configuration and launching its replacement; active turns can be interrupted. Successful shutdown discards the old conversation even if replacement fails. Failed shutdown retains the closed old owner without its endpoint and prevents launch. The replacement receives initialize only, not session/new or a prompt. ACP self-restart requires original-call human Allow once; new permissions or disconnection invalidate consent. Read codingAgentNewSession and match attempt: admission, initialization requested and initialization accepted are distinct. Reports shutdown, launch and initialize-write failures separately. Preserves unsent text/identity, document, drafts and settings. Requires the enabled panel; no automatic enable, Send, permission grant, settings save or retry. Failed, lost or expired reply delivery never executes. Headless, notifications and internal calls refuse.",
+      "effect": "application-lifecycle",
+      "guiEntry": [
+        "Coding agent > New session"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_new_session",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: replace or clear only the unsent User message field, preserving exact text. Read codingAgentDraft.identity and supply it as expectedDraftIdentity. An identified successful local reply and matching draft/opt-in identity precede one edit; admission is not execution. Read codingAgentDraftEdit and match attempt. Every authenticated ACP request requires original-call human Allow once, including identical text and empty seeding. No Send, launch, enable, permission grant, settings save or document edit. Private text is never returned. Native edits, failed/lost/expired delivery or invalid consent prevent execution; never retry automatically. The panel must be enabled; active-turn editing preserves the reader, conversation and permissions. Headless, internal calls and notifications refuse.",
       "effect": "editor-state",
       "guiEntry": [

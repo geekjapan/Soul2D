@@ -395,6 +395,7 @@ pub(crate) enum ApprovalTarget {
     Quit(AcpInvocation),
     Stop(StopTarget),
     CodingAgentSet(AgentSetTarget),
+    CodingAgentNewSession(NewSessionReviewTarget),
     CodingAgentDraft(DraftReviewTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
@@ -448,7 +449,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.prompt.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
+        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
             || matches!(call["op"].as_str(), Some("automesh.preset.save" | "automesh.preset.delete" | "physics.preset.save" |
@@ -494,6 +495,12 @@ impl HostApproval {
             text:request.call["text"].as_str()?.to_owned() })
     }
 
+    pub(crate) fn new_session_review(&self) -> Option<NewSessionReviewTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        match &request.target { ApprovalTarget::CodingAgentNewSession(target) => Some(target.clone()), _ => None }
+    }
+
     fn redact_finished_draft(&mut self) {
         if let Some(request) = &mut self.request {
             if matches!(request.target, ApprovalTarget::CodingAgentDraft(_))
@@ -536,7 +543,7 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentDraft(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentNewSession(_) | ApprovalTarget::CodingAgentDraft(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
@@ -633,6 +640,12 @@ impl HostApproval {
                     ui.label("After this original reply is delivered locally, Soul2D stops the agent without waiting for a successful turn. Shutdown may kill and reap the owned child and discard its conversation.");
                     ui.label("The checkbox becomes disabled even if shutdown fails and retains the closed client. Its endpoint is removed; no automatic retry. Enabling later does not launch or retry it.");
                     ui.label("Unsent text, document, drafts, undo and settings are preserved. New permissions, disconnection or an owner-observed prompt change invalidate consent before intake is sealed.");
+                },
+                ApprovalTarget::CodingAgentNewSession(_) => {
+                    ui.label("Target: restart the configured coding agent, preserving the unsent User message");
+                    ui.label("Allow this original request once. After local reply delivery, Soul2D stops the old agent, possibly killing and reaping it, discards its conversation, and launches the configured replacement without waiting for a successful turn.");
+                    ui.label("Shutdown failure retains the closed old owner and prevents launch. After successful shutdown, configuration or launch failure can leave no replacement. Initialization failure can retain the new owner. No automatic retry.");
+                    ui.label("Only initialization is requested: this does not Send, create an ACP session, grant permissions or save settings. New permissions, disconnection, or a changed owner or configuration invalidate consent before execution.");
                 },
                 ApprovalTarget::CodingAgentDraft(_) => {
                     ui.label("Target: the unsent User message field only");
@@ -806,6 +819,20 @@ pub(crate) enum StopRefusal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentRestartPhase {
+    Disabled,
+    ShutdownFailedRetained,
+    StartFailed,
+    InitializeWriteFailedRetained,
+    InitializationRequested,
+}
+
+pub(crate) struct AgentRestartResult {
+    pub(crate) phase: AgentRestartPhase,
+    pub(crate) stop: Option<StopResult>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AgentSetSnapshot {
     enabled: bool,
     epoch: u64,
@@ -821,6 +848,18 @@ pub(crate) struct AgentSetTarget {
 }
 
 impl AgentSetSnapshot {
+    pub(crate) fn new_session_target(self, settings: &Settings, approval: Option<&HostApproval>) -> Result<NewSessionTarget, String> {
+        if !self.enabled { return Err("Enable the coding-agent panel before requesting New session".into()); }
+        if self.next_run == u64::MAX { return Err("Coding-agent run identity unavailable".into()); }
+        let invocation = match approval {
+            Some(approval) => Some(approval.invocation.clone().filter(|call| approval.active && call.permissions != u64::MAX
+                && self.owner.is_some_and(|owner| owner.run == call.run))
+                .ok_or("ACP New session needs its original authenticated transmitted uncancelled prompt")?),
+            None => None,
+        };
+        Ok(NewSessionTarget { before:self, config:LaunchConfigSnapshot::capture(settings), invocation })
+    }
+
     pub(crate) fn target(self, enabled: bool, approval: Option<&HostApproval>) -> Result<AgentSetTarget, String> {
         let stop = if self.enabled && !enabled {
             self.owner.map(|owner| match approval {
@@ -841,6 +880,41 @@ pub(crate) enum AgentSetResult {
     Enabled,
     Disabled { stop: Option<StopResult> },
 }
+
+const LAUNCH_CONFIG_KEYS: [&str; 5] = ["ACP.Command", "ACP.Workdir", "ACP.Workingdir", "MCP.Name", "MCP.Headers"];
+
+#[derive(Clone, PartialEq)]
+struct LaunchConfigSnapshot([Option<Value>; 5]);
+
+impl LaunchConfigSnapshot {
+    fn capture(settings: &Settings) -> Self { Self(LAUNCH_CONFIG_KEYS.map(|key| settings.raw(key).cloned())) }
+    fn matches(&self, settings: &Settings) -> bool {
+        self.0.iter().zip(LAUNCH_CONFIG_KEYS).all(|(value, key)| value.as_ref() == settings.raw(key))
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct NewSessionTarget {
+    before: AgentSetSnapshot,
+    config: LaunchConfigSnapshot,
+    invocation: Option<AcpInvocation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NewSessionReviewTarget {
+    before: AgentSetSnapshot,
+    invocation: AcpInvocation,
+}
+
+impl NewSessionTarget {
+    pub(crate) fn invocation(&self) -> Option<&AcpInvocation> { self.invocation.as_ref() }
+    pub(crate) fn review(&self) -> Option<NewSessionReviewTarget> {
+        Some(NewSessionReviewTarget { before:self.before, invocation:self.invocation.clone()? })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewSessionRefusal { Disabled, IdentityUnavailable, StaleTarget, ConfigurationChanged, ConsentInvalid }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DraftSnapshot {
@@ -945,11 +1019,19 @@ impl<W: Write> AgentPanel<W> {
     }
 
     /// Bind the MCP endpoint, launch the agent from `ACP.Command` / `ACP.Workdir`, and send `initialize`.
-    /// Does nothing while the panel is disabled.
-    pub fn start(&mut self, settings: &Settings) {
-        self.stop();
-        if !self.enabled || self.run.is_some() {
-            return;
+    /// Does not launch while the panel is disabled.
+    pub(crate) fn start(&mut self, settings: &Settings) -> AgentRestartResult {
+        self.start_with(settings, Client::shutdown)
+    }
+
+    fn start_with(&mut self, settings: &Settings,
+        shutdown: impl FnOnce(&mut Client<W>) -> Result<Option<std::process::ExitStatus>, String>) -> AgentRestartResult {
+        let stop = self.stop_with(shutdown);
+        if self.run.is_some() {
+            return AgentRestartResult { phase:AgentRestartPhase::ShutdownFailedRetained, stop };
+        }
+        if !self.enabled {
+            return AgentRestartResult { phase:AgentRestartPhase::Disabled, stop };
         }
         let launched = (|| {
             let spec = LaunchSpec::from_settings(settings)?;
@@ -958,35 +1040,42 @@ impl<W: Write> AgentPanel<W> {
             let client = (self.launch)(&spec)?;
             Ok::<_, String>((client, mcp, endpoint))
         })();
-        match launched {
-            Ok((client, mcp, endpoint)) => self.attach(client, Some(mcp), Some(endpoint)),
-            Err(error) => self.fail("Start failed", error),
-        }
+        let phase = match launched {
+            Ok((client, mcp, endpoint)) => {
+                if self.attach(client, Some(mcp), Some(endpoint)) { AgentRestartPhase::InitializationRequested }
+                else if self.run.is_some() { AgentRestartPhase::InitializeWriteFailedRetained }
+                else { AgentRestartPhase::StartFailed }
+            }
+            Err(error) => { self.fail("Start failed", error); AgentRestartPhase::StartFailed }
+        };
+        AgentRestartResult { phase, stop }
     }
 
     /// Restart the agent with an empty conversation.
-    pub fn new_session(&mut self, settings: &Settings) {
-        self.start(settings);
+    pub(crate) fn new_session(&mut self, settings: &Settings) -> AgentRestartResult {
+        self.start(settings)
     }
 
     /// Take over a connected client (the real launch path and the tests both end here) and initialize it.
-    pub fn attach(&mut self, mut client: Client<W>, mcp: Option<McpHttp>, endpoint: Option<McpEndpoint>) {
+    /// Returns whether initialize was written; a failed write still retains the client.
+    pub fn attach(&mut self, mut client: Client<W>, mcp: Option<McpHttp>, endpoint: Option<McpEndpoint>) -> bool {
         self.stop();
-        if self.run.is_some() { return; }
+        if self.run.is_some() { return false; }
         let Some(next) = self.next_run.checked_add(1) else {
             self.fail("Start failed", "ACP run identity exhausted".into());
-            return;
+            return false;
         };
         let id = self.next_run;
         self.next_run = next;
         client.set_mcp_http(mcp);
         self.error = None;
-        match client.initialize() {
-            Ok(()) => self.status = "Initializing...".to_string(),
-            Err(error) => self.fail("Initialize failed", error),
-        }
+        let initialized = match client.initialize() {
+            Ok(()) => { self.status = "Initializing...".to_string(); true }
+            Err(error) => { self.fail("Initialize failed", error); false }
+        };
         self.run = Some(Run { id, stop_epoch: 0, client, endpoint, briefed: false, closed: false,
             host_approval: HostApproval::default(), pending_reply: None, next_call: 0 });
+        initialized
     }
 
     #[cfg(test)]
@@ -1042,6 +1131,56 @@ impl<W: Write> AgentPanel<W> {
         self.set_status(target, true)?;
         if let Some(stop) = &target.stop { self.seal_stop(stop)?; }
         Ok(self.set_enabled_with(target.enabled, Client::shutdown))
+    }
+
+    pub(crate) fn new_session_status(&self, target: &NewSessionTarget, settings: &Settings, admitted: bool) -> Result<(), NewSessionRefusal> {
+        if !self.enabled { return Err(NewSessionRefusal::Disabled); }
+        let current = self.set_snapshot().map_err(|_| NewSessionRefusal::IdentityUnavailable)?;
+        if current.next_run == u64::MAX { return Err(NewSessionRefusal::IdentityUnavailable); }
+        if current != target.before { return Err(NewSessionRefusal::StaleTarget); }
+        if !target.config.matches(settings) { return Err(NewSessionRefusal::ConfigurationChanged); }
+        if let Some(invocation) = &target.invocation {
+            let run = self.run.as_ref().ok_or(NewSessionRefusal::ConsentInvalid)?;
+            if run.id != invocation.run || run.closed || run.client.active_prompt() != Some(invocation.prompt)
+                || invocation.permissions == u64::MAX || run.client.permission_epoch() != invocation.permissions {
+                return Err(NewSessionRefusal::ConsentInvalid);
+            }
+            if !admitted && (run.host_approval.new_session_review() != target.review()
+                || run.host_approval.request.as_ref().is_none_or(|request| request.created.elapsed() >= HOST_APPROVAL_TIMEOUT)) {
+                return Err(NewSessionRefusal::ConsentInvalid);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_new_session_review(&mut self, target: &NewSessionReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if let Some(request) = &mut run.host_approval.request {
+                if matches!(&request.target, ApprovalTarget::CodingAgentNewSession(review) if review == target)
+                    && !matches!(request.decision, ApprovalDecision::Denied) {
+                    request.decision = ApprovalDecision::Stale;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn close_new_session_review(&mut self, target: &NewSessionReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if run.host_approval.request.as_ref().is_some_and(|request|
+                matches!(&request.target, ApprovalTarget::CodingAgentNewSession(review) if review == target)) {
+                run.clear_approval("The editor is closing; the coding agent was not restarted");
+            }
+        }
+    }
+
+    pub(crate) fn new_session_if_current(&mut self, target: &NewSessionTarget, settings: &Settings) -> Result<AgentRestartResult, NewSessionRefusal> {
+        self.new_session_status(target, settings, true)?;
+        if let Some(invocation) = &target.invocation {
+            if !self.run.as_mut().unwrap().client.seal_permission_intake(invocation.permissions) {
+                return Err(NewSessionRefusal::ConsentInvalid);
+            }
+        }
+        Ok(self.new_session(settings))
     }
 
     pub(crate) fn draft_snapshot(&self) -> DraftSnapshot {
@@ -1135,6 +1274,11 @@ impl<W: Write> AgentPanel<W> {
     /// The URL offered to the running agent (the token is never exposed).
     pub fn mcp_url(&self) -> Option<&str> {
         self.run.as_ref()?.endpoint.as_ref().map(McpEndpoint::url)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mcp_token_for_test(&self) -> Option<&str> {
+        self.run.as_ref()?.endpoint.as_ref().map(McpEndpoint::token_for_test)
     }
 
     pub fn state(&self) -> PanelState {
@@ -2255,7 +2399,165 @@ mod tests {
         assert!(!panel.controls().send);
     }
 
-    // -------------------------------------------------------------------- opt-in and launch
+    #[test]
+    fn coding_agent_new_session_config_snapshot_keeps_raw_presence_types_and_ignores_unrelated_settings() {
+        let panel = no_launch_panel();
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        for key in LAUNCH_CONFIG_KEYS {
+            let changed = Settings::parse(serde_json::to_vec(&json!({key:Value::Null})).unwrap().as_slice()).unwrap();
+            assert_eq!(panel.new_session_status(&target, &changed, true), Err(NewSessionRefusal::ConfigurationChanged));
+        }
+        let mut unrelated = settings.clone();
+        unrelated.set("ViewportZoomSpeed", 9.0).unwrap();
+        assert_eq!(panel.new_session_status(&target, &unrelated, true), Ok(()));
+        let mut malformed = Settings::empty();
+        malformed.set("MCP.Headers", "owned malformed first".to_owned()).unwrap();
+        let target = panel.set_snapshot().unwrap().new_session_target(&malformed, None).unwrap();
+        malformed.set("MCP.Headers", "owned malformed second".to_owned()).unwrap();
+        assert_eq!(panel.new_session_status(&target, &malformed, true), Err(NewSessionRefusal::ConfigurationChanged));
+    }
+
+    #[test]
+    fn coding_agent_new_session_snapshot_stales_on_opt_in_and_ownerless_lifecycle_cycles() {
+        let mut panel = no_launch_panel();
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        panel.set_enabled(false);
+        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::Disabled));
+        panel.set_enabled(true);
+        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::StaleTarget));
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let (client, _agent) = connect();
+        panel.attach(client, None, None);
+        panel.stop();
+        assert!(panel.owner().is_none());
+        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::StaleTarget));
+    }
+
+    #[test]
+    fn coding_agent_new_session_identity_exhaustion_never_releases_an_existing_owner() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let owner = panel.owner();
+        panel.next_run = u64::MAX;
+        assert!(panel.set_snapshot().unwrap().new_session_target(&settings, None).is_err());
+        assert!(matches!(panel.new_session_if_current(&target, &settings), Err(NewSessionRefusal::IdentityUnavailable)));
+        assert_eq!(panel.owner(), owner);
+        assert!(!panel.state().closed);
+        assert!(panel.mcp_url().is_some());
+    }
+
+    #[test]
+    fn coding_agent_new_session_review_has_no_launch_values_and_tracks_original_consent() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let mut settings = Settings::empty();
+        settings.set("ACP.Command", "owned-private-command".to_owned()).unwrap();
+        settings.set("MCP.Headers", "owned-private-headers".to_owned()).unwrap();
+        let before = panel.set_snapshot().unwrap();
+        let run = panel.run.as_mut().unwrap();
+        let invocation = AcpInvocation { run:run.id, prompt:run.client.active_prompt().unwrap(), call:17,
+            permissions:run.client.permission_epoch() };
+        run.host_approval.set_active(true);
+        run.host_approval.invocation = Some(invocation.clone());
+        let target = before.new_session_target(&settings, Some(&run.host_approval)).unwrap();
+        assert_eq!(target.invocation(), Some(&invocation));
+        let review = target.review().unwrap();
+        let approval_target = ApprovalTarget::CodingAgentNewSession(review.clone());
+        let debug = format!("{approval_target:?}");
+        assert!(!debug.contains("owned-private"));
+        let call = json!({"op":"editor.coding_agent.new_session"});
+        assert!(run.host_approval.guard(&call, Ok(approval_target), None).unwrap_err().starts_with("Waiting for host approval"));
+        assert_eq!(panel.new_session_status(&target, &settings, false), Ok(()));
+        panel.run.as_mut().unwrap().host_approval.request.as_mut().unwrap().decision = ApprovalDecision::Denied;
+        panel.invalidate_new_session_review(&review);
+        assert_eq!(panel.new_session_status(&target, &settings, false), Err(NewSessionRefusal::ConsentInvalid));
+        assert!(matches!(panel.run.as_ref().unwrap().host_approval.request.as_ref().unwrap().decision, ApprovalDecision::Denied));
+        panel.close_new_session_review(&review);
+        assert!(panel.run.as_ref().unwrap().host_approval.request.is_none());
+    }
+
+    #[test]
+    fn coding_agent_new_session_distinguishes_initialize_write_from_handshake_and_write_failure() {
+        let mut settings = Settings::empty();
+        settings.set("ACP.Command", "owned-unused-launch-spec".to_owned()).unwrap();
+        let mut panel = AgentPanel::with_launcher(|_| {
+            let (mut reader, writer) = pipe().unwrap();
+            std::thread::spawn(move || { let _ = reader.read_to_end(&mut Vec::new()); });
+            Ok(Client::new(std::io::empty(), writer))
+        });
+        panel.set_enabled(true);
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::InitializationRequested);
+        assert!(result.stop.is_none());
+        assert!(panel.state().has_client && !panel.state().ready);
+        panel.stop();
+        let mut panel = AgentPanel::with_launcher(|_| {
+            let (reader, writer) = pipe().unwrap();
+            drop(reader);
+            Ok(Client::new(std::io::empty(), writer))
+        });
+        panel.set_enabled(true);
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::InitializeWriteFailedRetained);
+        assert!(panel.state().has_client && !panel.state().ready);
+        assert!(panel.error().is_some());
+    }
+
+    #[test]
+    fn coding_agent_new_session_reports_stop_before_invalid_configuration_and_preserves_unsent_identity() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.set_prompt_for_test("  unsent 日本語  ".into());
+        panel.set_briefing(Some("retained briefing".into()));
+        let draft = panel.draft_snapshot();
+        let opt_in = panel.opt_in_epoch;
+        let before = panel.next_run;
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::StartFailed);
+        assert!(matches!(result.stop, Some(StopResult::Stopped { .. })));
+        assert!(panel.run.is_none());
+        assert_eq!(panel.next_run, before);
+        assert_eq!(panel.draft_snapshot(), draft);
+        assert_eq!(panel.prompt_text_for_test(), "  unsent 日本語  ");
+        assert_eq!(panel.briefing.as_deref(), Some("retained briefing"));
+        assert_eq!(panel.opt_in_epoch, opt_in);
+        assert!(panel.is_enabled());
+        assert_eq!(panel.status(), "Start failed");
+    }
+
+    #[test]
+    fn coding_agent_new_session_shutdown_failure_retains_owner_and_never_resolves_or_launches() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let owner = panel.owner();
+        let before = panel.next_run;
+        let result = panel.start_with(&Settings::empty(), |_| Err("owned shutdown unconfirmed".into()));
+        assert_eq!(result.phase, AgentRestartPhase::ShutdownFailedRetained);
+        assert!(matches!(result.stop, Some(StopResult::FailedRetained { .. })));
+        assert_eq!(panel.owner(), owner);
+        assert_eq!(panel.next_run, before);
+        assert!(panel.state().closed);
+        assert!(panel.mcp_url().is_none());
+        assert_eq!(panel.status(), "Stop failed; client ownership retained");
+        assert_eq!(panel.error(), Some("owned shutdown unconfirmed"));
+    }
+
+    #[test]
+    fn coding_agent_new_session_reports_disabled_without_launch_and_enabled_ownerless_start_failure() {
+        let mut panel = no_launch_panel();
+        panel.set_enabled(false);
+        let result = panel.new_session(&Settings::empty());
+        assert_eq!(result.phase, AgentRestartPhase::Disabled);
+        assert!(result.stop.is_none() && panel.run.is_none());
+        panel.set_enabled(true);
+        let result = panel.new_session(&Settings::empty());
+        assert_eq!(result.phase, AgentRestartPhase::StartFailed);
+        assert!(result.stop.is_none() && panel.run.is_none());
+    }
 
     #[test]
     fn nothing_is_spawned_or_bound_until_the_user_enables_and_starts() {
