@@ -1075,7 +1075,11 @@ impl EditorView<'_> {
             "editor.about.set" => self.windows.set_about_open(call["open"].as_bool().unwrap()),
             "editor.welcome.set" => self.windows.set_welcome_open(call["open"].as_bool().unwrap(), &self.tools.store),
             "editor.command.browser.set" => self.windows.set_command_browser_open(call["open"].as_bool().unwrap()),
-            "editor.texture.viewer.set" => self.windows.set_texture_viewer_open(call["open"].as_bool().unwrap()),
+            "editor.texture.viewer.set" => self.windows.set_texture_viewer(
+                call["open"].as_bool().unwrap(),
+                call.get("slot").map(|slot| slot.as_u64().unwrap() as usize),
+                call.get("zoom").map(|zoom| zoom.as_f64().unwrap()),
+            ),
             "editor.address.dialog" => {
                 let operation = soul2d_core::window_shell::AddressDialogOperation::from_fields(
                     call["action"].as_str().unwrap_or_default(), call["target"].as_str(),
@@ -1427,6 +1431,7 @@ impl EditorView<'_> {
                 "welcome": self.windows.welcome_open(),
                 "commandBrowser": self.windows.command_browser_open(),
                 "textureViewer": self.windows.texture_viewer_open(),
+                "textureViewerState": self.windows.texture_viewer_state(),
                 "recoveryOffer": {"pending": !self.recovery_offer.is_empty(),
                     "drawEligible": self.recovery_offer_draw_eligible()},
                 // The dialogs that wait for the user's answer; while one is open, document-replacing calls are
@@ -20327,6 +20332,101 @@ mod editor_state_tests {
     }
 
     #[test]
+    fn texture_viewer_controls_roundtrip_and_refuse_atomically() {
+        let mut app = app("texture-viewer-controls");
+        let before = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone().unwrap();
+        let settings = std::fs::read(&path).ok();
+        let answer = call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":1,"zoom":2.75}));
+        assert_eq!(answer["windows"]["textureViewer"], true);
+        assert_eq!(answer["windows"]["textureViewerState"], json!({"slot":1,"zoom":2.75}));
+        assert_eq!(state(&mut app)["windows"], answer["windows"]);
+        for (arguments, expected) in [
+            (json!({"open":true,"slot":2}), json!({"slot":2,"zoom":2.75})),
+            (json!({"open":true,"zoom":1e300}), json!({"slot":2,"zoom":10.0})),
+            (json!({"open":true,"zoom":-1e300}), json!({"slot":2,"zoom":0.1})),
+        ] {
+            let answer = call(&mut app, "editor_texture_viewer_set", arguments);
+            assert_eq!(answer["windows"]["textureViewerState"], expected);
+            assert_eq!(state(&mut app)["windows"]["textureViewerState"], expected);
+        }
+        for open in [false, true] {
+            call(&mut app, "editor_texture_viewer_set", json!({"open":open}));
+            let unchanged = state(&mut app);
+            for arguments in [
+                json!({"open":true,"slot":-1}), json!({"open":true,"slot":3}),
+                json!({"open":true,"slot":1.0}), json!({"open":true,"slot":u64::MAX}),
+                json!({"open":true,"slot":"1"}), json!({"open":true,"slot":null}),
+                json!({"open":true,"zoom":null}), json!({"open":true,"zoom":"2"}),
+                json!({"open":true,"zoom":true}), json!({"open":true,"zoom":[]}),
+                json!({"open":true,"slot":1,"zoom":null}),
+                json!({"open":true,"slot":3,"zoom":2.0}),
+                json!({"open":false,"slot":1}), json!({"open":false,"zoom":2.0}),
+                json!({"open":false,"zoom":null}), json!({"slot":1}),
+                json!({"open":true,"slot":1,"extra":true}),
+            ] {
+                refused(&mut app, "editor_texture_viewer_set", arguments);
+                assert_eq!(state(&mut app)["windows"], unchanged["windows"]);
+                assert_eq!(app.controller.snapshot(), &before);
+                assert_eq!(std::fs::read(&path).ok(), settings);
+            }
+        }
+        call(&mut app, "editor_texture_viewer_set", json!({"open":false}));
+        assert_eq!(state(&mut app)["windows"].get("textureViewerState"), Some(&Value::Null));
+        let reopened = call(&mut app, "editor_texture_viewer_set", json!({"open":true}));
+        assert_eq!(reopened["windows"]["textureViewerState"], json!({"slot":0,"zoom":1.0}));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(path).ok(), settings);
+    }
+
+    #[test]
+    fn texture_viewer_native_controls_and_mcp_share_state() {
+        use crate::editor_test_support::{find, has, name_of, texts, Harness};
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+
+        fn draw(app: &mut EditorApp, ctx: &egui::Context) {
+            let mcp = app.mcp_status();
+            let requests = app.windows.show(ctx, crate::editor_windows::Host {
+                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
+                store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
+                shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
+                tr:&tr, mcp:&mcp,
+            });
+            for request in requests { app.apply_window_request(ctx, request); }
+        }
+
+        let mut app = app("texture-viewer-native-controls");
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        app.controller.select_nodes(&[2]).unwrap();
+        let before = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone().unwrap();
+        let settings = std::fs::read(&path).ok();
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true}));
+        let mut harness = Harness::new();
+        let out = harness.click(Role::Button, "Load textures", |ctx| draw(&mut app, ctx));
+        assert!(has(&out, Role::Slider, "Zoom"));
+        harness.click(Role::ComboBox, "Slot", |ctx| draw(&mut app, ctx));
+        let out = harness.click(Role::Button, "Bump (empty)", |ctx| draw(&mut app, ctx));
+        assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":2,"zoom":1.0}));
+        let target = out.iter().find(|(_, node)| node.role() == Role::Slider
+            && name_of(&out, node).as_deref() == Some("Zoom")).unwrap().0;
+        harness.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action:Action::SetValue, target, data:Some(ActionData::NumericValue(2.75)),
+        })], |ctx| draw(&mut app, ctx));
+        assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":2,"zoom":2.75}));
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":0,"zoom":3.5}));
+        let out = harness.frame(Vec::new(), |ctx| draw(&mut app, ctx));
+        assert!(has(&out, Role::ComboBox, "Slot"));
+        assert!(texts(&out).iter().any(|text| text == "1 x 1 px, texture slot 0"));
+        assert_eq!(find(&out, Role::Slider, "Zoom").unwrap().numeric_value(), Some(3.5));
+        assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":0,"zoom":3.5}));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(path).ok(), settings);
+    }
+
+    #[test]
     fn texture_viewer_visibility_preserves_work_and_validates_before_mutation() {
         use crate::editor_agent::HostApproval;
         use crate::editor_test_support::Harness;
@@ -20362,6 +20462,7 @@ mod editor_state_tests {
             assert_eq!(result["windows"]["textureViewer"], open);
             assert_eq!(state(&mut app)["windows"]["textureViewer"], open);
         }
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":2,"zoom":2.75}));
         let unchanged = state(&mut app);
         for arguments in [json!(null), json!([]), json!({}), json!({"open":null}), json!({"open":1}),
             json!({"open":"true"}), json!({"open":false,"extra":true})] {
@@ -20373,7 +20474,7 @@ mod editor_state_tests {
         assert_eq!(state(&mut app), unchanged);
         let mut approval = HostApproval::default();
         let mut message = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":"editor_texture_viewer_set","arguments":{"open":false}}});
+            "params":{"name":"editor_texture_viewer_set","arguments":{"open":true,"slot":1,"zoom":3.5}}});
         assert_eq!(agent_rpc(&mut app, &mut approval, &message).unwrap()["result"]["isError"], false);
         approval.set_active(true);
         let protected = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -20385,6 +20486,7 @@ mod editor_state_tests {
         let after = state(&mut app);
         let mut windows = initial["windows"].clone();
         windows["textureViewer"] = json!(true);
+        windows["textureViewerState"] = json!({"slot":1,"zoom":3.5});
         assert_eq!(after["windows"], windows);
         for key in ["guides", "viewport", "selection", "armed", "drafts", "camera", "panels"] {
             assert_eq!(after[key], initial[key], "{key}");
@@ -20432,6 +20534,8 @@ mod editor_state_tests {
                     crate::editor_windows::call_request("editor_texture_viewer_set", json!({"open":open}))));
                 assert_eq!(state(&mut app)["windows"]["textureViewer"], open, "{format}");
             }
+            call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":2,"zoom":2.75}));
+            assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":2,"zoom":2.75}));
             assert_eq!(app.controller.snapshot(), &before);
             assert_eq!(std::fs::read(path).ok(), settings);
             call(&mut app, "new", json!({}));
@@ -20443,6 +20547,7 @@ mod editor_state_tests {
                 app.apply_mcp();
                 assert_eq!(app.mcp_status().url.is_some(), enabled);
                 assert_eq!(state(&mut app)["windows"]["textureViewer"], true);
+                assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":2,"zoom":2.75}));
             }
         }
     }

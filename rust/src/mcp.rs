@@ -342,7 +342,22 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         "editor_about_set" => json!({"op":"editor.about.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
         "editor_welcome_set" => json!({"op":"editor.welcome.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
         "editor_command_browser_set" => json!({"op":"editor.command.browser.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
-        "editor_texture_viewer_set" => json!({"op":"editor.texture.viewer.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
+        "editor_texture_viewer_set" => {
+            let open = args["open"].as_bool().ok_or("open must be a boolean")?;
+            if !open && (args.contains_key("slot") || args.contains_key("zoom")) {
+                return Err("slot and zoom require open to be true".into());
+            }
+            let mut call = json!({"op":"editor.texture.viewer.set", "open":open});
+            if let Some(value) = args.get("slot") {
+                let slot = value.as_u64().filter(|slot| *slot <= 2)
+                    .ok_or("slot must be an integer from 0 to 2")?;
+                call["slot"] = json!(slot);
+            }
+            if args.contains_key("zoom") {
+                call["zoom"] = number_arg(args, "zoom")?;
+            }
+            call
+        }
         "editor_address_dialog" => {
             let action = args["action"].as_str().ok_or("action must be open, copy or close")?;
             let target = args.get("target").map(|value| value.as_str().ok_or("target must be a string")).transpose()?;
@@ -5472,12 +5487,19 @@ flip-pair partners. The clipboard is used up.",
              all document formats. No document, history or settings write; no ACP host approval is needed.",
             closed_schema(&[("open", json!({"type":"boolean"}))], &["open"])),
         tool("editor_texture_viewer_set", "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close \
-             button do. Read windows.textureViewer in the returned editor state. Repeated open preserves Slot, Zoom, \
+             button do. With open:true, optional slot selects position 0 Albedo, 1 Emissive or 2 Bump, not a texture ID, \
+             and optional zoom sets a finite display multiplier clamped to 0.1..10 before conversion to f32. \
+             Controls are refused with open:false. Read windows.textureViewer and windows.textureViewerState \
+             (null when closed, otherwise {slot,zoom}) in the returned editor state. Repeated open preserves omitted controls, \
              loaded images, loading and errors; close drops the viewer and reopening starts unloaded at Slot 0, Zoom 1. \
              Uses the existing selected-Part texture_get loading path. Retained across document replacement, layout \
              reset and listener restart; closed on process restart. Editor only, all document formats. No document, \
              history or settings write; no ACP host approval is needed.",
-            closed_schema(&[("open", json!({"type":"boolean"}))], &["open"])),
+            closed_schema(&[
+                ("open", json!({"type":"boolean"})),
+                ("slot", json!({"type":"integer", "enum":[0,1,2]})),
+                ("zoom", json!({"type":"number"})),
+            ], &["open"])),
         tool("editor_address_dialog", "Action: open, copy or close the editor's existing address dialog. Open requires \
              target: configuration, online_documentation, soul2d_live_documentation, bug_report or feature_request. \
              Configuration uses the settings path's parent and refuses when unavailable. No browser, folder or \

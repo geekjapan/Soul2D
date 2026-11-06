@@ -12492,10 +12492,12 @@
       ]
     },
     {
-      "description": "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close button do. Read windows.textureViewer in the returned editor state. Repeated open preserves Slot, Zoom, loaded images, loading and errors; close drops the viewer and reopening starts unloaded at Slot 0, Zoom 1. Uses the existing selected-Part texture_get loading path. Retained across document replacement, layout reset and listener restart; closed on process restart. Editor only, all document formats. No document, history or settings write; no ACP host approval is needed.",
+      "description": "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close button do. With open:true, optional slot selects position 0 Albedo, 1 Emissive or 2 Bump, not a texture ID, and optional zoom sets a finite display multiplier clamped to 0.1..10 before conversion to f32. Controls are refused with open:false. Read windows.textureViewer and windows.textureViewerState (null when closed, otherwise {slot,zoom}) in the returned editor state. Repeated open preserves omitted controls, loaded images, loading and errors; close drops the viewer and reopening starts unloaded at Slot 0, Zoom 1. Uses the existing selected-Part texture_get loading path. Retained across document replacement, layout reset and listener restart; closed on process restart. Editor only, all document formats. No document, history or settings write; no ACP host approval is needed.",
       "effect": "editor-state",
       "guiEntry": [
         "Texture Viewer > Close window",
+        "Texture Viewer > Slot",
+        "Texture Viewer > Zoom",
         "Tools > Texture Viewer"
       ],
       "headless_ok": false,
@@ -12505,6 +12507,17 @@
         "properties": {
           "open": {
             "type": "boolean"
+          },
+          "slot": {
+            "enum": [
+              0,
+              1,
+              2
+            ],
+            "type": "integer"
+          },
+          "zoom": {
+            "type": "number"
           }
         },
         "required": [

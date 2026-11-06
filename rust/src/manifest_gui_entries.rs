@@ -199,6 +199,8 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ]),
     ("editor_texture_viewer_set", &[
         "Texture Viewer > Close window",
+        "Texture Viewer > Slot",
+        "Texture Viewer > Zoom",
         "Tools > Texture Viewer",
     ]),
     ("editor_timeline_zoom_set", &[

@@ -1045,9 +1045,9 @@ pub fn model_slots(node: &Value) -> [Option<u64>; 3] {
     slots
 }
 
-pub fn zoom_clamped(zoom: f32) -> f32 {
+pub fn zoom_clamped(zoom: f64) -> f32 {
     if zoom.is_finite() {
-        zoom.clamp(0.1, 10.0)
+        zoom.clamp(0.1, 10.0) as f32
     } else {
         1.0
     }
@@ -2348,9 +2348,28 @@ struct Loaded {
     handles: [Option<egui::TextureHandle>; 3],
 }
 
-struct TextureViewer {
+struct TextureViewerControls {
     slot: usize,
     zoom: f32,
+}
+
+impl TextureViewerControls {
+    fn new() -> Self {
+        Self { slot: 0, zoom: 1.0 }
+    }
+
+    fn apply(&mut self, slot: Option<usize>, zoom: Option<f64>) {
+        if let Some(slot) = slot {
+            self.slot = slot;
+        }
+        if let Some(zoom) = zoom {
+            self.zoom = zoom_clamped(zoom);
+        }
+    }
+}
+
+struct TextureViewer {
+    controls: TextureViewerControls,
     loaded: Option<Loaded>,
     error: Option<String>,
     loading: bool,
@@ -2358,7 +2377,7 @@ struct TextureViewer {
 
 impl TextureViewer {
     fn new() -> Self {
-        Self { slot: 0, zoom: 1.0, loaded: None, error: None, loading: false }
+        Self { controls: TextureViewerControls::new(), loaded: None, error: None, loading: false }
     }
 
     /// Stores the decoded textures that the `texture_get` calls made for `node` answered.
@@ -2435,26 +2454,28 @@ impl TextureViewer {
                 if loaded.revision != revision {
                     ui.colored_label(egui::Color32::YELLOW, "The document changed since these were loaded.");
                 }
-                let shown = SLOT_NAMES[self.slot.min(2)];
+                let mut slot = self.controls.slot;
+                let mut zoom = self.controls.zoom;
+                let shown = SLOT_NAMES[slot.min(2)];
                 egui::ComboBox::from_label("Slot").selected_text(shown).show_ui(ui, |ui| {
                     for (position, name) in SLOT_NAMES.iter().enumerate() {
                         let detail = loaded.slots[position]
                             .as_ref()
                             .map_or("empty".to_owned(), |image| format!("{}x{}", image.width, image.height));
-                        ui.selectable_value(&mut self.slot, position, format!("{name} ({detail})"));
+                        ui.selectable_value(&mut slot, position, format!("{name} ({detail})"));
                     }
                 });
                 ui.horizontal(|ui| {
                     let caption = ui.label("Zoom");
-                    ui.add(egui::Slider::new(&mut self.zoom, 0.1..=10.0).logarithmic(true).show_value(false))
+                    ui.add(egui::Slider::new(&mut zoom, 0.1..=10.0).logarithmic(true).show_value(false))
                         .labelled_by(caption.id);
-                    ui.label(format!("{:.2}x", self.zoom));
+                    ui.label(format!("{zoom:.2}x"));
                 });
-                self.zoom = zoom_clamped(self.zoom);
-                match (&loaded.slots[self.slot.min(2)], &loaded.handles[self.slot.min(2)]) {
+                self.controls.apply(Some(slot), Some(f64::from(zoom)));
+                match (&loaded.slots[self.controls.slot.min(2)], &loaded.handles[self.controls.slot.min(2)]) {
                     (Some(image), Some(handle)) => {
                         ui.label(format!("{} x {} px, texture slot {}", image.width, image.height, image.slot));
-                        let size = egui::vec2(image.width as f32, image.height as f32) * self.zoom;
+                        let size = egui::vec2(image.width as f32, image.height as f32) * self.controls.zoom;
                         egui::ScrollArea::both().show(ui, |ui| {
                             ui.add(egui::Image::new((handle.id(), size)));
                         });
@@ -2684,12 +2705,18 @@ impl Windows {
         self.texture.is_some()
     }
 
-    pub fn set_texture_viewer_open(&mut self, open: bool) {
+    pub(super) fn set_texture_viewer(&mut self, open: bool, slot: Option<usize>, zoom: Option<f64>) {
         if open {
-            self.texture.get_or_insert_with(TextureViewer::new);
+            self.texture.get_or_insert_with(TextureViewer::new).controls.apply(slot, zoom);
         } else {
             self.texture = None;
         }
+    }
+
+    pub(super) fn texture_viewer_state(&self) -> Value {
+        self.texture.as_ref().map_or(Value::Null, |viewer| {
+            json!({"slot":viewer.controls.slot, "zoom":viewer.controls.zoom})
+        })
     }
 
     pub fn welcome_open(&self) -> bool {
@@ -3700,7 +3727,7 @@ mod logic_tests {
         );
         assert_eq!(zoom_clamped(0.01), 0.1);
         assert_eq!(zoom_clamped(99.0), 10.0);
-        assert_eq!(zoom_clamped(f32::NAN), 1.0);
+        assert_eq!(zoom_clamped(f64::NAN), 1.0);
     }
 
     fn pair(a: Option<u32>, b: Option<u32>) -> FlipPair {
@@ -4145,13 +4172,13 @@ mod frame_tests {
         checked += assert_all_named(&output, "palette result");
         windows.set_command_browser_open(false);
 
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         for expected in ["Face (node 9)", "Texture slots in the model: Albedo: 0, Emissive: -, Bump: -", "Load textures"] {
             assert!(has(&output, expected), "textures: missing {expected:?} in {:?}", texts(&output));
         }
         checked += assert_all_named(&output, "texture viewer");
-        windows.set_texture_viewer_open(false);
+        windows.set_texture_viewer(false, None, None);
 
         let nodes_list = tree_nodes(&rig.snapshot["model"]["nodes"]);
         windows.flip = Some(FlipWindow::new(vec![pair_of(12, 13)], nodes_list, "message".to_owned()));
@@ -5180,20 +5207,19 @@ mod frame_tests {
         assert_eq!(only(requests), Request::Mcp(McpTarget::Layout,
             call_request("editor_texture_viewer_set", json!({"open":true}))));
         assert!(!windows.texture_viewer_open());
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
         windows.deliver(McpTarget::Texture(0), Some(texture_response(0, 2, 1)));
         let viewer = windows.texture.as_mut().unwrap();
-        viewer.slot = 2;
-        viewer.zoom = 2.75;
+        viewer.controls.apply(Some(2), Some(2.75));
         let loaded = viewer.loaded.as_ref().unwrap();
         let handle = loaded.handles[0].as_ref().unwrap().id();
         let pixels = loaded.slots[0].as_ref().unwrap().rgba.clone();
         let stamp = (loaded.node, loaded.revision);
-        for _ in 0..2 {
-            windows.set_texture_viewer_open(true);
+        for (slot, zoom) in [(1, 3.5), (2, 2.75)] {
+            windows.set_texture_viewer(true, Some(slot), Some(zoom));
             let viewer = windows.texture.as_ref().unwrap();
-            assert_eq!((viewer.slot, viewer.zoom), (2, 2.75));
+            assert_eq!((viewer.controls.slot, viewer.controls.zoom), (slot, zoom as f32));
             let loaded = viewer.loaded.as_ref().unwrap();
             assert_eq!((loaded.node, loaded.revision), stamp);
             assert_eq!(loaded.handles[0].as_ref().unwrap().id(), handle);
@@ -5202,23 +5228,25 @@ mod frame_tests {
         click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
         assert!(windows.texture.as_ref().unwrap().loading);
         let waiting = windows.texture_request.as_ref().unwrap().waiting;
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, Some(1), Some(4.5));
         assert!(windows.texture.as_ref().unwrap().loading);
+        assert_eq!(windows.texture_viewer_state(), json!({"slot":1,"zoom":4.5}));
         assert_eq!(windows.texture_request.as_ref().unwrap().waiting, waiting);
         windows.deliver(McpTarget::Texture(0), Some(json!({"result":{"isError":true,
             "content":[{"type":"text","text":"retained texture failure"}]}})));
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, Some(2), Some(5.5));
         assert_eq!(windows.texture.as_ref().unwrap().error.as_deref(), Some("retained texture failure"));
+        assert_eq!(windows.texture_viewer_state(), json!({"slot":2,"zoom":5.5}));
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Close window");
         assert_eq!(only(requests), Request::Mcp(McpTarget::Layout,
             call_request("editor_texture_viewer_set", json!({"open":false}))));
         assert!(windows.texture_viewer_open(), "only the shared handler destroys the viewer");
-        windows.set_texture_viewer_open(false);
-        windows.set_texture_viewer_open(false);
+        windows.set_texture_viewer(false, None, None);
+        windows.set_texture_viewer(false, None, None);
         assert!(!windows.texture_viewer_open());
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         let viewer = windows.texture.as_ref().unwrap();
-        assert_eq!((viewer.slot, viewer.zoom), (0, 1.0));
+        assert_eq!((viewer.controls.slot, viewer.controls.zoom), (0, 1.0));
         assert!(viewer.loaded.is_none() && viewer.error.is_none() && !viewer.loading);
         assert!(!Windows::new().texture_viewer_open());
     }
@@ -5231,7 +5259,7 @@ mod frame_tests {
         rig.store.set("hasDoneQuickSetup", true).unwrap();
         rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([4, 7, 5]);
         let mut windows = Windows::new();
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         frame(&ctx, &mut windows, &mut rig, Vec::new());
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         let events = ["Close window", "Load textures"].map(|label| {
@@ -5247,7 +5275,7 @@ mod frame_tests {
             Request::Mcp(McpTarget::Texture(position), call_request("texture_get", json!({"slot":slot})))));
         assert_eq!(requests, expected);
         assert!(windows.texture_viewer_open());
-        windows.set_texture_viewer_open(false);
+        windows.set_texture_viewer(false, None, None);
         assert!(windows.texture_request.is_some(), "close retains the existing aggregation lifetime");
         windows.deliver(McpTarget::Texture(2), Some(texture_response(5, 1, 1)));
         windows.deliver(McpTarget::Texture(0), Some(texture_response(4, 3, 2)));
@@ -5256,7 +5284,7 @@ mod frame_tests {
         windows.deliver(McpTarget::Texture(1), Some(texture_response(7, 2, 2)));
         assert!(windows.texture_request.is_none());
         assert!(!windows.texture_viewer_open(), "replies cannot reopen the viewer");
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         assert!(windows.texture.as_ref().unwrap().loaded.is_none());
     }
 
@@ -5267,7 +5295,7 @@ mod frame_tests {
         rig.store.set("firstrun_complete", true).unwrap();
         rig.store.set("hasDoneQuickSetup", true).unwrap();
         let mut windows = Windows::new();
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         // The Part lists only its albedo slot (the 4294967295 entry is the empty marker).
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
         let call = call_request("texture_get", json!({"slot": 0}));
@@ -5300,7 +5328,7 @@ mod frame_tests {
         rig.store.set("hasDoneQuickSetup", true).unwrap();
         rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([4, 7, 5]);
         let mut windows = Windows::new();
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
         let expected: Vec<Request> = [(0u8, 4u64), (1, 7), (2, 5)]
             .into_iter()
@@ -5318,6 +5346,12 @@ mod frame_tests {
         let loaded = windows.texture.as_ref().unwrap().loaded.as_ref().unwrap();
         let sizes: Vec<Option<(usize, usize)>> = loaded.slots.iter().map(|s| s.as_ref().map(|i| (i.width, i.height))).collect();
         assert_eq!(sizes, [Some((3, 2)), Some((2, 2)), Some((1, 1))]);
+        for (position, label) in [(1, "2 x 2 px, texture slot 7"), (2, "1 x 1 px, texture slot 5")] {
+            windows.set_texture_viewer(true, Some(position), Some(2.75));
+            let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+            assert!(has(&output, label), "{:?}", texts(&output));
+            assert_eq!(windows.texture_viewer_state(), json!({"slot":position,"zoom":2.75}));
+        }
 
         // One failing slot fails the whole load with its message.
         click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
@@ -5336,7 +5370,7 @@ mod frame_tests {
         rig.store.set("hasDoneQuickSetup", true).unwrap();
         rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([4294967295u64, null, null]);
         let mut windows = Windows::new();
-        windows.set_texture_viewer_open(true);
+        windows.set_texture_viewer(true, None, None);
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
         assert!(requests.is_empty(), "{requests:?}");
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
