@@ -20342,6 +20342,114 @@ mod editor_state_tests {
     }
 
     #[test]
+    fn texture_viewer_document_replacement_clears_payload_and_pending_but_keeps_controls() {
+        for tool in ["new", "open", "import_inp", "editor_recovery_restore"] {
+            let mut app = if tool == "editor_recovery_restore" {
+                app_with_two_snapshots("texture-viewer-replace-recovery")
+            } else { app(&format!("texture-viewer-replace-{tool}")) };
+            let project = app.controller.project_path().unwrap().to_owned();
+            app.controller.select_nodes(&[2]).unwrap();
+            call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":2,"zoom":2.75}));
+            call(&mut app, "editor_texture_viewer_load", json!({}));
+            let ctx = egui::Context::default();
+            let reads = app.windows.begin_texture_viewer_load(&ctx, app.controller.snapshot(), Some(2)).unwrap();
+            let before = state(&mut app);
+            assert!(before["windows"]["textureViewerLoadState"]["loaded"].is_object());
+            assert!(before["windows"]["textureViewerLoadState"]["pending"].is_object());
+            let path = app.tools.store_path.clone().unwrap();
+            let settings = std::fs::read(&path).ok();
+            let arguments = match tool {
+                "new" => json!({}),
+                "editor_recovery_restore" => json!({"id":SNAPSHOT_NEW}),
+                _ => json!({"path":project}),
+            };
+            call(&mut app, tool, arguments);
+            let replaced = state(&mut app);
+            let expected = json!({"loading":false,"pending":null,"loaded":null,"hasError":false});
+            assert_eq!(replaced["windows"]["textureViewerLoadState"], expected, "{tool}");
+            assert_eq!(replaced["windows"]["textureViewerState"], json!({"slot":2,"zoom":2.75}), "{tool}");
+            assert_eq!(replaced["windows"]["textureViewer"], true, "{tool}");
+            for (target, request) in reads {
+                app.apply_window_request(&ctx, crate::editor_windows::Request::Mcp(target, request));
+            }
+            assert_eq!(state(&mut app)["windows"]["textureViewerLoadState"], expected, "late reads: {tool}");
+            assert_eq!(std::fs::read(path).ok(), settings, "{tool}");
+        }
+    }
+
+    #[test]
+    fn texture_viewer_native_open_discards_reads_planned_for_the_old_document() {
+        use crate::editor_test_support::{texts, Harness};
+        use crate::editor_windows::{call_request, Host, McpTarget, Request};
+        use egui::accesskit::Role;
+
+        fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
+            let mcp = app.mcp_status();
+            app.windows.show(ctx, Host {
+                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
+                store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
+                shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
+                tr:&tr, mcp:&mcp,
+            })
+        }
+
+        let mut app = app("texture-viewer-native-replacement");
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        let (mut model_b, texture_a) = model_and_texture();
+        model_b["nodes"]["children"][0]["textures"] = json!([1]);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 255, 0, 255]))
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let texture_b = soul2d_core::model_import::Texture { tag:0, data:png.into_inner() };
+        let path_b = app.controller.project_path().unwrap().with_file_name("document-b.inx");
+        std::fs::write(&path_b, soul2d_core::model_import::inx_bytes(&model_b, &[texture_a, texture_b]).unwrap()).unwrap();
+        app.controller.select_nodes(&[2]).unwrap();
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":0,"zoom":2.75}));
+        let mut harness = Harness::new();
+        let mut reads_from_a = Vec::new();
+        harness.click(Role::Button, "Load textures", |ctx| reads_from_a.extend(draw(&mut app, ctx)));
+        assert_eq!(reads_from_a, vec![Request::Mcp(McpTarget::Texture(0), call_request("texture_get", json!({"slot":0})))]);
+        app.apply_window_request(&harness.ctx, Request::Open(path_b.to_string_lossy().into_owned()));
+        let revision_b = app.controller.snapshot()["revision"].clone();
+        for request in reads_from_a { app.apply_window_request(&harness.ctx, request); }
+        let replaced = state(&mut app);
+        assert_eq!(replaced["windows"]["textureViewerLoadState"],
+            json!({"loading":false,"pending":null,"loaded":null,"hasError":false}));
+        assert_eq!(replaced["windows"]["textureViewerState"], json!({"slot":0,"zoom":2.75}));
+        app.controller.select_nodes(&[2]).unwrap();
+        app.apply_window_request(&harness.ctx, Request::Mcp(McpTarget::Layout,
+            call_request("editor_texture_viewer_load", json!({}))));
+        let loaded = state(&mut app);
+        assert_eq!(loaded["windows"]["textureViewerLoadState"]["loaded"], json!({"node":2,"revision":revision_b,
+            "slots":[{"slot":1,"width":2,"height":1,"displayable":true},null,null]}));
+        let out = harness.frame(Vec::new(), |ctx| { assert!(draw(&mut app, ctx).is_empty()); });
+        assert!(texts(&out).iter().any(|text| text == "2 x 1 px, texture slot 1"));
+        assert_eq!(loaded["document"]["modified"], false);
+    }
+
+    #[test]
+    fn texture_viewer_failed_or_refused_replacement_retains_cache_and_pending() {
+        let mut app = app("texture-viewer-replace-refusal");
+        app.controller.select_nodes(&[2]).unwrap();
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":1,"zoom":3.5}));
+        call(&mut app, "editor_texture_viewer_load", json!({}));
+        app.windows.begin_texture_viewer_load(&egui::Context::default(), app.controller.snapshot(), Some(2)).unwrap();
+        let before = state(&mut app);
+        let document_before = document(&app);
+        let missing = app.controller.project_path().unwrap().with_file_name("missing-document.inx");
+        assert!(!missing.exists());
+        refused(&mut app, "open", json!({"path":missing}));
+        assert_eq!(state(&mut app)["windows"], before["windows"]);
+        assert_eq!(document(&app), document_before);
+        app.select_node_draft(2);
+        app.controller.set_draft_name("Unapplied rename".into());
+        assert_eq!(refused(&mut app, "new", json!({})), FILE_OP_BLOCKED_MESSAGE);
+        assert_eq!(state(&mut app)["windows"], before["windows"]);
+    }
+
+    #[test]
     fn texture_viewer_load_populates_cache_through_rpc_before_first_draw() {
         let mut app = app("texture-viewer-load-rpc");
         app.controller.select_nodes(&[2]).unwrap();
