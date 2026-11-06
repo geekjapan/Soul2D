@@ -85,6 +85,10 @@ ctypes, so build first. `./tools/verify-command-manifest.sh` rewrites
 The other `tools/verify-*.py` scripts drive the Rust binaries and fixtures.
 On Linux, CI also runs `./tools/verify-linux-launch.sh` with Xvfb, Weston and Mesa
 installed. It retains launch logs and screenshots for three days, including on failure.
+`tools/verify-editor-texture-cache.py` separately checks a production X11 window over stdio MCP.
+It verifies Texture Viewer pixels and cache state across document replacement, an explicit reload
+and a refused Open, then requires accepted Quit and a natural exit. Its pure `--self-test` runs
+on every supported platform. CI retains only text and image evidence for this check for three days.
 The job has a 45-minute timeout, and a newer run on the same ref cancels the previous run.
 On Windows, use `soul2d-core.exe` in the MCP initialization command. The FFI, CLI and MCP
 checks run on every platform. Native editor window checks run only on Linux.
