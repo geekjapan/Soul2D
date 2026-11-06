@@ -389,7 +389,8 @@ pub(crate) struct ApprovalDocument {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ApprovalTarget {
-    Quit(AcpQuitTarget),
+    Quit(AcpInvocation),
+    Stop(StopTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
     Outputs(Vec<PathBuf>),
@@ -418,12 +419,12 @@ pub(crate) struct HostApproval {
     active: bool,
     request: Option<ApprovalRequest>,
     defer_current: bool,
-    invocation: Option<AcpQuitTarget>,
+    invocation: Option<AcpInvocation>,
 }
 
 /// Assigned only inside authenticated hosting; equal wire IDs do not identify the same invocation.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AcpQuitTarget {
+pub(crate) struct AcpInvocation {
     run: u64,
     prompt: PromptId,
     call: u64,
@@ -436,13 +437,13 @@ pub(crate) enum QuitRelease {
     Invalid(String),
 }
 
-impl AcpQuitTarget {
+impl AcpInvocation {
     pub(crate) fn owner(&self) -> u64 { self.run }
 }
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        matches!(call["op"].as_str(), Some("editor.quit" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
+        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
             || matches!(call["op"].as_str(), Some("automesh.preset.save" | "automesh.preset.delete" | "physics.preset.save" |
@@ -453,16 +454,28 @@ impl HostApproval {
             || soul2d_core::editor_controller::replaces_document(call) || call["op"] == "editor.recovery.restore"
     }
 
-    pub(crate) fn quit_target(&self) -> Result<AcpQuitTarget, String> {
+    pub(crate) fn quit_target(&self) -> Result<AcpInvocation, String> {
         self.invocation.clone().filter(|_| self.active).ok_or_else(||
             "ACP Quit needs an authenticated request during a transmitted uncancelled prompt".into())
     }
 
-    pub(crate) fn quit_review(&self) -> Option<AcpQuitTarget> {
+    pub(crate) fn quit_review(&self) -> Option<AcpInvocation> {
         match &self.request.as_ref()?.target { ApprovalTarget::Quit(target) => Some(target.clone()), _ => None }
     }
 
-    pub(crate) fn invalidate_quit(&mut self, target: &AcpQuitTarget) {
+    pub(crate) fn stop_target(&self, owner: StopOwner) -> Result<StopTarget, String> {
+        let invocation = self.invocation.clone().filter(|call| self.active && call.run == owner.run)
+            .ok_or("ACP Stop needs its original authenticated transmitted uncancelled prompt")?;
+        Ok(StopTarget::Acp { owner, invocation })
+    }
+
+    pub(crate) fn stop_review(&self) -> Option<StopTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        match &request.target { ApprovalTarget::Stop(target) => Some(target.clone()), _ => None }
+    }
+
+    pub(crate) fn invalidate_quit(&mut self, target: &AcpInvocation) {
         if self.quit_review().as_ref() == Some(target) {
             if let Some(request) = &mut self.request {
                 if !matches!(request.decision, ApprovalDecision::Denied) { request.decision = ApprovalDecision::Stale; }
@@ -495,7 +508,7 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
@@ -578,6 +591,12 @@ impl HostApproval {
                     ui.label("Allow this original request once. After its reply is written and this prompt finishes successfully, Soul2D stops this agent and rechecks whether it can close safely.");
                     ui.label("This does not save or discard work. Failed delivery or new work cancels Quit. The agent may be stopped while the editor stays open if the final check refuses.");
                 },
+                ApprovalTarget::Stop(_) => {
+                    ui.label("Target: this owned coding-agent run and its conversation");
+                    ui.label("Allow this original request once. After its reply is delivered locally, Soul2D stops this agent without waiting for a successful turn. Shutdown may kill and reap the owned child.");
+                    ui.label("Successful Stop discards this conversation, while preserving unsent text, document, drafts, undo and settings. Failure can retain a closed client after its endpoint was removed; no automatic retry.");
+                    ui.label("Stop consent follows the owner-observed prompt. A queued completion may not yet be observed; new permissions or disconnection invalidate consent before intake is sealed.");
+                },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
                     let kind = if path.is_dir() { "Output folder" } else { "Output file" };
@@ -657,7 +676,7 @@ impl HostApproval {
                 ui.label("Replaces the current document. Source paths are read when this call runs.");
             }
             ui.label("The original call waits here. Allow applies this exact change once.");
-            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered file writes, document replacement and Quit for this turn.");
+            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered file writes, document replacement, Quit and Stop for this turn.");
             if ui.add_enabled(matches!(request.decision, ApprovalDecision::Pending), egui::Button::new("Allow once")).clicked() {
                 request.decision = ApprovalDecision::AllowedOnce;
             }
@@ -670,6 +689,7 @@ impl HostApproval {
 
 struct Run<W: Write> {
     id: u64,
+    stop_epoch: u64,
     client: Client<W>,
     endpoint: Option<McpEndpoint>,
     /// The briefing went with the first prompt of this run.
@@ -704,6 +724,34 @@ pub(crate) enum CancelResult {
     Unavailable,
     Requested { approval_reply_failed: bool },
     WriteFailed { approval_reply_failed: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopOwner {
+    run: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StopTarget {
+    External(StopOwner),
+    Acp { owner: StopOwner, invocation: AcpInvocation },
+}
+
+impl StopTarget {
+    fn owner(&self) -> StopOwner {
+        match self { Self::External(owner) | Self::Acp { owner, .. } => *owner }
+    }
+}
+
+pub(crate) enum StopResult {
+    Stopped { approval_reply_failed: bool },
+    FailedRetained { approval_reply_failed: bool },
+}
+
+pub(crate) enum StopRefusal {
+    StaleTarget,
+    ConsentInvalid,
 }
 
 pub struct AgentPanel<W: Write = ChildStdin> {
@@ -800,7 +848,7 @@ impl<W: Write> AgentPanel<W> {
             Ok(()) => self.status = "Initializing...".to_string(),
             Err(error) => self.fail("Initialize failed", error),
         }
-        self.run = Some(Run { id, client, endpoint, briefed: false, closed: false,
+        self.run = Some(Run { id, stop_epoch: 0, client, endpoint, briefed: false, closed: false,
             host_approval: HostApproval::default(), pending_reply: None, next_call: 0 });
     }
 
@@ -838,6 +886,11 @@ impl<W: Write> AgentPanel<W> {
         self.before_tick_for_test = Some(Box::new(hook));
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_host_approval_for_test(&mut self) {
+        self.run.as_mut().unwrap().host_approval.request.as_mut().unwrap().created = Instant::now() - HOST_APPROVAL_TIMEOUT;
+    }
+
     /// The URL offered to the running agent (the token is never exposed).
     pub fn mcp_url(&self) -> Option<&str> {
         self.run.as_ref()?.endpoint.as_ref().map(McpEndpoint::url)
@@ -868,35 +921,82 @@ impl<W: Write> AgentPanel<W> {
 
     /// Stop the agent (waits briefly for it to exit, then kills it) and close the MCP endpoint.
     pub fn stop(&mut self) {
-        self.stop_with(Client::shutdown);
+        let _ = self.stop_with(Client::shutdown);
     }
 
-    fn stop_with(&mut self, shutdown: impl FnOnce(&mut Client<W>) -> Result<Option<std::process::ExitStatus>, String>) {
+    fn stop_with(&mut self, shutdown: impl FnOnce(&mut Client<W>) -> Result<Option<std::process::ExitStatus>, String>) -> Option<StopResult> {
+        let mut result = None;
         if let Some(run) = self.run.as_mut() {
+            run.stop_epoch = run.stop_epoch.saturating_add(1);
             run.closed = true;
-            run.clear_approval("The ACP session stopped before the operation was approved");
+            let approval_reply_failed = !run.clear_approval("The ACP session stopped before the operation was approved");
             run.endpoint = None;
             if let Err(error) = shutdown(&mut run.client) {
                 self.fail("Stop failed; client ownership retained", error);
-                return;
+                return Some(StopResult::FailedRetained { approval_reply_failed });
             }
             self.run = None;
             self.status = "Stopped".into();
+            result = Some(StopResult::Stopped { approval_reply_failed });
         }
         self.error = None;
+        result
+    }
+
+    pub(crate) fn stop_owner(&self) -> Option<StopOwner> {
+        let run = self.run.as_ref().filter(|run| run.stop_epoch != u64::MAX)?;
+        Some(StopOwner { run: run.id, epoch: run.stop_epoch })
+    }
+
+    pub(crate) fn invalidate_stop(&mut self, target: &StopTarget) {
+        if let Some(run) = self.run.as_mut().filter(|run| run.id == target.owner().run) {
+            if run.host_approval.stop_review().as_ref() == Some(target) {
+                if let Some(request) = &mut run.host_approval.request {
+                    if !matches!(request.decision, ApprovalDecision::Denied) { request.decision = ApprovalDecision::Stale; }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn stop_status(&self, target: &StopTarget, admitted: bool) -> Result<(), StopRefusal> {
+        if self.stop_owner() != Some(target.owner()) { return Err(StopRefusal::StaleTarget); }
+        let run = self.run.as_ref().unwrap();
+        if let StopTarget::Acp { invocation, .. } = target {
+            if run.id != invocation.run || run.closed || run.client.active_prompt() != Some(invocation.prompt)
+                || run.client.permission_epoch() != invocation.permissions {
+                return Err(StopRefusal::ConsentInvalid);
+            }
+            if !admitted && (run.host_approval.stop_review().as_ref() != Some(target)
+                || run.host_approval.request.as_ref().is_none_or(|request|
+                    !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce)
+                        || request.created.elapsed() >= HOST_APPROVAL_TIMEOUT)) {
+                return Err(StopRefusal::ConsentInvalid);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stop_if_current(&mut self, target: &StopTarget) -> Result<StopResult, StopRefusal> {
+        self.stop_status(target, true)?;
+        if let StopTarget::Acp { invocation, .. } = target {
+            if !self.run.as_mut().unwrap().client.seal_permission_intake(invocation.permissions) {
+                return Err(StopRefusal::ConsentInvalid);
+            }
+        }
+        self.stop_with(Client::shutdown).ok_or(StopRefusal::StaleTarget)
     }
 
     pub(crate) fn owner(&self) -> Option<u64> {
         self.run.as_ref().map(|run| run.id)
     }
 
-    pub(crate) fn invalidate_quit(&mut self, target: &AcpQuitTarget) {
+    pub(crate) fn invalidate_quit(&mut self, target: &AcpInvocation) {
         if let Some(run) = self.run.as_mut().filter(|run| run.id == target.run) {
             run.host_approval.invalidate_quit(target);
         }
     }
 
-    pub(crate) fn quit_status(&self, target: &AcpQuitTarget, admitted_at: Option<Instant>) -> Result<bool, String> {
+    pub(crate) fn quit_status(&self, target: &AcpInvocation, admitted_at: Option<Instant>) -> Result<bool, String> {
         let run = self.run.as_ref().filter(|run| run.id == target.run).ok_or("ACP client changed or stopped")?;
         if run.closed || run.client.permission_epoch() != target.permissions {
             return Err("ACP disconnected or received a new permission request".into());
@@ -914,7 +1014,7 @@ impl<W: Write> AgentPanel<W> {
         }
     }
 
-    pub(crate) fn release_for_quit(&mut self, target: &AcpQuitTarget, admitted_at: Instant) -> QuitRelease {
+    pub(crate) fn release_for_quit(&mut self, target: &AcpInvocation, admitted_at: Instant) -> QuitRelease {
         self.pump();
         match self.quit_status(target, Some(admitted_at)) {
             Ok(false) => QuitRelease::Waiting,
@@ -1067,7 +1167,7 @@ impl<W: Write> AgentPanel<W> {
             if let Some((call, pending)) = run.pending_reply.take() {
                 if let Err(error) = pending.finish(&mut |message| {
                     run.host_approval.defer_current = false;
-                    run.host_approval.invocation = run.client.active_prompt().map(|prompt| AcpQuitTarget {
+                    run.host_approval.invocation = run.client.active_prompt().map(|prompt| AcpInvocation {
                         run: run.id, prompt, call, permissions: run.client.permission_epoch() });
                     handler(message, &mut run.host_approval)
                 }) {
@@ -1094,7 +1194,7 @@ impl<W: Write> AgentPanel<W> {
                 occurrence = run.next_call;
                 run.host_approval.invocation = run.next_call.checked_add(1).and_then(|next| {
                     run.next_call = next;
-                    run.client.active_prompt().map(|prompt| AcpQuitTarget {
+                    run.client.active_prompt().map(|prompt| AcpInvocation {
                         run: run.id, prompt, call: occurrence, permissions: run.client.permission_epoch() })
                 });
                 let response = handler(message, &mut run.host_approval);
@@ -1989,7 +2089,7 @@ mod tests {
     fn failed_shutdown_retains_the_same_run_and_does_not_report_stopped() {
         let (mut panel, _agent, _) = active_panel_endpoint();
         let owner = panel.owner();
-        panel.stop_with(|_| Err("owned reaping could not be confirmed".into()));
+        let _ = panel.stop_with(|_| Err("owned reaping could not be confirmed".into()));
         assert_eq!(panel.owner(), owner);
         assert!(panel.state().has_client);
         assert!(panel.mcp_url().is_none());
@@ -2003,6 +2103,87 @@ mod tests {
             "Off. An ACP client is still owned because shutdown failed; enable the panel to retry Stop."));
         panel.stop();
         assert!(!panel.state().has_client);
+    }
+
+    #[test]
+    fn coding_agent_stop_stales_held_admission_after_failed_native_attempt_and_keeps_retry_explicit() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let target = StopTarget::External(panel.stop_owner().unwrap());
+        let owner = panel.owner();
+        assert!(matches!(panel.stop_with(|_| Err("unconfirmed owned shutdown".into())),
+            Some(StopResult::FailedRetained { approval_reply_failed:false })));
+        assert_eq!(panel.owner(), owner);
+        assert_eq!(panel.run.as_ref().unwrap().stop_epoch, 1);
+        assert!(matches!(panel.stop_if_current(&target), Err(StopRefusal::StaleTarget)));
+        assert_eq!(panel.run.as_ref().unwrap().stop_epoch, 1, "an old admission must not attempt shutdown twice");
+        panel.enabled = false;
+        *panel.prompt_mut() = "Retained retry text".into();
+        let retry = StopTarget::External(panel.stop_owner().unwrap());
+        assert!(matches!(panel.stop_if_current(&retry), Ok(StopResult::Stopped { approval_reply_failed:false })));
+        assert!(panel.owner().is_none() && !panel.is_enabled());
+        assert_eq!(panel.prompt_mut(), "Retained retry text");
+    }
+
+    #[test]
+    fn coding_agent_stop_epoch_exhaustion_refuses_remote_but_keeps_native_stop_available() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.run.as_mut().unwrap().stop_epoch = u64::MAX - 1;
+        let target = StopTarget::External(panel.stop_owner().unwrap());
+        assert!(matches!(panel.stop_with(|_| Err("unconfirmed owned shutdown".into())),
+            Some(StopResult::FailedRetained { .. })));
+        assert!(panel.stop_owner().is_none());
+        assert!(matches!(panel.stop_if_current(&target), Err(StopRefusal::StaleTarget)));
+        assert!(panel.controls().stop);
+        panel.stop();
+        assert!(panel.owner().is_none());
+    }
+
+    #[test]
+    fn coding_agent_stop_preserves_both_refusal_write_and_shutdown_failure_dimensions() {
+        for shutdown_fails in [false, true] {
+            let (mut panel, _agent, _) = active_panel_endpoint();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let control = stream.try_clone().unwrap();
+            let body = json!({"jsonrpc":"2.0", "id":7, "method":"ping"}).to_string();
+            write!(peer, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let pending = handle_connection_deferred(stream, None, WAIT, &mut |_| HttpDispatch::Defer).unwrap().unwrap();
+            control.shutdown(std::net::Shutdown::Write).unwrap();
+            panel.run.as_mut().unwrap().pending_reply = Some((7, pending));
+            let owner = panel.owner();
+            let mut attempts = 0;
+            let result = panel.stop_with(|_| {
+                attempts += 1;
+                if shutdown_fails { Err("owned reaping not confirmed".into()) } else { Ok(None) }
+            });
+            assert_eq!(attempts, 1);
+            if shutdown_fails {
+                assert!(matches!(result, Some(StopResult::FailedRetained { approval_reply_failed:true })));
+                assert_eq!(panel.owner(), owner);
+                let run = panel.run.as_ref().unwrap();
+                assert!(run.closed && run.endpoint.is_none() && run.pending_reply.is_none());
+                assert!(!run.host_approval.active && run.host_approval.request.is_none());
+                assert!(panel.error().unwrap().contains("owned reaping not confirmed"));
+            } else {
+                assert!(matches!(result, Some(StopResult::Stopped { approval_reply_failed:true })));
+                assert!(panel.owner().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_native_button_uses_the_same_owned_release_and_preserves_unsent_text() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        *panel.prompt_mut() = "Retained native Stop prompt".into();
+        Harness::new().click(Role::Button, "Stop", |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { panel.buttons(ui, &Settings::empty()); });
+        });
+        assert!(panel.owner().is_none());
+        assert_eq!(panel.status(), "Stopped");
+        assert_eq!(panel.prompt_mut(), "Retained native Stop prompt");
     }
 
     #[test]
@@ -2101,7 +2282,7 @@ mod tests {
         for case in ["early", "late", "permission", "replacement", "failed_stop"] {
             let (mut panel, mut agent, prompt) = active_panel_endpoint();
             let run = panel.run.as_ref().unwrap();
-            let target = AcpQuitTarget { run: run.id, prompt: run.client.active_prompt().unwrap(), call: 1,
+            let target = AcpInvocation { run: run.id, prompt: run.client.active_prompt().unwrap(), call: 1,
                 permissions: run.client.permission_epoch() };
             let before = Instant::now();
             if case == "permission" {
@@ -2117,7 +2298,7 @@ mod tests {
                 panel.attach(client, None, Some(McpEndpoint::bind().unwrap()));
                 assert_ne!(panel.owner(), Some(target.run));
             }
-            if case == "failed_stop" { panel.stop_with(|_| Err("unconfirmed shutdown".into())); }
+            if case == "failed_stop" { let _ = panel.stop_with(|_| Err("unconfirmed shutdown".into())); }
             if case == "late" {
                 assert_eq!(panel.quit_status(&target, Some(admitted)), Ok(true));
                 assert!(matches!(panel.release_for_quit(&target, admitted), QuitRelease::Released));

@@ -133,6 +133,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_coding_agent_cancel", &[
         "Coding agent > Cancel",
     ]),
+    ("editor_coding_agent_stop", &[
+        "Coding agent > Stop",
+    ]),
     ("editor_command_browser_set", &[
         "Command Browser > Close window; Escape",
         "Edit > Command Browser",

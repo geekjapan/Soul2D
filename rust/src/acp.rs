@@ -1655,15 +1655,61 @@ mod lifecycle_tests {
         assert!(times.iter().all(|at| *at == times[0]), "backpressure must not move a decoded response beyond the admission fence");
     }
 
-    #[cfg(unix)]
+    fn python_owned_child(tail: &str) -> Client<ChildStdin> {
+        let spec = LaunchSpec { command: vec![
+            if cfg!(windows) { "python" } else { "python3" }.into(), "-I".into(), "-u".into(), "-c".into(),
+            format!("import sys,time\nprint('owned-ready',file=sys.stderr,flush=True)\n{tail}"),
+        ], workdir: None };
+        let client = Client::spawn(&spec).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !client.stderr_text().contains("owned-ready") {
+            assert!(Instant::now() < deadline, "owned Python child did not become ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client
+    }
+
+    #[test]
+    fn owned_child_shutdown_graceful_exit_and_forced_termination_release_the_actual_process() {
+        for graceful in [false, true] {
+            let mut client = python_owned_child(if graceful { "sys.stdin.buffer.read()\nsys.exit(23)" } else { "time.sleep(300)" });
+            let pid = client.pid().unwrap();
+            #[cfg(windows)]
+            let handle = {
+                use std::os::windows::io::AsHandle;
+                client.process.as_ref().unwrap().child.as_handle().try_clone_to_owned().unwrap()
+            };
+            let started = Instant::now();
+            let status = client.shutdown().unwrap().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10));
+            if graceful { assert_eq!(status.code(), Some(23)); } else { assert!(!status.success()); }
+            assert_eq!(client.pid(), None);
+            #[cfg(unix)]
+            {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) }, -1);
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                #[link(name = "kernel32")]
+                extern "system" { fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32; }
+                assert_eq!(unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) }, 0, "the original owned process terminated");
+                assert!(pid > 0);
+            }
+            assert_eq!(client.shutdown(), Ok(None));
+        }
+    }
+
     #[test]
     fn uncertain_shutdown_retains_owned_child_for_the_same_owner_to_retry() {
-        let spec = LaunchSpec { command: vec!["/bin/sh".into(), "-c".into(), "exec sleep 300".into()], workdir: None };
-        let mut client = Client::spawn(&spec).unwrap();
+        let mut client = python_owned_child("time.sleep(300)");
         let pid = client.pid().unwrap();
         client.fail_shutdown = true;
         assert!(client.shutdown().is_err());
         assert_eq!(client.pid(), Some(pid));
+        assert!(client.process.as_mut().unwrap().child.try_wait().unwrap().is_none());
         assert!(client.shutdown().unwrap().is_some());
         assert_eq!(client.pid(), None);
         assert_eq!(client.shutdown(), Ok(None));

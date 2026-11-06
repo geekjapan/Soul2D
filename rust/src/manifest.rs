@@ -67,7 +67,7 @@ const IMPORT: &[&str] = &[
 
 /// D `ngManifestEffectSlug` value for the tools whose effect is known by name.
 pub fn effect_of(tool: &str) -> Option<&'static str> {
-    if tool == "editor_quit" { return Some("application-lifecycle"); }
+    if matches!(tool, "editor_quit" | "editor_coding_agent_stop") { return Some("application-lifecycle"); }
     [("-", READ_ONLY), ("project-reset", PROJECT_RESET), ("file-write", FILE_WRITE), ("import", IMPORT),
         ("clipboard-write", CLIPBOARD_WRITE)]
         .into_iter()

@@ -314,6 +314,67 @@ impl LightweightPlayback {
 const QUIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_QUIT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const AGENT_CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum AgentStopOutcome {
+    Stopped { approval_reply_failed: bool },
+    FailedRetained { approval_reply_failed: bool },
+    StaleTarget,
+    ConsentInvalid,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+impl From<crate::editor_agent::StopRefusal> for AgentStopOutcome {
+    fn from(refusal: crate::editor_agent::StopRefusal) -> Self {
+        match refusal {
+            crate::editor_agent::StopRefusal::StaleTarget => Self::StaleTarget,
+            crate::editor_agent::StopRefusal::ConsentInvalid => Self::ConsentInvalid,
+        }
+    }
+}
+
+enum RemoteAgentStop {
+    Idle,
+    Reviewing { attempt: u64, target: crate::editor_agent::StopTarget },
+    Waiting { attempt: u64, target: crate::editor_agent::StopTarget,
+        receipt: Receiver<Result<(), String>>, deadline: Instant },
+    Finished { attempt: u64, outcome: AgentStopOutcome, invalid: Option<crate::editor_agent::StopTarget> },
+}
+
+impl RemoteAgentStop {
+    fn attempt(&self) -> u64 {
+        match self {
+            Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt,
+        }
+    }
+
+    fn state(&self) -> Value {
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Reviewing { attempt, .. } => json!({"state":"awaiting_human", "attempt":attempt}),
+            Self::Waiting { attempt, .. } => json!({"state":"waiting_for_reply", "attempt":attempt}),
+            Self::Finished { attempt, outcome, .. } => {
+                let (state, failed) = match outcome {
+                    AgentStopOutcome::Stopped { approval_reply_failed } => ("stopped", Some(*approval_reply_failed)),
+                    AgentStopOutcome::FailedRetained { approval_reply_failed } => ("failed_retained", Some(*approval_reply_failed)),
+                    AgentStopOutcome::StaleTarget => ("stale_target", None),
+                    AgentStopOutcome::ConsentInvalid => ("consent_invalid", None),
+                    AgentStopOutcome::ReplyNotProduced => ("reply_not_produced", None),
+                    AgentStopOutcome::ReplyFailed => ("reply_failed", None),
+                    AgentStopOutcome::ReplyLost => ("reply_lost", None),
+                    AgentStopOutcome::ReplyExpired => ("reply_expired", None),
+                };
+                let mut value = json!({"state":state, "attempt":attempt});
+                if let Some(failed) = failed { value["approval_reply_failed"] = json!(failed); }
+                value
+            }
+        }
+    }
+}
 
 enum AgentCancelOutcome {
     Requested { approval_reply_failed: bool },
@@ -364,17 +425,17 @@ impl RemoteAgentCancel {
 
 enum QuitOrigin {
     External,
-    Acp { target: crate::editor_agent::AcpQuitTarget, admitted_at: Instant, turn_deadline: Instant },
+    Acp { target: crate::editor_agent::AcpInvocation, admitted_at: Instant, turn_deadline: Instant },
 }
 
 #[derive(Default)]
 enum RemoteQuit {
     #[default]
     Idle,
-    Reviewing { attempt: u64, revision: Value, path: Option<PathBuf>, target: crate::editor_agent::AcpQuitTarget },
+    Reviewing { attempt: u64, revision: Value, path: Option<PathBuf>, target: crate::editor_agent::AcpInvocation },
     Waiting { attempt: u64, revision: Value, path: Option<PathBuf>, receipt: Receiver<Result<(), String>>, deadline: Instant,
         origin: QuitOrigin, delivered: bool },
-    Cancelled { attempt: u64, reason: String, invalid: Option<crate::editor_agent::AcpQuitTarget> },
+    Cancelled { attempt: u64, reason: String, invalid: Option<crate::editor_agent::AcpInvocation> },
     Closing(u64),
 }
 
@@ -383,7 +444,7 @@ impl RemoteQuit {
         match self { Self::Idle => 0, Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Cancelled { attempt, .. } | Self::Closing(attempt) => *attempt }
     }
 
-    fn target(&self) -> Option<&crate::editor_agent::AcpQuitTarget> {
+    fn target(&self) -> Option<&crate::editor_agent::AcpInvocation> {
         match self {
             Self::Reviewing { target, .. } | Self::Waiting { origin: QuitOrigin::Acp { target, .. }, .. } => Some(target),
             Self::Cancelled { invalid, .. } => invalid.as_ref(),
@@ -419,6 +480,8 @@ struct EditorView<'a> {
     remote_quit: &'a mut RemoteQuit,
     agent_cancel: &'a mut RemoteAgentCancel,
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
+    agent_stop: &'a mut RemoteAgentStop,
+    agent_stop_owner: Option<crate::editor_agent::StopOwner>,
     animation_draft: &'a mut AnimationDraft,
     timeline_value_draft: &'a mut Option<(TimelineSelection, f64)>,
     timeline_tension_draft: &'a mut Option<(TimelineSelection, f64)>,
@@ -488,6 +551,8 @@ macro_rules! editor_view {
             remote_quit: &mut $app.remote_quit,
             agent_cancel: &mut $app.agent_cancel,
             agent_cancel_target: $app.agent.cancel_target(),
+            agent_stop: &mut $app.agent_stop,
+            agent_stop_owner: $app.agent.stop_owner(),
             animation_draft: &mut $app.animation_draft,
             timeline_value_draft: &mut $app.timeline_value_draft,
             timeline_tension_draft: &mut $app.timeline_tension_draft,
@@ -586,7 +651,26 @@ impl EditorView<'_> {
     /// One MCP message: the controller answers it and asks this view for the `editor.*` requests.
     fn mcp(&mut self, controller: &mut EditorController, message: &Value, mut origin: McpOrigin<'_>) -> RpcReply {
         let reply_capable = matches!(origin, McpOrigin::Client);
-        let cancel_reply_capable = matches!(origin, McpOrigin::Client | McpOrigin::Agent(_));
+        let control_reply_capable = matches!(origin, McpOrigin::Client | McpOrigin::Agent(_));
+        let identified_stop = control_reply_capable && message["jsonrpc"] == "2.0" && message.get("id").is_some_and(|id|
+            id.is_string() || id.as_i64().is_some() || id.as_u64().is_some());
+        let stop_target = self.agent_stop_owner.ok_or_else(|| "Coding agent Stop is unavailable or its identity is exhausted".to_owned())
+            .and_then(|owner| match &origin {
+                McpOrigin::Client => Ok(crate::editor_agent::StopTarget::External(owner)),
+                McpOrigin::Agent(approval) => approval.stop_target(owner),
+                McpOrigin::Internal => Err("Stop requires an identified external request with a reply writer".into()),
+            }).and_then(|target| {
+                match &*self.agent_stop {
+                    RemoteAgentStop::Reviewing { target: expected, .. } if expected == &target
+                        && matches!(&target, crate::editor_agent::StopTarget::Acp { .. }) => Ok(target),
+                    RemoteAgentStop::Reviewing { .. } | RemoteAgentStop::Waiting { .. } =>
+                        Err("Stop already pending; read editor state".into()),
+                    RemoteAgentStop::Finished { invalid: Some(invalid), .. } if invalid == &target
+                        && matches!(&target, crate::editor_agent::StopTarget::Acp { .. }) =>
+                        Err("This original Stop request was invalidated; make a fresh request".into()),
+                    _ => self.agent_stop.attempt().checked_add(1).map(|_| target).ok_or("Stop identity exhausted".into()),
+                }
+            });
         let acp_quit = match &origin { McpOrigin::Agent(approval) => approval.quit_target().ok(), _ => None };
         let is_quit = message["method"] == "tools/call" && message["params"]["name"] == "editor_quit";
         let read_only = matches!(message["method"].as_str(), Some("tools/list" | "resources/list" | "resources/templates/list" | "resources/read" | "ping" | "initialize"))
@@ -615,6 +699,7 @@ impl EditorView<'_> {
             });
         let mut quit_receipt = None;
         let mut cancel_receipt = None;
+        let mut stop_receipt = None;
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
         controller.replacement_refusal = self.replacement_refusal(controller.snapshot());
@@ -634,6 +719,10 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.coding_agent.stop" {
+                    if !identified_stop { return Err("Stop requires an identified request with a reply writer".into()); }
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::Stop(stop_target.clone()?)), None);
+                }
                 if call["op"] == "editor.quit" {
                     if message["jsonrpc"] != "2.0" || !message.get("id").is_some_and(|id|
                         id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()) {
@@ -760,8 +849,25 @@ impl EditorView<'_> {
             }
             Ok(())
         }, &mut |controller, call| {
+            if call["op"] == "editor.coding_agent.stop" {
+                if !identified_stop { return Err("Stop requires an identified request with a reply writer".into()); }
+                let target = stop_target.clone()?;
+                let attempt = if matches!(&target, crate::editor_agent::StopTarget::Acp { .. }) {
+                    match &*self.agent_stop {
+                        RemoteAgentStop::Reviewing { attempt, target: expected } if expected == &target => *attempt,
+                        _ => return Err("The original Stop review is no longer valid".into()),
+                    }
+                } else { self.agent_stop.attempt().checked_add(1).ok_or("Stop identity exhausted")? };
+                let (sender, receipt) = sync_channel(1);
+                *self.agent_stop = RemoteAgentStop::Waiting { attempt, target, receipt,
+                    deadline: Instant::now() + AGENT_STOP_REPLY_TIMEOUT };
+                let admitted = json!({"codingAgentStop":{"state":"admitted", "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_owner"}});
+                stop_receipt = Some((sender, admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.coding_agent.cancel" {
-                if !cancel_reply_capable || message["jsonrpc"] != "2.0" || !message.get("id").is_some_and(|id|
+                if !control_reply_capable || message["jsonrpc"] != "2.0" || !message.get("id").is_some_and(|id|
                     id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()) {
                     return Err("Coding agent cancellation requires an identified request with a reply writer".into());
                 }
@@ -810,6 +916,14 @@ impl EditorView<'_> {
             self.handle(controller, call)
         });
         if let McpOrigin::Agent(approval) = &origin {
+            if let Some(target) = approval.stop_review() {
+                if !matches!(&*self.agent_stop, RemoteAgentStop::Reviewing { .. } | RemoteAgentStop::Waiting { .. })
+                    && !matches!(&*self.agent_stop, RemoteAgentStop::Finished { invalid: Some(invalid), .. } if invalid == &target) {
+                    if let Some(attempt) = self.agent_stop.attempt().checked_add(1) {
+                        *self.agent_stop = RemoteAgentStop::Reviewing { attempt, target };
+                    }
+                }
+            }
             if let Some(target) = approval.quit_review() {
                 if !self.remote_quit.active() && !matches!(&*self.remote_quit,
                     RemoteQuit::Cancelled { invalid: Some(invalid), .. } if invalid == &target) {
@@ -832,6 +946,19 @@ impl EditorView<'_> {
         }
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
+        if let Some((receipt, admitted)) = stop_receipt {
+            if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteAgentStop::Waiting { deadline, .. } = self.agent_stop {
+                    *deadline = Instant::now() + AGENT_STOP_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            let pending = std::mem::replace(self.agent_stop, RemoteAgentStop::Idle);
+            let RemoteAgentStop::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            *self.agent_stop = RemoteAgentStop::Finished { attempt, outcome:AgentStopOutcome::ReplyNotProduced, invalid:Some(target) };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, accepted)) = cancel_receipt {
             if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == accepted) {
@@ -1487,6 +1614,7 @@ impl EditorView<'_> {
                 "awaiting_permission": self.agent_state.awaiting_permission,
             },
             "codingAgentCancel": self.agent_cancel.state(),
+            "codingAgentStop": self.agent_stop.state(),
             "selection": {
                 "nodes": controller.selected_nodes(),
                 "bindings": self.parameters.selected_bindings.iter()
@@ -1562,6 +1690,7 @@ fn adopt_recovery(offer: &mut Vec<PathBuf>, recovery: Option<&mut autosave::Reco
 pub struct EditorApp {
     remote_quit: RemoteQuit,
     agent_cancel: RemoteAgentCancel,
+    agent_stop: RemoteAgentStop,
     #[cfg(test)]
     hold_quit_receipt_for_test: bool,
     #[cfg(test)]
@@ -1691,6 +1820,7 @@ impl EditorApp {
         let mut app = Self {
             remote_quit: RemoteQuit::Idle,
             agent_cancel: RemoteAgentCancel::Idle,
+            agent_stop: RemoteAgentStop::Idle,
             #[cfg(test)]
             hold_quit_receipt_for_test: false,
             #[cfg(test)]
@@ -2020,6 +2150,38 @@ impl EditorApp {
             Some(crate::editor_agent::CancelResult::Unavailable) | None => AgentCancelOutcome::StaleTarget,
         });
         self.agent_cancel = RemoteAgentCancel::Finished { attempt, outcome };
+    }
+
+    fn finish_agent_stop(&mut self, ctx: &egui::Context) {
+        if let RemoteAgentStop::Reviewing { attempt, target } = &self.agent_stop {
+            if let Err(refusal) = self.agent.stop_status(target, false) {
+                let (attempt, target) = (*attempt, target.clone());
+                self.agent.invalidate_stop(&target);
+                self.agent_stop = RemoteAgentStop::Finished { attempt, outcome:refusal.into(), invalid:Some(target) };
+            }
+            return;
+        }
+        let RemoteAgentStop::Waiting { receipt, deadline, .. } = &mut self.agent_stop else { return };
+        let failure = if Instant::now() >= *deadline { Some(AgentStopOutcome::ReplyExpired) } else {
+            match receipt.try_recv() {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => Some(AgentStopOutcome::ReplyFailed),
+                Err(TryRecvError::Disconnected) => Some(AgentStopOutcome::ReplyLost),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(10));
+                    return;
+                }
+            }
+        };
+        let pending = std::mem::replace(&mut self.agent_stop, RemoteAgentStop::Idle);
+        let RemoteAgentStop::Waiting { attempt, target, .. } = pending else { unreachable!() };
+        let outcome = failure.unwrap_or_else(|| match self.agent.stop_if_current(&target) {
+            Ok(crate::editor_agent::StopResult::Stopped { approval_reply_failed }) => AgentStopOutcome::Stopped { approval_reply_failed },
+            Ok(crate::editor_agent::StopResult::FailedRetained { approval_reply_failed }) => AgentStopOutcome::FailedRetained { approval_reply_failed },
+            Err(refusal) => refusal.into(),
+        });
+        self.agent.invalidate_stop(&target);
+        self.agent_stop = RemoteAgentStop::Finished { attempt, outcome, invalid:Some(target) };
     }
 
     fn finish_remote_quit(&mut self, ctx: &egui::Context) {
@@ -6802,6 +6964,7 @@ impl eframe::App for EditorApp {
             self.remote_quit.cancel("native_close_requested");
         }
         self.finish_agent_cancel(ctx);
+        self.finish_agent_stop(ctx);
         self.agent.pump();
         self.observe_remote_quit(ctx);
         let mcp_status = self.mcp_status();
@@ -6833,11 +6996,13 @@ impl eframe::App for EditorApp {
         self.observe_remote_quit(ctx);
         let approval_path = self.tools.store_path.clone();
         self.finish_agent_cancel(ctx);
+        self.finish_agent_stop(ctx);
         self.agent.tick(ctx);
         let controller = &mut self.controller;
         let mut view = editor_view!(self, ctx);
         self.agent.serve_mcp(approval_path.as_deref(), &mut |message, approval| view.mcp(controller, message, McpOrigin::Agent(approval)));
         self.finish_agent_cancel(ctx);
+        self.finish_agent_stop(ctx);
         self.agent.host_approval_window(ctx, approval_path.as_deref());
         self.handle_shortcuts(ctx);
         self.window_chrome(ctx);
@@ -16195,8 +16360,575 @@ mod editor_state_tests {
         CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
     }
 
+    #[test]
+    fn coding_agent_stop_admission_precedes_frame_owned_release() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-stop-admission");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        *app.agent.prompt_mut() = "Retained next prompt".into();
+        let before = app.controller.snapshot().clone();
+        let request = json!({"jsonrpc":"2.0", "id":"stop-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client));
+        let mut bytes = Vec::new();
+        reply.write_line(&mut bytes).unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentStop"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert!(!app.agent.state().has_client);
+        assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"stopped", "attempt":1, "approval_reply_failed":false}));
+        assert_eq!(app.agent.prompt_mut(), "Retained next prompt");
+        assert_eq!(app.controller.snapshot(), &before);
+        peer.finish(&mut app);
+    }
+
     fn finish_agent_cancel(app: &mut EditorApp) {
         CTX.with(|ctx| app.finish_agent_cancel(ctx));
+    }
+
+    fn request_agent_stop(app: &mut EditorApp) -> RpcReply {
+        let request = json!({"jsonrpc":"2.0", "id":"stop-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+    }
+
+    fn finish_agent_stop(app: &mut EditorApp) {
+        CTX.with(|ctx| app.finish_agent_stop(ctx));
+    }
+
+    fn serve_agent_requests(app: &mut EditorApp) {
+        let path = app.tools.store_path.clone();
+        CTX.with(|ctx| {
+            let controller = &mut app.controller;
+            let mut view = editor_view!(app, ctx);
+            app.agent.serve_mcp(path.as_deref(), &mut |request, approval|
+                view.mcp(controller, request, McpOrigin::Agent(approval)));
+        });
+    }
+
+    #[test]
+    fn coding_agent_stop_failed_lost_and_expired_replies_keep_owner_and_require_fresh_attempt() {
+        struct BadWriter { remaining: usize, fail_flush: bool }
+        impl std::io::Write for BadWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                let n = bytes.len().min(self.remaining);
+                self.remaining -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+            }
+        }
+        for case in ["partial", "flush", "drop", "consumer", "expired"] {
+            let mut app = app(&format!("coding-agent-stop-reply-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let before = app.controller.snapshot().clone();
+            let reply = request_agent_stop(&mut app);
+            finish_agent_stop(&mut app);
+            assert!(app.agent.state().has_client);
+            assert_eq!(state(&mut app)["codingAgentStop"]["state"], "waiting_for_reply");
+            assert!(refused(&mut app, "editor_coding_agent_stop", json!({})).contains("already pending"));
+            match case {
+                "partial" | "flush" => assert!(reply.write_line(&mut BadWriter {
+                    remaining:if case == "partial" { 4 } else { usize::MAX }, fail_flush:case == "flush" }).is_err()),
+                "drop" => drop(reply),
+                "consumer" => { assert!(reply.into_message().is_some()); }
+                _ => {
+                    reply.write_line(&mut Vec::new()).unwrap();
+                    let RemoteAgentStop::Waiting { deadline, .. } = &mut app.agent_stop else { panic!() };
+                    *deadline = Instant::now() - Duration::from_millis(1);
+                }
+            }
+            finish_agent_stop(&mut app);
+            let expected = match case { "partial" | "flush" => "reply_failed", "expired" => "reply_expired", _ => "reply_lost" };
+            assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":expected, "attempt":1}));
+            assert!(app.agent.state().has_client && app.agent.state().turn_active);
+            assert_eq!(app.controller.snapshot(), &before);
+            request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();
+            finish_agent_stop(&mut app);
+            assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"stopped", "attempt":2, "approval_reply_failed":false}));
+            finish_agent_stop(&mut app);
+            assert!(!app.agent.state().has_client);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_original_authenticated_call_alone_consumes_human_approval() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-stop-original-acp");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"same-stop-id", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        let original = lifecycle_http(&endpoint, &request);
+        let second = lifecycle_http(&endpoint, &request);
+        let address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let token = endpoint.token_for_test().to_owned();
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        let mut harness = Harness::new();
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"awaiting_human", "attempt":1}));
+        assert!(app.agent.state().has_client);
+        assert_eq!(lifecycle_http_result(second, "same-stop-id")["isError"], true);
+        assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":"Changed during Stop review"}))["succeeded"], true);
+        app.select_node_draft(2);
+        app.controller.set_draft_name("Unapplied Stop review draft".into());
+        let _ = state(&mut app);
+        let snapshot = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone();
+        harness.click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        let late_duplicate = {
+            use std::io::Write;
+            let mut stream = std::net::TcpStream::connect(&address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body = request.to_string();
+            write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            stream
+        };
+        harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        let result = lifecycle_http_result(original, "same-stop-id");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["codingAgentStop"]["state"], "admitted");
+        assert_eq!(lifecycle_http_result(late_duplicate, "same-stop-id")["isError"], true);
+        assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"stopped", "attempt":1, "approval_reply_failed":false}));
+        assert!(!app.agent.state().has_client);
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Unapplied Stop review draft"));
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_denied_expired_or_changed_review_never_stops_the_owner() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["denied", "timeout", "completed", "permission"] {
+            let mut app = app(&format!("coding-agent-stop-review-{case}"));
+            let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+            let request = json!({"jsonrpc":"2.0", "id":"review-stop", "method":"tools/call",
+                "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+            let stream = lifecycle_http(&endpoint, &request);
+            let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+            lifecycle_prompt(&mut app, &peer);
+            serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["codingAgentStop"]["state"], "awaiting_human");
+            match case {
+                "denied" => {
+                    let path = app.tools.store_path.clone();
+                    Harness::new().click(Role::Button, "Deny changes this turn", |ctx|
+                        app.agent.host_approval_window(ctx, path.as_deref()));
+                }
+                "timeout" => app.agent.expire_host_approval_for_test(),
+                "completed" => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    app.agent.pump();
+                }
+                _ => peer.enqueue(lifecycle_permission()),
+            }
+            finish_agent_stop(&mut app);
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(stream, "review-stop")["isError"], true);
+            assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"consent_invalid", "attempt":1}));
+            assert!(app.agent.state().has_client);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_acp_execution_uses_owner_observed_turn_and_reader_permission_cutoffs() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["decoded_completion", "observed_completion", "new_prompt", "permission", "disconnect"] {
+            let mut app = app(&format!("coding-agent-stop-cutoff-{case}"));
+            let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+            let request = json!({"jsonrpc":"2.0", "id":"cutoff-stop", "method":"tools/call",
+                "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+            let stream = lifecycle_http(&endpoint, &request);
+            let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+            lifecycle_prompt(&mut app, &peer);
+            serve_agent_requests(&mut app);
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            let result = lifecycle_http_result(stream, "cutoff-stop");
+            assert_eq!(result["isError"], false, "{result}");
+            assert!(app.agent.state().has_client);
+            match case {
+                "permission" => peer.enqueue(lifecycle_permission()),
+                "disconnect" => {
+                    peer.frames.take();
+                    let RemoteAgentStop::Waiting { target, .. } = &app.agent_stop else { panic!() };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.agent.stop_status(target, true).is_ok() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                }
+                _ => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    if case != "decoded_completion" { app.agent.pump(); }
+                    if case == "new_prompt" {
+                        *app.agent.prompt_mut() = "New independently sent fixture turn".into();
+                        app.agent.send();
+                    }
+                }
+            }
+            if case == "decoded_completion" {
+                let mut frame = eframe::Frame::_new_kittest();
+                Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+                assert!(!app.agent.state().has_client);
+            } else {
+                finish_agent_stop(&mut app);
+                assert_eq!(state(&mut app)["codingAgentStop"]["state"], "consent_invalid");
+                assert!(app.agent.state().has_client);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_external_action_handles_every_retained_lifecycle_state() {
+        for case in ["initializing", "ready", "queued", "running", "cancelling", "closed"] {
+            let mut app = app(&format!("coding-agent-stop-state-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
+            else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
+            if case == "queued" { *app.agent.prompt_mut() = "Owned queued turn".into(); app.agent.send(); }
+            if case == "cancelling" { app.agent.cancel(); }
+            if case == "closed" {
+                peer.frames.take();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.agent.state().closed {
+                    assert!(Instant::now() < deadline);
+                    app.agent.pump();
+                    std::thread::yield_now();
+                }
+            }
+            assert!(app.agent.state().has_client);
+            *app.agent.prompt_mut() = "Retained after Stop".into();
+            request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();
+            finish_agent_stop(&mut app);
+            assert!(!app.agent.state().has_client, "{case}");
+            assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+            assert_eq!(app.agent.prompt_mut(), "Retained after Stop");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_bad_envelopes_arguments_and_internal_origin_never_admit() {
+        let mut app = app("coding-agent-stop-inputs");
+        assert!(refused(&mut app, "editor_coding_agent_stop", json!({})).contains("unavailable"));
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        for args in [Value::Null, json!([]), json!({"force":true}), json!({"run":0})] {
+            let _ = refused(&mut app, "editor_coding_agent_stop", args);
+        }
+        for (id, version) in [(Value::Null, "2.0"), (json!(true), "2.0"), (json!(1.5), "2.0"), (json!([]), "2.0"), (json!(1), "1.0")] {
+            let request = json!({"jsonrpc":version, "id":id, "method":"tools/call",
+                "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+            CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+                .write_line(&mut Vec::new()).unwrap();
+        }
+        let notification = json!({"jsonrpc":"2.0", "method":"tools/call", "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &notification, McpOrigin::Client))
+            .write_line(&mut Vec::new()).unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        let response = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Internal).into_message()).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        finish_agent_stop(&mut app);
+        assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"idle"}));
+        assert!(app.agent.state().has_client);
+        app.agent_stop = RemoteAgentStop::Finished { attempt:u64::MAX, outcome:AgentStopOutcome::ReplyLost, invalid:None };
+        assert!(refused(&mut app, "editor_coding_agent_stop", json!({})).contains("identity exhausted"));
+        assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"reply_lost", "attempt":u64::MAX}));
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_never_retargets_replacement_but_external_run_authority_survives_turn_progress() {
+        for case in ["replacement", "native_stop", "new_prompt"] {
+            let mut app = app(&format!("coding-agent-stop-owner-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let reply = request_agent_stop(&mut app);
+            match case {
+                "replacement" => {
+                    peer.finish(&mut app);
+                    peer = LifecyclePeer::attach(&mut app, None);
+                    lifecycle_prompt(&mut app, &peer);
+                }
+                "native_stop" => app.agent.stop(),
+                _ => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    app.agent.pump();
+                    *app.agent.prompt_mut() = "New owned fixture turn".into();
+                    app.agent.send();
+                }
+            }
+            reply.write_line(&mut Vec::new()).unwrap();
+            finish_agent_stop(&mut app);
+            if case == "new_prompt" {
+                assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+                assert!(!app.agent.state().has_client);
+            } else {
+                assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stale_target");
+                assert_eq!(app.agent.state().has_client, case == "replacement");
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_ordinary_http_delivers_before_canonical_release() {
+        use std::io::Write;
+        let mut app = app("coding-agent-stop-http");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
+        let token = "owned-stop-http-token";
+        let server = mcp_listener::McpServer::start(&settings, Some(token.into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = json!({"jsonrpc":"2.0", "id":"stop-http", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}}).to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server);
+        CTX.with(|ctx| app.serve_mcp(ctx));
+        let result = lifecycle_http_result(stream, "stop-http");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["codingAgentStop"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        finish_agent_stop(&mut app);
+        assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_stdio_worker_flushes_admission_before_release() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct Output(Arc<Mutex<Vec<u8>>>, std::sync::mpsc::SyncSender<()>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.1.send(()).unwrap(); Ok(()) }
+        }
+        let mut app = app("coding-agent-stop-stdio");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        let (input, mut writer) = std::io::pipe().unwrap();
+        let (host, receive) = std::sync::mpsc::sync_channel(1);
+        let (flushed, flush) = std::sync::mpsc::sync_channel(1);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Output(bytes.clone(), flushed);
+        let worker = std::thread::spawn(move || crate::editor_stdio::serve_lines(
+            std::io::BufReader::new(input), output, &host, &egui::Context::default()));
+        app.host_rx = Some(receive);
+        writeln!(writer, "{}", json!({"jsonrpc":"2.0", "id":"stop-stdio", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.agent_stop, RemoteAgentStop::Waiting { .. }) {
+            assert!(Instant::now() < deadline);
+            CTX.with(|ctx| app.drain_host(ctx));
+            std::thread::yield_now();
+        }
+        flush.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response: Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "stop-stdio");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentStop"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        while app.agent.state().has_client {
+            assert!(Instant::now() < deadline);
+            finish_agent_stop(&mut app);
+            std::thread::yield_now();
+        }
+        assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+        drop(writer);
+        worker.join().unwrap();
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_preserves_actual_edit_history_private_draft_settings_and_human_dialogs() {
+        for format in ["inx", "live2d.cmo3", "live2d.can3"] {
+            let mut app = match format {
+                "live2d.cmo3" => runtime_export_app("coding-agent-stop-cmo3", false),
+                "live2d.can3" => can3_scene_app("coding-agent-stop-can3"),
+                _ => app("coding-agent-stop-inx"),
+            };
+            let mut models = Vec::new();
+            if format == "inx" {
+                models.push(app.controller.snapshot()["model"].clone());
+                for name in ["First", "Second"] {
+                    assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":name}))["succeeded"], true);
+                    models.push(app.controller.snapshot()["model"].clone());
+                }
+                assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+                app.select_node_draft(2);
+                app.controller.set_draft_name("Retained Stop edit draft".into());
+            }
+            app.unsaved = Some(unsaved_dialog());
+            app.tools.prompt = Some(restore_prompt());
+            let dialog = app.unsaved.as_ref().unwrap().dialog.clone();
+            let restore = app.tools.prompt.clone();
+            let settings_path = app.tools.store_path.clone().unwrap();
+            std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+            std::fs::write(&settings_path, b"{\"DarkMode\":true}").unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let private = "stop-private-unsent-sentinel";
+            *app.agent.prompt_mut() = private.into();
+            app.agent.set_briefing(Some(private.into()));
+            app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
+            app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
+            let _ = state(&mut app);
+            let before = app.controller.snapshot().clone();
+            let mut bytes = Vec::new();
+            request_agent_stop(&mut app).write_line(&mut bytes).unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains(private));
+            finish_agent_stop(&mut app);
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentStop"], json!({"state":"stopped", "attempt":1, "approval_reply_failed":false}));
+            assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
+            assert!(!observed["codingAgentStop"].to_string().contains(private));
+            assert_eq!(app.controller.snapshot(), &before);
+            assert_eq!(app.agent.prompt_mut(), private);
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
+            assert_eq!(app.tools.prompt, restore);
+            assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
+            if format == "inx" {
+                assert_eq!((&before["canUndo"], &before["canRedo"]), (&json!(true), &json!(true)));
+                assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Retained Stop edit draft"));
+                app.controller.discard_draft();
+                for (op, model) in [("redo", &models[2]), ("undo", &models[1]), ("undo", &models[0])] {
+                    assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"], true);
+                    assert_eq!(&app.controller.snapshot()["model"], model);
+                }
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_external_drain_releases_endpoint_before_the_existing_second_pump() {
+        use crate::editor_test_support::Harness;
+        use std::io::Write;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let mut app = app("coding-agent-stop-second-pump");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let agent_address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
+        let token = "owned-stop-order-token";
+        let server = mcp_listener::McpServer::start(&settings, Some(token.into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = json!({"jsonrpc":"2.0", "id":"before-second-stop", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}}).to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server);
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        app.agent.before_next_tick_for_test(move || {
+            assert!(std::net::TcpStream::connect(&agent_address).is_err(), "Stop must release the agent endpoint before tick pumps");
+            observed.store(true, Ordering::SeqCst);
+        });
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(lifecycle_http_result(stream, "before-second-stop")["isError"], false);
+        assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_and_cancel_keep_existing_order_and_do_not_retarget_after_release() {
+        use crate::editor_test_support::Harness;
+        for stop_first in [false, true] {
+            let mut app = app("coding-agent-stop-cancel-order");
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let stop = request_agent_stop(&mut app);
+            let cancel = request_agent_cancel(&mut app);
+            stop.write_line(&mut Vec::new()).unwrap();
+            if stop_first { finish_agent_stop(&mut app); }
+            cancel.write_line(&mut Vec::new()).unwrap();
+            let mut frame = eframe::Frame::_new_kittest();
+            Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+            assert_eq!(state(&mut app)["codingAgentCancel"]["state"], if stop_first { "stale_target" } else { "requested" });
+            assert!(!app.agent.state().has_client);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_self_consent_is_invalidated_by_deliverable_cancel() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-stop-self-cancel");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"self-stop", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
+        let stream = lifecycle_http(&endpoint, &request);
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(stream, "self-stop")["isError"], false);
+        request_agent_cancel(&mut app).write_line(&mut Vec::new()).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentCancel"]["state"], "requested");
+        assert_eq!(state(&mut app)["codingAgentStop"]["state"], "consent_invalid");
+        assert!(app.agent.state().has_client && app.agent.state().cancelling);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_stop_invalidates_accepted_acp_quit_without_closing_the_editor() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-stop-quit");
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"quit-before-stop", "method":"tools/call",
+            "params":{"name":"editor_quit", "arguments":{}}});
+        let stream = lifecycle_http(&endpoint, &request);
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(stream, "quit-before-stop")["isError"], false);
+        request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();
+        finish_agent_stop(&mut app);
+        assert_eq!(finish_quit(&mut app), 0);
+        assert!(!app.closing && !app.agent.state().has_client);
+        assert_eq!(state(&mut app)["quit"]["state"], "cancelled");
+        peer.finish(&mut app);
     }
 
     #[test]

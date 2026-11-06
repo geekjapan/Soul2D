@@ -2330,9 +2330,9 @@ Counts: covered 74, tracked 4, absent 22, no counterpart 3.
 
 ## Soul2D editor panels (`rust/src/editor_ui.rs`)
 
-Read from the source on 2026-10-20: the 118 distinct control labels of `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers), grouped by panel, 21 rows (Cancel is listed separately). `covered` means every control of the group ends in a Session operation that an MCP tool also reaches; `GUI-only` names a group that does not.
+Read from the source on 2026-10-20: the 118 distinct control labels of `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers), grouped by panel, 22 rows (Cancel and Stop are listed separately). `covered` means every control of the group ends in a Session operation that an MCP tool also reaches; `GUI-only` names a group that does not.
 
-Counts: covered 20, GUI-only 1.
+Counts: covered 21, GUI-only 1.
 
 | Panel | Controls | Session operation / tool | Status |
 |---|---|---|---|
@@ -2354,6 +2354,7 @@ Counts: covered 20, GUI-only 1.
 | History | Undo history, Clear history | history_summary, history_goto, history_clear | covered (history_goto) |
 | Part split review | Part split review, Apply split | split_plan, split_apply | covered (split_apply) |
 | Coding agent > Cancel | Cancel | editor_coding_agent_cancel | bounded current-turn Cancel after exact local reply delivery and matching owner; latest attempt under `codingAgentCancel`, local request acceptance is not peer processing or turn completion |
-| Coding agent | Coding agent (ACP session, prompt, permission replies) |  | GUI-only controls; lifecycle is partially observable through `resource://soul2d/editor/state` under `codingAgent` (seven nonsecret processed-state booleans). Start/Stop, sessions, prompts and permission replies remain native controls; ACP tool calls reach the shared Session through the editor's MCP endpoint |
+| Coding agent > Stop | Stop | editor_coding_agent_stop | bounded exact-run Stop after local reply delivery; ACP self-Stop needs original human consent, shared canonical release/failure and latest `codingAgentStop` readback; no successful-turn prerequisite |
+| Coding agent | Coding agent (ACP session, prompt, permission replies) |  | GUI-only controls; lifecycle is partially observable through `resource://soul2d/editor/state` under `codingAgent` (seven nonsecret processed-state booleans). Start, New session, prompts and permission replies remain native controls; ACP tool calls reach the shared Session through the editor's MCP endpoint |
 | Viewport | Zoom in, Zoom out, 1: follows the parents, 2: model coordinates | editor_camera_set, editor_viewport_set | covered (editor_camera_set) |
 | Dialogs | Save As, Keep for later, Add with suffix, Confirm / Cancel deletions, Discard new ... | save, editor_recovery_restore, editor_recovery_keep | covered (editor_recovery_keep); Keep for later dismisses the startup offer only; other confirmations remain host-owned, the operations refuse or apply in one call |

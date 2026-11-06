@@ -103,7 +103,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// Tools that set state only the editor window holds. Every other host refuses them, and the manifest
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
-    "editor_quit", "editor_coding_agent_cancel",
+    "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop",
     "editor_selection_set", "editor_armed_set", "editor_camera_set", "editor_camera_fit", "editor_camera_sync", "editor_tool_set", "editor_grid_set",
     "editor_guides_set", "editor_physics_preview_set", "editor_solo_set", "editor_onion_set", "editor_playback_set", "editor_timeline_zoom_set", "editor_viewport_set", "editor_address_dialog", "editor_about_set", "editor_welcome_set", "editor_command_browser_set", "editor_texture_viewer_set", "editor_parameters_set", "editor_panel_set", "editor_layout_reset", "editor_workspace_save",
     "editor_workspace_apply", "editor_native_parameters_set", "editor_texture_viewer_load",
@@ -217,6 +217,7 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
     Ok(match name {
         "editor_quit" => json!({"op":"editor.quit"}),
         "editor_coding_agent_cancel" => json!({"op":"editor.coding_agent.cancel"}),
+        "editor_coding_agent_stop" => json!({"op":"editor.coding_agent.stop"}),
         "editor_selection_set" => {
             let mut call = json!({"op": "editor.selection.set"});
             if let Some(list) = args.get("nodes") {
@@ -5404,6 +5405,13 @@ flip-pair partners. The clipboard is used up.",
              Failed, dropped or expired reply delivery never executes. Cancellation-write failure may leave partial remote effects; do not \
              retry automatically. Preserves unsent text, document, drafts and settings; cancels permissions rather than approving them. \
              Does not start an agent or send a new prompt. Headless, notifications and internal calls refuse.",
+            closed_schema(&[], &[])),
+        tool("editor_coding_agent_stop", "Action: admit Stop of the exact retained coding-agent run after local reply delivery. \
+             ACP self-Stop requires human approval of the original authenticated call, without waiting for a successful turn. \
+             Stops and may kill/reap the owned child; successful release discards its conversation but preserves unsent text, \
+             document, drafts, history and settings. Failed shutdown can retain a closed owner after removing its endpoint. \
+             Read codingAgentStop for the latest attempt and independent approval-write failure; admission is not execution. \
+             No automatic retry, provider-completion guarantee, launch or disable. Headless, notifications and internal calls refuse.",
             closed_schema(&[], &[])),
         tool("editor_selection_set", "Action: select in the editor. nodes: these nodes, in this order (the first is the \
              primary); an empty list clears the node selection. bindings: these {node, channel} bindings of the armed \

@@ -11879,6 +11879,25 @@
       ]
     },
     {
+      "description": "Action: admit Stop of the exact retained coding-agent run after local reply delivery. ACP self-Stop requires human approval of the original authenticated call, without waiting for a successful turn. Stops and may kill/reap the owned child; successful release discards its conversation but preserves unsent text, document, drafts, history and settings. Failed shutdown can retain a closed owner after removing its endpoint. Read codingAgentStop for the latest attempt and independent approval-write failure; admission is not execution. No automatic retry, provider-completion guarantee, launch or disable. Headless, notifications and internal calls refuse.",
+      "effect": "application-lifecycle",
+      "guiEntry": [
+        "Coding agent > Stop"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_stop",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: open or close the Command Browser, as Edit > Command Browser, its shortcut, close button and Escape do. Read windows.commandBrowser in the returned editor state. Repeated open preserves the current search, selection, argument draft and result; closing clears them. Retained across document replacement, layout reset and listener restart; closed on process restart. Editor only, all document formats. No document, history or settings write; no ACP host approval is needed.",
       "effect": "editor-state",
       "guiEntry": [
