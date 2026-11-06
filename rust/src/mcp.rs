@@ -103,7 +103,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// Tools that set state only the editor window holds. Every other host refuses them, and the manifest
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
-    "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set",
+    "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set", "editor_coding_agent_prompt_set",
     "editor_selection_set", "editor_armed_set", "editor_camera_set", "editor_camera_fit", "editor_camera_sync", "editor_tool_set", "editor_grid_set",
     "editor_guides_set", "editor_physics_preview_set", "editor_solo_set", "editor_onion_set", "editor_playback_set", "editor_timeline_zoom_set", "editor_viewport_set", "editor_address_dialog", "editor_about_set", "editor_welcome_set", "editor_command_browser_set", "editor_texture_viewer_set", "editor_parameters_set", "editor_panel_set", "editor_layout_reset", "editor_workspace_save",
     "editor_workspace_apply", "editor_native_parameters_set", "editor_texture_viewer_load",
@@ -218,6 +218,9 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         "editor_quit" => json!({"op":"editor.quit"}),
         "editor_coding_agent_cancel" => json!({"op":"editor.coding_agent.cancel"}),
         "editor_coding_agent_stop" => json!({"op":"editor.coding_agent.stop"}),
+        "editor_coding_agent_prompt_set" => json!({"op":"editor.coding_agent.prompt.set",
+            "expectedDraftIdentity":args["expectedDraftIdentity"].as_str().ok_or("expectedDraftIdentity must be a string")?,
+            "text":args["text"].as_str().ok_or("text must be a string")?}),
         "editor_coding_agent_set" => json!({"op":"editor.coding_agent.set", "enabled":args["enabled"].as_bool().ok_or("enabled must be a boolean")?}),
         "editor_selection_set" => {
             let mut call = json!({"op": "editor.selection.set"});
@@ -5407,6 +5410,15 @@ flip-pair partners. The clipboard is used up.",
              retry automatically. Preserves unsent text, document, drafts and settings; cancels permissions rather than approving them. \
              Does not start an agent or send a new prompt. Headless, notifications and internal calls refuse.",
             closed_schema(&[], &[])),
+        tool("editor_coding_agent_prompt_set", "Action: replace or clear only the unsent User message field, preserving exact text. \
+             Read codingAgentDraft.identity and supply it as expectedDraftIdentity. An identified successful local reply and matching \
+             draft/opt-in identity precede one edit; admission is not execution. Read codingAgentDraftEdit and match attempt. \
+             Every authenticated ACP request requires original-call human Allow once, including identical text and empty seeding. \
+             No Send, launch, enable, permission grant, settings save or document edit. Private text is never returned. \
+             Native edits, failed/lost/expired delivery or invalid consent prevent execution; never retry automatically. \
+             The panel must be enabled; active-turn editing preserves the reader, conversation and permissions. \
+             Headless, internal calls and notifications refuse.",
+            closed_schema(&[("expectedDraftIdentity", json!({"type":"string"})), ("text", json!({"type":"string"}))], &["expectedDraftIdentity", "text"])),
         tool("editor_coding_agent_set", "Action: admit the session-only coding-agent checkbox transition after identified local reply delivery and matching state. \
              Enabling does not launch, bind, save settings or clear errors. Disabling uses native Stop once, then sets enabled=false even if \
              shutdown fails and retains the closed owner without its endpoint. Same-value requests do nothing and never retry Stop. \

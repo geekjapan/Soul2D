@@ -11879,6 +11879,35 @@
       ]
     },
     {
+      "description": "Action: replace or clear only the unsent User message field, preserving exact text. Read codingAgentDraft.identity and supply it as expectedDraftIdentity. An identified successful local reply and matching draft/opt-in identity precede one edit; admission is not execution. Read codingAgentDraftEdit and match attempt. Every authenticated ACP request requires original-call human Allow once, including identical text and empty seeding. No Send, launch, enable, permission grant, settings save or document edit. Private text is never returned. Native edits, failed/lost/expired delivery or invalid consent prevent execution; never retry automatically. The panel must be enabled; active-turn editing preserves the reader, conversation and permissions. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Coding agent > User message"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_prompt_set",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedDraftIdentity": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedDraftIdentity",
+          "text"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: admit the session-only coding-agent checkbox transition after identified local reply delivery and matching state. Enabling does not launch, bind, save settings or clear errors. Disabling uses native Stop once, then sets enabled=false even if shutdown fails and retains the closed owner without its endpoint. Same-value requests do nothing and never retry Stop. ACP self-disable that stops an owner requires original-call human Allow once, without successful-turn waiting. Read codingAgentSet and match its attempt; admission is not execution. Preserves unsent text, document, drafts, history and settings. Failed, lost or expired delivery never executes. No automatic retry. Headless, notifications and internal calls refuse.",
       "effect": "application-lifecycle",
       "guiEntry": [

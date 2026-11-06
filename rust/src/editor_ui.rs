@@ -316,6 +316,60 @@ const ACP_QUIT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const AGENT_CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_SET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_DRAFT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum AgentDraftOutcome {
+    Applied,
+    NoOp,
+    Refused(crate::editor_agent::DraftRefusal),
+    EditorClosing,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+enum RemoteAgentDraft {
+    Idle,
+    Reviewing { attempt:u64, target:crate::editor_agent::DraftTarget },
+    Waiting { attempt:u64, target:crate::editor_agent::DraftTarget,
+        receipt:Receiver<Result<(), String>>, deadline:Instant },
+    Finished { attempt:u64, outcome:AgentDraftOutcome, invalid_invocation:Option<crate::editor_agent::AcpInvocation> },
+}
+
+impl RemoteAgentDraft {
+    fn attempt(&self) -> u64 {
+        match self {
+            Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt,
+        }
+    }
+
+    fn state(&self) -> Value {
+        use crate::editor_agent::DraftRefusal;
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Reviewing { attempt, .. } => json!({"state":"awaiting_human", "attempt":attempt}),
+            Self::Waiting { attempt, .. } => json!({"state":"waiting_for_reply", "attempt":attempt}),
+            Self::Finished { attempt, outcome, .. } => {
+                let state = match outcome {
+                    AgentDraftOutcome::Applied => "applied",
+                    AgentDraftOutcome::NoOp => "no_op",
+                    AgentDraftOutcome::Refused(DraftRefusal::Disabled) => "disabled",
+                    AgentDraftOutcome::Refused(DraftRefusal::StaleDraft) => "stale_draft",
+                    AgentDraftOutcome::Refused(DraftRefusal::IdentityUnavailable) => "identity_unavailable",
+                    AgentDraftOutcome::Refused(DraftRefusal::ConsentInvalid) => "consent_invalid",
+                    AgentDraftOutcome::EditorClosing => "editor_closing",
+                    AgentDraftOutcome::ReplyNotProduced => "reply_not_produced",
+                    AgentDraftOutcome::ReplyFailed => "reply_failed",
+                    AgentDraftOutcome::ReplyLost => "reply_lost",
+                    AgentDraftOutcome::ReplyExpired => "reply_expired",
+                };
+                json!({"state":state, "attempt":attempt})
+            }
+        }
+    }
+}
 
 enum AgentSetOutcome {
     Applied(crate::editor_agent::AgentSetResult),
@@ -542,6 +596,8 @@ struct EditorView<'a> {
     agent_stop_owner: Option<crate::editor_agent::StopOwner>,
     agent_set: &'a mut RemoteAgentSet,
     agent_set_snapshot: Result<crate::editor_agent::AgentSetSnapshot, String>,
+    agent_draft: &'a mut RemoteAgentDraft,
+    agent_draft_snapshot: crate::editor_agent::DraftSnapshot,
     animation_draft: &'a mut AnimationDraft,
     timeline_value_draft: &'a mut Option<(TimelineSelection, f64)>,
     timeline_tension_draft: &'a mut Option<(TimelineSelection, f64)>,
@@ -615,6 +671,8 @@ macro_rules! editor_view {
             agent_stop_owner: $app.agent.stop_owner(),
             agent_set: &mut $app.agent_set,
             agent_set_snapshot: $app.agent.set_snapshot(),
+            agent_draft: &mut $app.agent_draft,
+            agent_draft_snapshot: $app.agent.draft_snapshot(),
             animation_draft: &mut $app.animation_draft,
             timeline_value_draft: &mut $app.timeline_value_draft,
             timeline_tension_draft: &mut $app.timeline_tension_draft,
@@ -746,6 +804,20 @@ impl EditorView<'_> {
                 _ => self.agent_set.attempt().checked_add(1).map(|_| target).ok_or("Coding agent Set identity exhausted".into()),
             }
         });
+        let draft_target: Result<crate::editor_agent::DraftTarget, String> = (|| {
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_)) { return Err(CLOSING_MESSAGE.into()); }
+            let expected = message["params"]["arguments"]["expectedDraftIdentity"].as_str().ok_or("expectedDraftIdentity must be a string")?;
+            let text = message["params"]["arguments"]["text"].as_str().ok_or("text must be a string")?;
+            let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
+            let target = self.agent_draft_snapshot.target(expected, text.to_owned(), approval)?;
+            match &*self.agent_draft {
+                RemoteAgentDraft::Reviewing { target:original, .. } if original == &target && target.invocation().is_some() => Ok(target),
+                RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. } => Err("Coding-agent draft edit already pending; read editor state".into()),
+                RemoteAgentDraft::Finished { invalid_invocation:Some(invalid), .. } if target.invocation() == Some(invalid) =>
+                    Err("This original draft edit was invalidated; make a fresh request".into()),
+                _ => self.agent_draft.attempt().checked_add(1).map(|_| target).ok_or("Draft edit identity exhausted".into()),
+            }
+        })();
         let acp_quit = match &origin { McpOrigin::Agent(approval) => approval.quit_target().ok(), _ => None };
         let is_quit = message["method"] == "tools/call" && message["params"]["name"] == "editor_quit";
         let read_only = matches!(message["method"].as_str(), Some("tools/list" | "resources/list" | "resources/templates/list" | "resources/read" | "ping" | "initialize"))
@@ -772,6 +844,7 @@ impl EditorView<'_> {
                     _ => Ok(target.clone()),
                 }
             });
+        let mut draft_receipt = None;
         let mut set_receipt = None;
         let mut quit_receipt = None;
         let mut cancel_receipt = None;
@@ -795,6 +868,12 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.coding_agent.prompt.set" {
+                    if !identified_stop { return Err("Draft editing requires an identified request with a reply writer".into()); }
+                    let target = draft_target.clone()?;
+                    let review = target.review().ok_or("ACP draft editing requires its original authenticated invocation")?;
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::CodingAgentDraft(review)), None);
+                }
                 if call["op"] == "editor.coding_agent.set" {
                     if !identified_stop { return Err("Coding agent Set requires an identified request with a reply writer".into()); }
                     let target = set_target.clone()?;
@@ -931,6 +1010,23 @@ impl EditorView<'_> {
             }
             Ok(())
         }, &mut |controller, call| {
+            if call["op"] == "editor.coding_agent.prompt.set" {
+                if !identified_stop { return Err("Draft editing requires an identified request with a reply writer".into()); }
+                let target = draft_target.clone()?;
+                let attempt = if target.invocation().is_some() {
+                    match &*self.agent_draft {
+                        RemoteAgentDraft::Reviewing { attempt, target:original } if original == &target => *attempt,
+                        _ => return Err("The original draft review is no longer valid".into()),
+                    }
+                } else { self.agent_draft.attempt().checked_add(1).ok_or("Draft edit identity exhausted")? };
+                let (sender, receipt) = sync_channel(1);
+                *self.agent_draft = RemoteAgentDraft::Waiting { attempt, target, receipt,
+                    deadline:Instant::now() + AGENT_DRAFT_REPLY_TIMEOUT };
+                let admitted = json!({"codingAgentDraftEdit":{"state":"admitted", "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_draft"}});
+                draft_receipt = Some((sender, admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.coding_agent.set" {
                 if !identified_stop { return Err("Coding agent Set requires an identified request with a reply writer".into()); }
                 let target = set_target.clone()?;
@@ -1016,6 +1112,15 @@ impl EditorView<'_> {
             self.handle(controller, call)
         });
         if let McpOrigin::Agent(approval) = &origin {
+            if let Some(target) = approval.draft_review() {
+                if !matches!(&*self.agent_draft, RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. })
+                    && !matches!(&*self.agent_draft, RemoteAgentDraft::Finished { invalid_invocation:Some(invalid), .. }
+                        if target.invocation() == Some(invalid)) {
+                    if let Some(attempt) = self.agent_draft.attempt().checked_add(1) {
+                        *self.agent_draft = RemoteAgentDraft::Reviewing { attempt, target };
+                    }
+                }
+            }
             if let Some(target) = approval.set_review() {
                 if !matches!(&*self.agent_set, RemoteAgentSet::Reviewing { .. } | RemoteAgentSet::Waiting { .. })
                     && !matches!(&*self.agent_set, RemoteAgentSet::Finished { invalid, .. } if invalid == &target) {
@@ -1054,6 +1159,20 @@ impl EditorView<'_> {
         }
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
+        if let Some((receipt, admitted)) = draft_receipt {
+            if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteAgentDraft::Waiting { deadline, .. } = self.agent_draft {
+                    *deadline = Instant::now() + AGENT_DRAFT_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            let pending = std::mem::replace(self.agent_draft, RemoteAgentDraft::Idle);
+            let RemoteAgentDraft::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            *self.agent_draft = RemoteAgentDraft::Finished { attempt, outcome:AgentDraftOutcome::ReplyNotProduced,
+                invalid_invocation:target.invocation().cloned() };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, admitted)) = set_receipt {
             if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == admitted) {
@@ -1737,6 +1856,11 @@ impl EditorView<'_> {
             "codingAgentCancel": self.agent_cancel.state(),
             "codingAgentStop": self.agent_stop.state(),
             "codingAgentSet": self.agent_set.state(),
+            "codingAgentDraft": {"identity":self.agent_draft_snapshot.identity(),
+                "editable":self.agent_draft_snapshot.editable() && !*self.closing
+                    && self.agent_draft.attempt() != u64::MAX
+                    && !matches!(&*self.agent_draft, RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. })},
+            "codingAgentDraftEdit": self.agent_draft.state(),
             "selection": {
                 "nodes": controller.selected_nodes(),
                 "bindings": self.parameters.selected_bindings.iter()
@@ -1814,6 +1938,7 @@ pub struct EditorApp {
     agent_cancel: RemoteAgentCancel,
     agent_stop: RemoteAgentStop,
     agent_set: RemoteAgentSet,
+    agent_draft: RemoteAgentDraft,
     #[cfg(test)]
     hold_quit_receipt_for_test: bool,
     #[cfg(test)]
@@ -1945,6 +2070,7 @@ impl EditorApp {
             agent_cancel: RemoteAgentCancel::Idle,
             agent_stop: RemoteAgentStop::Idle,
             agent_set: RemoteAgentSet::Idle,
+            agent_draft: RemoteAgentDraft::Idle,
             #[cfg(test)]
             hold_quit_receipt_for_test: false,
             #[cfg(test)]
@@ -2339,6 +2465,57 @@ impl EditorApp {
         self.agent_set = RemoteAgentSet::Finished { attempt, outcome, invalid:target };
     }
 
+    fn begin_closing(&mut self) {
+        self.closing = true;
+        let pending = std::mem::replace(&mut self.agent_draft, RemoteAgentDraft::Idle);
+        self.agent_draft = match pending {
+            RemoteAgentDraft::Reviewing { attempt, target } | RemoteAgentDraft::Waiting { attempt, target, .. } => {
+                if let Some(review) = target.review() { self.agent.close_draft_review(&review); }
+                RemoteAgentDraft::Finished { attempt, outcome:AgentDraftOutcome::EditorClosing,
+                    invalid_invocation:target.invocation().cloned() }
+            }
+            other => other,
+        };
+    }
+
+    fn finish_agent_draft(&mut self, ctx: &egui::Context) {
+        let closing = self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_));
+        if let RemoteAgentDraft::Reviewing { attempt, target } = &self.agent_draft {
+            let failure = if closing { Some(AgentDraftOutcome::EditorClosing) }
+                else { self.agent.draft_status(target, false).err().map(AgentDraftOutcome::Refused) };
+            if let Some(outcome) = failure {
+                let (attempt, invocation, review) = (*attempt, target.invocation().cloned(), target.review());
+                if let Some(review) = review { self.agent.invalidate_draft_review(&review); }
+                self.agent_draft = RemoteAgentDraft::Finished { attempt, outcome, invalid_invocation:invocation };
+            }
+            return;
+        }
+        let RemoteAgentDraft::Waiting { receipt, deadline, .. } = &mut self.agent_draft else { return };
+        let failure = if closing { Some(AgentDraftOutcome::EditorClosing) }
+            else if Instant::now() >= *deadline { Some(AgentDraftOutcome::ReplyExpired) } else {
+                match receipt.try_recv() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(_)) => Some(AgentDraftOutcome::ReplyFailed),
+                    Err(TryRecvError::Disconnected) => Some(AgentDraftOutcome::ReplyLost),
+                    Err(TryRecvError::Empty) => {
+                        ctx.request_repaint_after(Duration::from_millis(10));
+                        return;
+                    }
+                }
+            };
+        let pending = std::mem::replace(&mut self.agent_draft, RemoteAgentDraft::Idle);
+        let RemoteAgentDraft::Waiting { attempt, target, .. } = pending else { unreachable!() };
+        let invalid_invocation = target.invocation().cloned();
+        let review = target.review();
+        let outcome = failure.unwrap_or_else(|| match self.agent.replace_draft_if_current(target) {
+            Ok(crate::editor_agent::DraftEditResult::Applied) => AgentDraftOutcome::Applied,
+            Ok(crate::editor_agent::DraftEditResult::NoOp) => AgentDraftOutcome::NoOp,
+            Err(refusal) => AgentDraftOutcome::Refused(refusal),
+        });
+        if let Some(review) = review { self.agent.invalidate_draft_review(&review); }
+        self.agent_draft = RemoteAgentDraft::Finished { attempt, outcome, invalid_invocation };
+    }
+
     fn finish_remote_quit(&mut self, ctx: &egui::Context) {
         self.observe_remote_quit(ctx);
         let RemoteQuit::Waiting { receipt, deadline, origin, delivered, .. } = &mut self.remote_quit else { return };
@@ -2394,7 +2571,7 @@ impl EditorApp {
             return;
         }
         self.remote_quit = RemoteQuit::Closing(self.remote_quit.attempt());
-        self.closing = true;
+        self.begin_closing();
         self.close_sent = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -7121,6 +7298,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_draft(ctx);
         self.agent.pump();
         self.observe_remote_quit(ctx);
         let mcp_status = self.mcp_status();
@@ -7154,6 +7332,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_draft(ctx);
         self.agent.tick(ctx);
         let controller = &mut self.controller;
         let mut view = editor_view!(self, ctx);
@@ -7161,6 +7340,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
         self.finish_agent_set(ctx);
+        self.finish_agent_draft(ctx);
         self.agent.host_approval_window(ctx, approval_path.as_deref());
         self.handle_shortcuts(ctx);
         self.window_chrome(ctx);
@@ -12208,7 +12388,7 @@ impl EditorApp {
             PendingAction::Request(request) => self.run_command(request),
             PendingAction::Open(path) => self.begin_open(&path),
             PendingAction::ImportLayers => self.import_layers(),
-            PendingAction::Close => self.closing = true,
+            PendingAction::Close => self.begin_closing(),
         }
         if self.tools.prompt.is_none() {
             self.discarding = false;
@@ -12298,7 +12478,7 @@ impl EditorApp {
         }
         let modified = self.controller.snapshot()["modified"].as_bool() == Some(true);
         match window_shell::gate(modified, window_shell::close_setting(&mut self.tools.store)) {
-            Gate::Proceed => self.closing = true,
+            Gate::Proceed => self.begin_closing(),
             Gate::Ask => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.unsaved.is_none() {
@@ -16447,7 +16627,7 @@ mod editor_state_tests {
         let dialog = app.unsaved.as_ref().unwrap().dialog.clone();
         let restore = app.tools.prompt.clone();
         let secret = "lifecycle-private-sentinel";
-        *app.agent.prompt_mut() = secret.into();
+        app.agent.set_prompt_for_test(secret.into());
         app.agent.set_briefing(Some(secret.into()));
         app.tools.store.set("ACP.Command", secret.to_owned()).unwrap();
         app.tools.store.set("ACP.Workdir", secret.to_owned()).unwrap();
@@ -16474,7 +16654,7 @@ mod editor_state_tests {
             "ready":true,"turn_active":false,"cancelling":false,"awaiting_permission":false}));
         let changed = call(&mut app, "editor_texture_viewer_set", json!({"open":true}));
         assert_eq!(changed["codingAgent"], state(&mut app)["codingAgent"]);
-        assert_eq!(app.agent.prompt_mut().as_str(), secret);
+        assert_eq!(app.agent.prompt_text_for_test(), secret);
         assert!(app.agent.permission().is_none());
         assert_eq!(app.controller.snapshot(), &snapshot);
         assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Retained lifecycle draft"));
@@ -16505,7 +16685,7 @@ mod editor_state_tests {
         peer.enqueue(lifecycle_initialize());
         app.agent.pump();
         assert!(app.agent.state().ready && !app.agent.state().turn_active);
-        *app.agent.prompt_mut() = "Deterministic lifecycle state".into();
+        app.agent.set_prompt_for_test("Deterministic lifecycle state".into());
         app.agent.send();
         assert!(app.agent.state().turn_active);
         peer.enqueue(json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}}));
@@ -16522,6 +16702,300 @@ mod editor_state_tests {
         let request = json!({"jsonrpc":"2.0", "id":"set-admission", "method":"tools/call",
             "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":enabled}}});
         CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+    }
+
+    fn draft_message(app: &EditorApp, text: &str) -> Value {
+        json!({"jsonrpc":"2.0", "id":"draft-edit", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_prompt_set", "arguments":{
+                "expectedDraftIdentity":app.agent.draft_snapshot().identity().unwrap(), "text":text}}})
+    }
+
+    fn request_agent_draft(app: &mut EditorApp, text: &str) -> RpcReply {
+        let request = draft_message(app, text);
+        CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+    }
+
+    fn finish_agent_draft(app: &mut EditorApp) { CTX.with(|ctx| app.finish_agent_draft(ctx)); }
+
+    fn draft_peer(app: &mut EditorApp) -> (LifecyclePeer, String) {
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let token = endpoint.token_for_test().to_owned();
+        let peer = LifecyclePeer::attach(app, Some(endpoint));
+        lifecycle_prompt(app, &peer);
+        (peer, token)
+    }
+
+    fn draft_http(app: &EditorApp, token: &str, request: &Value) -> std::net::TcpStream {
+        use std::io::Write;
+        let address = app.agent.mcp_url().unwrap().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = request.to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        stream
+    }
+
+    #[test]
+    fn coding_agent_draft_exact_replacements_clear_noop_and_metadata_privacy() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-draft-exact"); app.agent.set_enabled(true);
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let initial = state(&mut app)["codingAgentDraft"]["identity"].clone();
+        for (text, expected) in [("  日本語 👁️\t\r\n", "applied"), ("  日本語 👁️\t\r\n", "no_op"), ("", "applied")] {
+            let before = app.agent.prompt_text_for_test().to_owned();
+            let reply = request_agent_draft(&mut app, text);
+            finish_agent_draft(&mut app);
+            assert_eq!(app.agent.prompt_text_for_test(), before);
+            let mut bytes = Vec::new(); reply.write_line(&mut bytes).unwrap();
+            let response:Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["result"]["structuredContent"]["codingAgentDraftEdit"]["state"], "admitted");
+            assert!(response["result"]["structuredContent"]["codingAgentDraftEdit"].get("text").is_none());
+            let mut frame = eframe::Frame::_new_kittest();
+            Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            assert_eq!(app.agent.prompt_text_for_test(), text);
+            assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], expected);
+            assert!(!app.agent.state().has_client && app.agent.mcp_url().is_none());
+            assert_eq!(state(&mut app)["codingAgent"].as_object().unwrap().len(), 7);
+        }
+        assert_ne!(state(&mut app)["codingAgentDraft"]["identity"], initial);
+    }
+
+    #[test]
+    fn coding_agent_draft_failed_lost_expired_replies_never_replace_human_text() {
+        struct BadWriter;
+        impl std::io::Write for BadWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+        }
+        for case in ["failed", "lost", "expired"] {
+            let mut app = app(&format!("coding-agent-draft-reply-{case}")); app.agent.set_enabled(true);
+            app.agent.set_prompt_for_test("private human draft".into());
+            let identity = app.agent.draft_snapshot().identity().unwrap().to_owned();
+            let reply = request_agent_draft(&mut app, "private proposal");
+            assert!(refused(&mut app, "editor_coding_agent_prompt_set",
+                json!({"expectedDraftIdentity":identity,"text":"duplicate"})).contains("already pending"));
+            match case {
+                "failed" => assert!(reply.write_line(&mut BadWriter).is_err()),
+                "lost" => drop(reply),
+                _ => {
+                    reply.write_line(&mut Vec::new()).unwrap();
+                    let RemoteAgentDraft::Waiting { deadline, .. } = &mut app.agent_draft else { panic!() };
+                    *deadline = Instant::now() - Duration::from_millis(1);
+                }
+            }
+            finish_agent_draft(&mut app);
+            assert_eq!(app.agent.prompt_text_for_test(), "private human draft");
+            assert_eq!(app.agent.draft_snapshot().identity(), Some(identity.as_str()));
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentDraftEdit"]["state"], format!("reply_{case}"));
+            assert!(!observed.to_string().contains("private human draft") && !observed.to_string().contains("private proposal"));
+            request_agent_draft(&mut app, "fresh explicit edit").write_line(&mut Vec::new()).unwrap();
+            finish_agent_draft(&mut app);
+            assert_eq!(state(&mut app)["codingAgentDraftEdit"]["attempt"], 2);
+            assert_eq!(app.agent.prompt_text_for_test(), "fresh explicit edit");
+        }
+    }
+
+    #[test]
+    fn coding_agent_draft_every_authenticated_occurrence_needs_human_review_even_same_text() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for text in ["new proposal", "human unsent sentinel", ""] {
+            let mut app = app("coding-agent-draft-original");
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let (mut peer, token) = draft_peer(&mut app);
+            app.agent.set_prompt_for_test("human unsent sentinel".into());
+            let request = draft_message(&app, text);
+            let original = draft_http(&app, &token, &request);
+            let duplicate = draft_http(&app, &token, &request);
+            serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "awaiting_human");
+            assert_eq!(lifecycle_http_result(duplicate, "draft-edit")["isError"], true);
+            assert_eq!(app.agent.prompt_text_for_test(), "human unsent sentinel");
+            assert!(app.agent.retains_draft_review_text_for_test());
+            assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":"Edited during draft review"}))["succeeded"], true);
+            app.select_node_draft(2);
+            app.controller.set_draft_name("Unapplied document draft".into());
+            let document_before = app.controller.snapshot().clone();
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            let late = draft_http(&app, &token, &request);
+            let mut frame = eframe::Frame::_new_kittest();
+            Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            let result = lifecycle_http_result(original, "draft-edit");
+            assert_eq!(result["isError"], false, "{result}");
+            assert_eq!(result["structuredContent"]["codingAgentDraftEdit"]["state"], "admitted");
+            assert_eq!(lifecycle_http_result(late, "draft-edit")["isError"], true);
+            finish_agent_draft(&mut app);
+            assert_eq!(app.agent.prompt_text_for_test(), text);
+            assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], if text == "human unsent sentinel" { "no_op" } else { "applied" });
+            assert!(!app.agent.retains_draft_review_text_for_test());
+            assert!(app.agent.state().turn_active && app.agent.state().has_client);
+            assert_eq!(app.controller.snapshot(), &document_before);
+            assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Unapplied document draft"));
+            peer.enqueue(lifecycle_permission()); app.agent.pump();
+            assert!(app.agent.permission().is_some(), "draft editing must keep the ACP reader alive");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_draft_denied_expired_or_native_changed_review_discards_proposal() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["denied", "expired", "native_aba"] {
+            let mut app = app(&format!("coding-agent-draft-review-{case}"));
+            let (mut peer, token) = draft_peer(&mut app);
+            app.agent.set_prompt_for_test("human text".into());
+            let request = draft_message(&app, "private review proposal");
+            let original = draft_http(&app, &token, &request);
+            serve_agent_requests(&mut app);
+            match case {
+                "denied" => {
+                    let path = app.tools.store_path.clone();
+                    Harness::new().click(Role::Button, "Deny changes this turn", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+                }
+                "expired" => app.agent.expire_host_approval_for_test(),
+                _ => { app.agent.set_prompt_for_test("temporary native edit".into()); app.agent.set_prompt_for_test("human text".into()); }
+            }
+            finish_agent_draft(&mut app); serve_agent_requests(&mut app); finish_agent_draft(&mut app);
+            assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], true);
+            assert_eq!(app.agent.prompt_text_for_test(), "human text");
+            assert!(!app.agent.retains_draft_review_text_for_test());
+            if case == "denied" {
+                let again = draft_http(&app, &token, &draft_message(&app, "new denied proposal"));
+                serve_agent_requests(&mut app);
+                let refusal = lifecycle_http_result(again, "draft-edit");
+                assert!(refusal.to_string().contains("denied protected changes"));
+                assert!(!app.agent.retains_draft_review_text_for_test());
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_draft_consumed_consent_rechecks_permission_cancel_and_completion_without_sealing() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["permission", "cancel", "completed", "decoded_completion", "disconnect"] {
+            let mut app = app(&format!("coding-agent-draft-cutoff-{case}"));
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let (mut peer, token) = draft_peer(&mut app);
+            let original = draft_http(&app, &token, &draft_message(&app, "approved proposal"));
+            serve_agent_requests(&mut app);
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], false);
+            match case {
+                "permission" => peer.enqueue(lifecycle_permission()),
+                "cancel" => { request_agent_cancel(&mut app).write_line(&mut Vec::new()).unwrap(); finish_agent_cancel(&mut app); }
+                "disconnect" => {
+                    peer.frames.take();
+                    let RemoteAgentDraft::Waiting { target, .. } = &app.agent_draft else { panic!() };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.agent.draft_status(target, true).is_ok() { assert!(Instant::now() < deadline); std::thread::yield_now(); }
+                }
+                _ => {
+                    peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}));
+                    if case == "completed" { app.agent.pump(); }
+                }
+            }
+            if case == "decoded_completion" {
+                let mut frame = eframe::Frame::_new_kittest();
+                Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                assert_eq!(app.agent.prompt_text_for_test(), "approved proposal");
+                assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "applied");
+            } else {
+                finish_agent_draft(&mut app);
+                assert_eq!(app.agent.prompt_text_for_test(), "");
+                assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "consent_invalid");
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_draft_disable_and_later_quit_prevent_delayed_writes() {
+        let mut app = app("coding-agent-draft-closing"); app.agent.set_enabled(true);
+        let pending = request_agent_draft(&mut app, "must not appear after close");
+        request_quit(&mut app).write_line(&mut Vec::new()).unwrap();
+        assert_eq!(finish_quit(&mut app), 1);
+        assert!(matches!(app.agent_draft, RemoteAgentDraft::Finished { outcome:AgentDraftOutcome::EditorClosing, .. }));
+        pending.write_line(&mut Vec::new()).unwrap(); finish_agent_draft(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "editor_closing");
+        assert_eq!(app.agent.prompt_text_for_test(), "");
+        let mut app = self::app("coding-agent-draft-disable"); app.agent.set_enabled(true);
+        request_agent_draft(&mut app, "must not appear after disable").write_line(&mut Vec::new()).unwrap();
+        request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
+        finish_agent_set(&mut app); finish_agent_draft(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "disabled");
+        assert_eq!(app.agent.prompt_text_for_test(), "");
+    }
+
+    #[test]
+    fn coding_agent_draft_closing_refuses_parked_original_review_and_discards_proposal() {
+        let mut app = app("coding-agent-draft-closing-review");
+        let (mut peer, token) = draft_peer(&mut app);
+        let original = draft_http(&app, &token, &draft_message(&app, "private pending proposal"));
+        serve_agent_requests(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "awaiting_human");
+        app.begin_closing();
+        assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], true);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "editor_closing");
+        assert!(!app.agent.retains_draft_review_text_for_test());
+        assert_eq!(app.agent.prompt_text_for_test(), "");
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_draft_strict_envelopes_arguments_disabled_and_exhausted_attempts_refuse() {
+        let mut app = app("coding-agent-draft-boundaries"); app.agent.set_enabled(true);
+        let identity = app.agent.draft_snapshot().identity().unwrap().to_owned();
+        for args in [json!({}), json!({"expectedDraftIdentity":identity}), json!({"text":"x"}),
+            json!({"expectedDraftIdentity":3,"text":"x"}), json!({"expectedDraftIdentity":identity,"text":false}),
+            json!({"expectedDraftIdentity":identity,"text":"x","extra":true})] {
+            let _ = refused(&mut app, "editor_coding_agent_prompt_set", args);
+        }
+        let request = draft_message(&app, "not applied");
+        for id in [Value::Null, json!(true), json!([]), json!({}), json!(0.25)] {
+            let mut request = request.clone(); request["id"] = id;
+            let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client)).into_message();
+            if let Some(reply) = reply { assert!(reply["result"]["isError"] == true || reply.get("error").is_some()); }
+        }
+        let mut notification = request.clone(); notification.as_object_mut().unwrap().remove("id");
+        assert!(CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &notification, McpOrigin::Client)).into_message().is_none());
+        assert_eq!(CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Internal)).into_message().unwrap()["result"]["isError"], true);
+        finish_agent_draft(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "idle");
+        app.agent.set_enabled(false);
+        assert!(refused(&mut app, "editor_coding_agent_prompt_set", json!({"expectedDraftIdentity":identity,"text":"x"})).contains("Enable"));
+        app.agent.set_enabled(true);
+        app.agent_draft = RemoteAgentDraft::Finished { attempt:u64::MAX, outcome:AgentDraftOutcome::ReplyLost, invalid_invocation:None };
+        let args = draft_message(&app, "still not applied")["params"]["arguments"].clone();
+        assert!(refused(&mut app, "editor_coding_agent_prompt_set", args).contains("identity exhausted"));
+        assert_eq!(state(&mut app)["codingAgentDraft"]["editable"], false);
+        assert_eq!(app.agent.prompt_text_for_test(), "");
+    }
+
+    #[test]
+    fn coding_agent_draft_http_applies_before_second_tick_without_launch_or_send() {
+        use crate::editor_test_support::Harness;
+        use std::io::Write;
+        let mut app = app("coding-agent-draft-http"); app.agent.set_enabled(true);
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let server = mcp_listener::McpServer::start(&McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true }, Some("owned-draft-token".into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = draft_message(&app, "exact HTTP draft").to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer owned-draft-token\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server);
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(lifecycle_http_result(stream, "draft-edit")["structuredContent"]["codingAgentDraftEdit"]["state"], "admitted");
+        assert_eq!(app.agent.prompt_text_for_test(), "exact HTTP draft");
+        assert!(!app.agent.state().has_client && app.agent.mcp_url().is_none());
     }
 
     fn request_agent_disable(app: &mut EditorApp) -> RpcReply { request_agent_set(app, false) }
@@ -16671,7 +17145,7 @@ mod editor_state_tests {
         app.tools.store.set("Outline.visible", false).unwrap();
         let mut peer = LifecyclePeer::attach(&mut app, None);
         lifecycle_prompt(&mut app, &peer);
-        *app.agent.prompt_mut() = "Retained next prompt".into();
+        app.agent.set_prompt_for_test("Retained next prompt".into());
         let before = app.controller.snapshot().clone();
         let request = json!({"jsonrpc":"2.0", "id":"stop-admission", "method":"tools/call",
             "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
@@ -16686,7 +17160,7 @@ mod editor_state_tests {
         Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
         assert!(!app.agent.state().has_client);
         assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"disabled", "enabled":false, "stop":"stopped", "attempt":1, "approval_reply_failed":false}));
-        assert_eq!(app.agent.prompt_mut(), "Retained next prompt");
+        assert_eq!(app.agent.prompt_text_for_test(), "Retained next prompt");
         assert_eq!(app.controller.snapshot(), &before);
         peer.finish(&mut app);
     }
@@ -16858,7 +17332,7 @@ mod editor_state_tests {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     if case != "decoded_completion" { app.agent.pump(); }
                     if case == "new_prompt" {
-                        *app.agent.prompt_mut() = "New independently sent fixture turn".into();
+                        app.agent.set_prompt_for_test("New independently sent fixture turn".into());
                         app.agent.send();
                     }
                 }
@@ -16884,7 +17358,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { *app.agent.prompt_mut() = "Owned queued turn".into(); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "closed" {
                 peer.frames.take();
@@ -16896,12 +17370,12 @@ mod editor_state_tests {
                 }
             }
             assert!(app.agent.state().has_client);
-            *app.agent.prompt_mut() = "Retained after Stop".into();
+            app.agent.set_prompt_for_test("Retained after Stop".into());
             request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
             finish_agent_set(&mut app);
             assert!(!app.agent.state().has_client, "{case}");
             assert_eq!(state(&mut app)["codingAgentSet"]["state"], "disabled");
-            assert_eq!(app.agent.prompt_mut(), "Retained after Stop");
+            assert_eq!(app.agent.prompt_text_for_test(), "Retained after Stop");
             peer.finish(&mut app);
         }
     }
@@ -16929,6 +17403,54 @@ mod editor_state_tests {
         assert!(app.agent.state().has_client);
         finish_agent_set(&mut app);
         assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_draft_stdio_worker_flushes_admission_before_edit() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct Output(Arc<Mutex<Vec<u8>>>, std::sync::mpsc::SyncSender<()>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.1.send(()).unwrap(); Ok(()) }
+        }
+        let mut app = app("coding-agent-draft-stdio");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        let (input, mut writer) = std::io::pipe().unwrap();
+        let (host, receive) = std::sync::mpsc::sync_channel(1);
+        let (flushed, flush) = std::sync::mpsc::sync_channel(1);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Output(bytes.clone(), flushed);
+        let worker = std::thread::spawn(move || crate::editor_stdio::serve_lines(
+            std::io::BufReader::new(input), output, &host, &egui::Context::default()));
+        app.host_rx = Some(receive);
+        writeln!(writer, "{}", draft_message(&app, "stdio replacement")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.agent_draft, RemoteAgentDraft::Waiting { .. }) {
+            assert!(Instant::now() < deadline);
+            CTX.with(|ctx| app.drain_host(ctx));
+            std::thread::yield_now();
+        }
+        flush.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response: Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "draft-edit");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentDraftEdit"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        while !matches!(app.agent_draft, RemoteAgentDraft::Finished { .. }) {
+            assert!(Instant::now() < deadline);
+            finish_agent_draft(&mut app);
+            std::thread::yield_now();
+        }
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "applied");
+        assert_eq!(app.agent.prompt_text_for_test(), "stdio replacement");
+        assert!(app.agent.state().has_client && app.agent.state().turn_active);
+        drop(writer);
+        worker.join().unwrap();
         peer.finish(&mut app);
     }
 
@@ -16980,6 +17502,76 @@ mod editor_state_tests {
     }
 
     #[test]
+    fn coding_agent_draft_preserves_actual_edit_history_private_draft_settings_and_human_dialogs() {
+        for format in ["inx", "live2d.cmo3", "live2d.can3"] {
+            let mut app = match format {
+                "live2d.cmo3" => runtime_export_app("coding-agent-draft-cmo3", false),
+                "live2d.can3" => can3_scene_app("coding-agent-draft-can3"),
+                _ => app("coding-agent-draft-inx"),
+            };
+            let mut models = Vec::new();
+            models.push(app.controller.snapshot()["model"].clone());
+            for name in ["First", "Second"] {
+                let revision = app.controller.snapshot()["revision"].clone();
+                let edit = match format {
+                    "inx" => json!({"op":"node.rename", "id":2, "name":name}),
+                    "live2d.cmo3" => json!({"op":"live2d.rename", "guid":"parameter-guid", "name":name, "expectedRevision":revision}),
+                    _ => json!({"op":"live2d.animation.scene.set", "sceneGuid":"scene-guid", "name":name, "expectedRevision":revision}),
+                };
+                let result = app.controller.core_request(&edit);
+                assert_eq!(result["succeeded"], true, "{format}: {result}");
+                models.push(app.controller.snapshot()["model"].clone());
+            }
+            assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+            if format == "inx" {
+                app.select_node_draft(2);
+                app.controller.set_draft_name("Retained Stop edit draft".into());
+            }
+            app.unsaved = Some(unsaved_dialog());
+            app.tools.prompt = Some(restore_prompt());
+            let dialog = app.unsaved.as_ref().unwrap().dialog.clone();
+            let restore = app.tools.prompt.clone();
+            let settings_path = app.tools.store_path.clone().unwrap();
+            std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+            std::fs::write(&settings_path, b"{\"DarkMode\":true}").unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let private = "stop-private-unsent-sentinel";
+            app.agent.set_prompt_for_test(private.into());
+            app.agent.set_briefing(Some(private.into()));
+            app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
+            app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
+            let _ = state(&mut app);
+            let before = app.controller.snapshot().clone();
+            let mut bytes = Vec::new();
+            request_agent_draft(&mut app, "authorized new draft").write_line(&mut bytes).unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains(private));
+            finish_agent_draft(&mut app);
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentDraftEdit"], json!({"state":"applied", "attempt":1}));
+            assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
+            assert!(!observed["codingAgentDraftEdit"].to_string().contains(private));
+            assert_eq!(app.controller.snapshot(), &before);
+            assert_eq!(app.agent.prompt_text_for_test(), "authorized new draft");
+            assert!(app.agent.state().has_client && app.agent.state().turn_active);
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
+            assert_eq!(app.tools.prompt, restore);
+            assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
+            if format == "inx" {
+                assert_eq!((&before["canUndo"], &before["canRedo"]), (&json!(true), &json!(true)));
+                assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Retained Stop edit draft"));
+                app.controller.discard_draft();
+            }
+            assert_eq!((&before["canUndo"], &before["canRedo"]), (&json!(true), &json!(true)));
+            for (op, model) in [("redo", &models[2]), ("undo", &models[1]), ("undo", &models[0])] {
+                assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"], true);
+                assert_eq!(&app.controller.snapshot()["model"], model);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
     fn coding_agent_set_preserves_actual_edit_history_private_draft_settings_and_human_dialogs() {
         for format in ["inx", "live2d.cmo3", "live2d.can3"] {
             let mut app = match format {
@@ -17015,7 +17607,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             lifecycle_prompt(&mut app, &peer);
             let private = "stop-private-unsent-sentinel";
-            *app.agent.prompt_mut() = private.into();
+            app.agent.set_prompt_for_test(private.into());
             app.agent.set_briefing(Some(private.into()));
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
@@ -17030,7 +17622,7 @@ mod editor_state_tests {
             assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
             assert!(!observed["codingAgentSet"].to_string().contains(private));
             assert_eq!(app.controller.snapshot(), &before);
-            assert_eq!(app.agent.prompt_mut(), private);
+            assert_eq!(app.agent.prompt_text_for_test(), private);
             assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
             assert_eq!(app.tools.prompt, restore);
             assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
@@ -17114,7 +17706,7 @@ mod editor_state_tests {
         app.tools.store.set("Outline.visible", false).unwrap();
         let mut peer = LifecyclePeer::attach(&mut app, None);
         lifecycle_prompt(&mut app, &peer);
-        *app.agent.prompt_mut() = "Retained next prompt".into();
+        app.agent.set_prompt_for_test("Retained next prompt".into());
         let before = app.controller.snapshot().clone();
         let request = json!({"jsonrpc":"2.0", "id":"stop-admission", "method":"tools/call",
             "params":{"name":"editor_coding_agent_stop", "arguments":{}}});
@@ -17129,7 +17721,7 @@ mod editor_state_tests {
         Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
         assert!(!app.agent.state().has_client);
         assert_eq!(state(&mut app)["codingAgentStop"], json!({"state":"stopped", "attempt":1, "approval_reply_failed":false}));
-        assert_eq!(app.agent.prompt_mut(), "Retained next prompt");
+        assert_eq!(app.agent.prompt_text_for_test(), "Retained next prompt");
         assert_eq!(app.controller.snapshot(), &before);
         peer.finish(&mut app);
     }
@@ -17325,7 +17917,7 @@ mod editor_state_tests {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     if case != "decoded_completion" { app.agent.pump(); }
                     if case == "new_prompt" {
-                        *app.agent.prompt_mut() = "New independently sent fixture turn".into();
+                        app.agent.set_prompt_for_test("New independently sent fixture turn".into());
                         app.agent.send();
                     }
                 }
@@ -17351,7 +17943,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { *app.agent.prompt_mut() = "Owned queued turn".into(); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "closed" {
                 peer.frames.take();
@@ -17363,12 +17955,12 @@ mod editor_state_tests {
                 }
             }
             assert!(app.agent.state().has_client);
-            *app.agent.prompt_mut() = "Retained after Stop".into();
+            app.agent.set_prompt_for_test("Retained after Stop".into());
             request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();
             finish_agent_stop(&mut app);
             assert!(!app.agent.state().has_client, "{case}");
             assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
-            assert_eq!(app.agent.prompt_mut(), "Retained after Stop");
+            assert_eq!(app.agent.prompt_text_for_test(), "Retained after Stop");
             peer.finish(&mut app);
         }
     }
@@ -17420,7 +18012,7 @@ mod editor_state_tests {
                 _ => {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     app.agent.pump();
-                    *app.agent.prompt_mut() = "New owned fixture turn".into();
+                    app.agent.set_prompt_for_test("New owned fixture turn".into());
                     app.agent.send();
                 }
             }
@@ -17539,7 +18131,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             lifecycle_prompt(&mut app, &peer);
             let private = "stop-private-unsent-sentinel";
-            *app.agent.prompt_mut() = private.into();
+            app.agent.set_prompt_for_test(private.into());
             app.agent.set_briefing(Some(private.into()));
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
@@ -17554,7 +18146,7 @@ mod editor_state_tests {
             assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
             assert!(!observed["codingAgentStop"].to_string().contains(private));
             assert_eq!(app.controller.snapshot(), &before);
-            assert_eq!(app.agent.prompt_mut(), private);
+            assert_eq!(app.agent.prompt_text_for_test(), private);
             assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
             assert_eq!(app.tools.prompt, restore);
             assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
@@ -17746,7 +18338,7 @@ mod editor_state_tests {
         let mut app = app("coding-agent-cancel-admission");
         let mut peer = LifecyclePeer::attach(&mut app, None);
         lifecycle_prompt(&mut app, &peer);
-        *app.agent.prompt_mut() = "Retained second prompt".into();
+        app.agent.set_prompt_for_test("Retained second prompt".into());
         let before = app.controller.snapshot().clone();
         let reply = request_agent_cancel(&mut app);
         finish_agent_cancel(&mut app);
@@ -17755,7 +18347,7 @@ mod editor_state_tests {
         assert_eq!(waiting, json!({"state":"waiting_for_reply", "attempt":1}));
         assert!(refused(&mut app, "editor_coding_agent_cancel", json!({})).contains("already pending"));
         assert_eq!(state(&mut app)["codingAgentCancel"], waiting);
-        assert_eq!(app.agent.prompt_mut().as_str(), "Retained second prompt");
+        assert_eq!(app.agent.prompt_text_for_test(), "Retained second prompt");
         let mut bytes = Vec::new();
         reply.write_line(&mut bytes).unwrap();
         let response: Value = serde_json::from_slice(&bytes).unwrap();
@@ -17770,7 +18362,7 @@ mod editor_state_tests {
         assert!(refused(&mut app, "editor_coding_agent_cancel", json!({})).contains("unavailable"));
         finish_agent_cancel(&mut app);
         assert_eq!(state(&mut app)["codingAgentCancel"], applied);
-        assert_eq!(app.agent.prompt_mut().as_str(), "Retained second prompt");
+        assert_eq!(app.agent.prompt_text_for_test(), "Retained second prompt");
         assert_eq!(app.controller.snapshot(), &before);
         peer.finish(&mut app);
     }
@@ -17825,7 +18417,7 @@ mod editor_state_tests {
         let mut peer = LifecyclePeer::attach(&mut app, None);
         lifecycle_prompt(&mut app, &peer);
         let before = app.controller.snapshot().clone();
-        *app.agent.prompt_mut() = "Retained failure draft".into();
+        app.agent.set_prompt_for_test("Retained failure draft".into());
         let reply = request_agent_cancel(&mut app);
         peer.child.kill().unwrap();
         peer.child.wait().unwrap();
@@ -17834,7 +18426,7 @@ mod editor_state_tests {
         let failed = state(&mut app)["codingAgentCancel"].clone();
         assert_eq!(failed, json!({"state":"request_failed", "attempt":1, "approval_reply_failed":false}));
         assert!(app.agent.state().has_client && app.agent.state().cancelling);
-        assert_eq!(app.agent.prompt_mut(), "Retained failure draft");
+        assert_eq!(app.agent.prompt_text_for_test(), "Retained failure draft");
         assert_eq!(app.controller.snapshot(), &before);
         finish_agent_cancel(&mut app);
         assert_eq!(state(&mut app)["codingAgentCancel"], failed);
@@ -17858,7 +18450,7 @@ mod editor_state_tests {
                 "new_turn" => {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     app.agent.pump();
-                    *app.agent.prompt_mut() = "New turn".into();
+                    app.agent.set_prompt_for_test("New turn".into());
                     app.agent.send();
                 }
                 _ => { app.agent.cancel(); }
@@ -17878,7 +18470,7 @@ mod editor_state_tests {
         let mut peer = LifecyclePeer::attach(&mut app, None);
         peer.enqueue(lifecycle_initialize());
         app.agent.pump();
-        *app.agent.prompt_mut() = "Queued local fixture".into();
+        app.agent.set_prompt_for_test("Queued local fixture".into());
         app.agent.send();
         assert!(app.agent.state().turn_active && app.agent.state().ready);
         let reply = request_agent_cancel(&mut app);
@@ -18036,7 +18628,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             peer.enqueue(lifecycle_initialize());
             app.agent.pump();
-            *app.agent.prompt_mut() = "Queued local fixture".into();
+            app.agent.set_prompt_for_test("Queued local fixture".into());
             app.agent.send();
             let ready = json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}});
             if before_second {
@@ -18076,7 +18668,7 @@ mod editor_state_tests {
         let mut peer = LifecyclePeer::attach(&mut app, None);
         peer.enqueue(lifecycle_initialize());
         app.agent.pump();
-        *app.agent.prompt_mut() = "Queued local fixture".into();
+        app.agent.set_prompt_for_test("Queued local fixture".into());
         app.agent.send();
         let reply = request_agent_cancel(&mut app);
         peer.enqueue(json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}}));
@@ -18120,7 +18712,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             lifecycle_prompt(&mut app, &peer);
             let private = "cancel-private-unsent-prompt";
-            *app.agent.prompt_mut() = private.into();
+            app.agent.set_prompt_for_test(private.into());
             app.agent.set_briefing(Some(private.into()));
             let before = app.controller.snapshot().clone();
             let reply = request_agent_cancel(&mut app);
@@ -18132,7 +18724,7 @@ mod editor_state_tests {
             assert_eq!(observed["codingAgentCancel"], json!({"state":"requested", "attempt":1, "approval_reply_failed":false}));
             assert!(!observed["codingAgentCancel"].to_string().contains(private));
             assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
-            assert_eq!(app.agent.prompt_mut().as_str(), private);
+            assert_eq!(app.agent.prompt_text_for_test(), private);
             assert_eq!(app.controller.snapshot(), &before);
             assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
             assert_eq!(app.tools.prompt, restore);
@@ -21922,7 +22514,7 @@ mod editor_state_tests {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            *app.agent.prompt_mut() = "Deterministic lifecycle review check".into();
+            app.agent.set_prompt_for_test("Deterministic lifecycle review check".into());
             app.agent.send();
             let deadline = Instant::now() + Duration::from_secs(15);
             let instance = loop {

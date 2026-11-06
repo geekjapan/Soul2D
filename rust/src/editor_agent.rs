@@ -10,7 +10,7 @@
 //! The pure functions (button states, block lines, permission choices, URL and token shape) are tested
 //! without egui; the panel logic is generic over the agent's writer so tests can drive it over pipes.
 
-use eframe::egui;
+use eframe::egui::{self, TextBuffer};
 use serde_json::{json, Map, Value};
 use soul2d_core::acp::{Block, Client, Incoming, LaunchSpec, McpHttp, Plan, PermissionRequest, PromptId, PromptOutcome, RoleKind};
 use soul2d_core::mcp_http::{handle_connection_deferred, HttpDispatch, PendingReply, RpcReply};
@@ -34,6 +34,9 @@ const ALLOW_ONCE: &str = "allow-once";
 const HOST_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// `Client` appends the agent's stderr to its error strings after this marker.
 const STDERR_MARKER: &str = " | stderr: ";
+
+mod prompt_draft;
+use prompt_draft::PromptDraft;
 
 // ---------------------------------------------------------------------------------------------
 // Pure functions
@@ -392,6 +395,7 @@ pub(crate) enum ApprovalTarget {
     Quit(AcpInvocation),
     Stop(StopTarget),
     CodingAgentSet(AgentSetTarget),
+    CodingAgentDraft(DraftReviewTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
     Outputs(Vec<PathBuf>),
@@ -444,7 +448,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
+        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.prompt.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
             || matches!(call["op"].as_str(), Some("automesh.preset.save" | "automesh.preset.delete" | "physics.preset.save" |
@@ -482,6 +486,23 @@ impl HostApproval {
         match &request.target { ApprovalTarget::CodingAgentSet(target) => Some(target.clone()), _ => None }
     }
 
+    pub(crate) fn draft_review(&self) -> Option<DraftTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        let ApprovalTarget::CodingAgentDraft(review) = &request.target else { return None };
+        Some(DraftTarget { before:review.before.clone(), invocation:Some(review.invocation.clone()),
+            text:request.call["text"].as_str()?.to_owned() })
+    }
+
+    fn redact_finished_draft(&mut self) {
+        if let Some(request) = &mut self.request {
+            if matches!(request.target, ApprovalTarget::CodingAgentDraft(_))
+                && matches!(request.decision, ApprovalDecision::Denied | ApprovalDecision::Stale) {
+                request.call = Value::Null;
+            }
+        }
+    }
+
     pub(crate) fn invalidate_quit(&mut self, target: &AcpInvocation) {
         if self.quit_review().as_ref() == Some(target) {
             if let Some(request) = &mut self.request {
@@ -515,19 +536,21 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentDraft(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
             Ok(value) => value,
             Err(error) => {
                 if let Some(request) = &mut self.request { request.decision = ApprovalDecision::Stale; }
+                self.redact_finished_draft();
                 return Err(error);
             }
         };
         if let Some(request) = &mut self.request {
             if request.target != target || request.document != document {
                 request.decision = ApprovalDecision::Stale;
+                self.redact_finished_draft();
                 return Err("The destination or document changed; request the operation again".into());
             }
         }
@@ -536,7 +559,8 @@ impl HostApproval {
         }
         if matches!(target, ApprovalTarget::Settings(None)) { return Ok(()) }
         let tool = call["op"].as_str().unwrap_or_default().replace('.', "_");
-        let effect = soul2d_core::manifest::effect_of(&tool).filter(|effect| matches!(*effect, "file-write" | "project-reset" | "import" | "application-lifecycle"))
+        let effect = soul2d_core::manifest::effect_of(&tool).filter(|effect| matches!(*effect, "file-write" | "project-reset" | "import" | "application-lifecycle")
+            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_))))
             .ok_or("The operation effect is missing from the command manifest")?;
         if let Some(request) = &self.request {
             if matches!(request.decision, ApprovalDecision::AllowedOnce) {
@@ -609,6 +633,19 @@ impl HostApproval {
                     ui.label("After this original reply is delivered locally, Soul2D stops the agent without waiting for a successful turn. Shutdown may kill and reap the owned child and discard its conversation.");
                     ui.label("The checkbox becomes disabled even if shutdown fails and retains the closed client. Its endpoint is removed; no automatic retry. Enabling later does not launch or retry it.");
                     ui.label("Unsent text, document, drafts, undo and settings are preserved. New permissions, disconnection or an owner-observed prompt change invalidate consent before intake is sealed.");
+                },
+                ApprovalTarget::CodingAgentDraft(_) => {
+                    ui.label("Target: the unsent User message field only");
+                    ui.label("Allow this original request once, including an identical replacement. After local reply delivery, Soul2D rechecks the draft and this ACP invocation. It never sends, launches, saves settings or grants permissions.");
+                    ui.label("Exact replacement as a JSON string (escapes preserve whitespace):");
+                    let quoted = serde_json::to_string(&request.call["text"]).unwrap_or_default();
+                    let mut shown = quoted.as_str();
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace)
+                            .desired_width(400.0).interactive(false));
+                    });
+                    if request.call["text"] == "" { ui.label("This clears the unsent message."); }
+                    ui.label("Native edits or opt-in changes invalidate this request. Prompt expiry is owner-observed; permissions/disconnection visible at the final check invalidate consent. The reader stays open.");
                 },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
@@ -689,7 +726,7 @@ impl HostApproval {
                 ui.label("Replaces the current document. Source paths are read when this call runs.");
             }
             ui.label("The original call waits here. Allow applies this exact change once.");
-            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered file writes, document replacement, Quit, Stop and owned disable for this turn.");
+            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered changes, including message replacement, for this turn.");
             if ui.add_enabled(matches!(request.decision, ApprovalDecision::Pending), egui::Button::new("Allow once")).clicked() {
                 request.decision = ApprovalDecision::AllowedOnce;
             }
@@ -697,6 +734,7 @@ impl HostApproval {
                 request.decision = ApprovalDecision::Denied;
             }
         });
+        self.redact_finished_draft();
     }
 }
 
@@ -804,12 +842,59 @@ pub(crate) enum AgentSetResult {
     Disabled { stop: Option<StopResult> },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DraftSnapshot {
+    identity: Option<String>,
+    enabled: bool,
+    opt_in_epoch: u64,
+}
+
+impl DraftSnapshot {
+    pub(crate) fn identity(&self) -> Option<&str> { self.identity.as_deref() }
+    pub(crate) fn editable(&self) -> bool { self.enabled && self.identity.is_some() }
+
+    pub(crate) fn target(&self, expected: &str, text: String, approval: Option<&HostApproval>) -> Result<DraftTarget, String> {
+        if !self.enabled { return Err("Enable the coding-agent panel before editing its message".into()); }
+        let identity = self.identity.as_ref().ok_or("Coding-agent draft identity unavailable")?;
+        if identity != expected { return Err("Coding-agent draft changed; read its current identity".into()); }
+        let invocation = match approval {
+            Some(approval) => Some(approval.invocation.clone().filter(|call| approval.active && call.permissions != u64::MAX)
+                .ok_or("ACP draft editing needs its original authenticated transmitted uncancelled prompt")?),
+            None => None,
+        };
+        Ok(DraftTarget { before:self.clone(), text, invocation })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DraftReviewTarget {
+    before: DraftSnapshot,
+    invocation: AcpInvocation,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct DraftTarget {
+    before: DraftSnapshot,
+    text: String,
+    invocation: Option<AcpInvocation>,
+}
+
+impl DraftTarget {
+    pub(crate) fn invocation(&self) -> Option<&AcpInvocation> { self.invocation.as_ref() }
+    pub(crate) fn review(&self) -> Option<DraftReviewTarget> {
+        Some(DraftReviewTarget { before:self.before.clone(), invocation:self.invocation.clone()? })
+    }
+}
+
+pub(crate) enum DraftEditResult { Applied, NoOp }
+pub(crate) enum DraftRefusal { Disabled, StaleDraft, IdentityUnavailable, ConsentInvalid }
+
 pub struct AgentPanel<W: Write = ChildStdin> {
     enabled: bool,
     opt_in_epoch: u64,
     status: String,
     error: Option<String>,
-    prompt: String,
+    prompt: PromptDraft,
     /// What the editor tells the agent with the first prompt of a session (`set_briefing`); none for a host
     /// without a document.
     briefing: Option<String>,
@@ -848,7 +933,7 @@ impl<W: Write> AgentPanel<W> {
             opt_in_epoch: 0,
             status: "Idle".to_string(),
             error: None,
-            prompt: String::new(),
+            prompt: PromptDraft::new(),
             briefing: None,
             settings_dirty: false,
             launch,
@@ -959,6 +1044,57 @@ impl<W: Write> AgentPanel<W> {
         Ok(self.set_enabled_with(target.enabled, Client::shutdown))
     }
 
+    pub(crate) fn draft_snapshot(&self) -> DraftSnapshot {
+        DraftSnapshot { identity:self.prompt.identity().filter(|_| self.opt_in_epoch != u64::MAX)
+                .map(|identity| format!("{identity}:{}", self.opt_in_epoch)),
+            enabled:self.enabled, opt_in_epoch:self.opt_in_epoch }
+    }
+
+    pub(crate) fn draft_status(&self, target: &DraftTarget, admitted: bool) -> Result<(), DraftRefusal> {
+        let current = self.draft_snapshot();
+        if !current.enabled { return Err(DraftRefusal::Disabled); }
+        if current.identity.is_none() { return Err(DraftRefusal::IdentityUnavailable); }
+        if current != target.before { return Err(DraftRefusal::StaleDraft); }
+        if let Some(invocation) = &target.invocation {
+            let run = self.run.as_ref().ok_or(DraftRefusal::ConsentInvalid)?;
+            if run.id != invocation.run || run.closed || run.client.active_prompt() != Some(invocation.prompt)
+                || invocation.permissions == u64::MAX || run.client.permission_epoch() != invocation.permissions {
+                return Err(DraftRefusal::ConsentInvalid);
+            }
+            if !admitted && (run.host_approval.draft_review().as_ref() != Some(target)
+                || run.host_approval.request.as_ref().is_none_or(|request| request.created.elapsed() >= HOST_APPROVAL_TIMEOUT)) {
+                return Err(DraftRefusal::ConsentInvalid);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_draft_review(&mut self, target: &DraftReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if let Some(request) = &mut run.host_approval.request {
+                if matches!(&request.target, ApprovalTarget::CodingAgentDraft(review) if review == target)
+                    && !matches!(request.decision, ApprovalDecision::Denied) {
+                    request.decision = ApprovalDecision::Stale;
+                }
+            }
+            run.host_approval.redact_finished_draft();
+        }
+    }
+
+    pub(crate) fn close_draft_review(&mut self, target: &DraftReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if run.host_approval.request.as_ref().is_some_and(|request|
+                matches!(&request.target, ApprovalTarget::CodingAgentDraft(review) if review == target)) {
+                run.clear_approval("The editor is closing; the draft was not replaced");
+            }
+        }
+    }
+
+    pub(crate) fn replace_draft_if_current(&mut self, target: DraftTarget) -> Result<DraftEditResult, DraftRefusal> {
+        self.draft_status(&target, true)?;
+        Ok(if self.prompt.replace(target.text) { DraftEditResult::Applied } else { DraftEditResult::NoOp })
+    }
+
     #[cfg(test)]
     pub fn status(&self) -> &str {
         &self.status
@@ -970,8 +1106,19 @@ impl<W: Write> AgentPanel<W> {
     }
 
     #[cfg(test)]
-    pub fn prompt_mut(&mut self) -> &mut String {
-        &mut self.prompt
+    pub(crate) fn set_prompt_for_test(&mut self, text: String) {
+        self.prompt.replace(text);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prompt_text_for_test(&self) -> &str {
+        &self.prompt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_draft_review_text_for_test(&self) -> bool {
+        self.run.as_ref().and_then(|run| run.host_approval.request.as_ref())
+            .is_some_and(|request| matches!(request.target, ApprovalTarget::CodingAgentDraft(_)) && request.call.get("text").is_some())
     }
 
     #[cfg(test)]
@@ -1369,7 +1516,7 @@ impl<W: Write> AgentPanel<W> {
         let available = http && self.prompt.trim().is_empty()
             && !state.turn_active && !state.cancelling && !state.awaiting_permission;
         if ui.add_enabled(available, egui::Button::new("Split this image")).clicked() {
-            self.prompt = format!(
+            self.prompt.replace(format!(
                 "Split the illustration currently loaded in this editor into proposed Parts.\n\
                  Use only the existing Soul2D MCP server offered to this ACP session; skip the Skill's host setup.\n\
                  First read resource://soul2d/part-split/plan and note its documentRevision and draftRevision.\n\
@@ -1379,7 +1526,7 @@ impl<W: Write> AgentPanel<W> {
                  Do not invoke external segmentation or inpainting providers.\n\
                  Follow this Skill for the taxonomy, mask operations and failure cases:\n\n{}",
                 include_str!("../../.cursor/skills/split-illustration/SKILL.md")
-            );
+            ));
         }
         if !http {
             ui.weak("Start an ACP agent with HTTP MCP support to prepare a split request.");
@@ -1902,10 +2049,13 @@ mod tests {
         let snapshot = session.snapshot();
         let mut harness = Harness::new();
         harness.screen = egui::vec2(900.0, 1800.0);
+        let draft_before = panel.draft_snapshot();
+        let held = draft_before.target(draft_before.identity().unwrap(), "stale replacement".into(), None).unwrap();
         let output = harness.click(Role::Button, "Split this image", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot); });
         });
         assert!(has(&output, Role::Button, "Split this image"));
+        assert!(matches!(panel.draft_status(&held, true), Err(DraftRefusal::StaleDraft)));
         assert!(panel.prompt.contains("resource://soul2d/part-split/source"));
         assert!(panel.prompt.contains("resource://soul2d/part-split/plan"));
         assert!(panel.prompt.contains("do not call split_apply"));
@@ -1913,13 +2063,13 @@ mod tests {
         assert!(!panel.prompt.contains("data:image/") && !panel.prompt.contains("\"blob\":"));
         assert!(!panel.state().turn_active);
         assert!(agent.lines.try_recv().is_err(), "preparing sends no ACP request");
-        let prepared = panel.prompt.clone();
-        panel.prompt = "Keep my existing text".to_owned();
+        let prepared = panel.prompt.to_string();
+        panel.prompt.replace("Keep my existing text".to_owned());
         harness.click(Role::Button, "Split this image", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot); });
         });
-        assert_eq!(panel.prompt, "Keep my existing text");
-        panel.prompt = prepared.clone();
+        assert_eq!(panel.prompt_text_for_test(), "Keep my existing text");
+        panel.prompt.replace(prepared.clone());
         panel.send();
         let new_session = agent.recv();
         assert_eq!(new_session["method"], "session/new");
@@ -1983,7 +2133,7 @@ mod tests {
     fn the_first_prompt_of_a_run_carries_the_briefing_once() {
         let (mut panel, mut agent) = panel_over_pipes();
         panel.set_briefing(Some("Soul2D briefing: read resource://soul2d/editor/state".to_owned()));
-        *panel.prompt_mut() = "fix the nose".to_string();
+        panel.set_prompt_for_test("fix the nose".to_string());
         panel.send();
         let new_session = agent.recv();
         assert_eq!(new_session["method"], "session/new");
@@ -1998,7 +2148,7 @@ mod tests {
         assert_eq!(roles, ["You", "Soul2D"], "the user sees what was sent on their behalf");
         agent.send(json!({"jsonrpc": "2.0", "id": prompt["id"], "result": {"stopReason": "end_turn"}}));
         pump_until(&mut panel, |panel| !panel.state().turn_active);
-        *panel.prompt_mut() = "second".to_string();
+        panel.set_prompt_for_test("second".to_string());
         panel.send();
         assert_eq!(agent.recv()["params"]["prompt"], json!([{"type": "text", "text": "second"}]), "once per run");
         // A new run (restart) is briefed again; a run without a briefing sends one block.
@@ -2008,7 +2158,7 @@ mod tests {
         agent.send(json!({"jsonrpc": "2.0", "id": init["id"], "result": {
             "protocolVersion": 1, "agentCapabilities": {"mcpCapabilities": {"http": false}}}}));
         pump_until(&mut panel, |panel| panel.state().ready);
-        *panel.prompt_mut() = "third".to_string();
+        panel.set_prompt_for_test("third".to_string());
         panel.send();
         let new_session = agent.recv();
         agent.send(json!({"jsonrpc": "2.0", "id": new_session["id"], "result": {"sessionId": "s2"}}));
@@ -2021,10 +2171,10 @@ mod tests {
         let (mut panel, mut agent) = panel_over_pipes();
         assert!(!panel.controls().send, "an empty prompt box cannot be sent");
 
-        *panel.prompt_mut() = "fix the nose".to_string();
+        panel.set_prompt_for_test("fix the nose".to_string());
         assert!(panel.controls().send);
         panel.send();
-        assert_eq!(panel.prompt_mut().as_str(), "", "a sent prompt leaves the box");
+        assert_eq!(panel.prompt_text_for_test(), "", "a sent prompt leaves the box");
         assert_eq!(panel.status(), "Waiting for the agent");
         let new_session = agent.recv();
         assert_eq!(new_session["method"], "session/new");
@@ -2035,7 +2185,7 @@ mod tests {
         assert_eq!(prompt["params"]["prompt"][0]["text"], "fix the nose");
 
         // While the turn runs, nothing can be sent but it can be cancelled.
-        *panel.prompt_mut() = "second".to_string();
+        panel.set_prompt_for_test("second".to_string());
         assert_eq!(panel.controls(), Controls { stop: true, new_session: true, cancel: true, ..Controls::default() });
 
         agent.send(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
@@ -2145,10 +2295,116 @@ mod tests {
     // -------------------------------------------------------------------- MCP over the non-blocking listener
 
     #[test]
+    fn coding_agent_draft_external_edit_preserves_live_reader_permission_and_emits_no_frames() {
+        let (mut panel, mut agent, _) = active_panel_endpoint();
+        let old = panel.draft_snapshot();
+        let text = "  private 日本語 👁️\t\r\n";
+        let target = old.target(old.identity().unwrap(), text.into(), None).unwrap();
+        let owner = panel.owner();
+        assert!(matches!(panel.replace_draft_if_current(target), Ok(DraftEditResult::Applied)));
+        assert_eq!(panel.prompt_text_for_test(), text);
+        assert_eq!(panel.owner(), owner);
+        assert!(panel.state().turn_active);
+        assert!(agent.lines.recv_timeout(Duration::from_millis(40)).is_err(), "draft editing must emit no ACP frame");
+        agent.send(json!({"jsonrpc":"2.0", "id":"draft-permission", "method":"session/request_permission",
+            "params":{"sessionId":"panel-test", "toolCall":{"title":"owned permission"}}}));
+        pump_until(&mut panel, |panel| panel.permission().is_some());
+        let permission = panel.permission().unwrap();
+        let snapshot = panel.draft_snapshot();
+        let target = snapshot.target(snapshot.identity().unwrap(), String::new(), None).unwrap();
+        assert!(matches!(panel.replace_draft_if_current(target), Ok(DraftEditResult::Applied)));
+        assert_eq!(panel.permission().unwrap().generation, permission.generation);
+        assert!(panel.state().turn_active && panel.prompt_text_for_test().is_empty());
+        assert!(agent.lines.recv_timeout(Duration::from_millis(40)).is_err());
+        panel.stop();
+    }
+
+    #[test]
+    fn coding_agent_draft_native_same_frame_aba_stales_held_edit() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut panel = no_launch_panel(); panel.set_enabled(true);
+        panel.set_prompt_for_test("A".into());
+        let before = panel.draft_snapshot();
+        let target = before.target(before.identity().unwrap(), "old remote replacement".into(), None).unwrap();
+        let mut harness = Harness::new();
+        let mut draw = |ctx:&egui::Context| { egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui)); };
+        harness.click(Role::TextInput, "User message:", &mut draw);
+        harness.frame(vec![egui::Event::Text("x".into()), egui::Event::Key { key:egui::Key::Backspace,
+            physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }], &mut draw);
+        assert_eq!(panel.prompt_text_for_test(), "A");
+        assert!(matches!(panel.replace_draft_if_current(target), Err(DraftRefusal::StaleDraft)));
+        harness.frame(vec![egui::Event::Text("z".into())], |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+        });
+        let typed = panel.draft_snapshot();
+        harness.next_input = Some(Box::new(|input| input.modifiers = egui::Modifiers::COMMAND));
+        harness.frame(vec![egui::Event::Key { key:egui::Key::Z, physical_key:None,
+            pressed:true, repeat:false, modifiers:egui::Modifiers::COMMAND }], |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+        });
+        assert_eq!(panel.prompt_text_for_test(), "A");
+        assert_ne!(panel.draft_snapshot().identity(), typed.identity());
+    }
+
+    #[test]
+    fn coding_agent_draft_external_identity_survives_stop_but_not_optin_or_other_instance() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let before = panel.draft_snapshot();
+        let target = before.target(before.identity().unwrap(), "surviving draft".into(), None).unwrap();
+        panel.stop();
+        assert!(matches!(panel.replace_draft_if_current(target), Ok(DraftEditResult::Applied)));
+        let old = panel.draft_snapshot();
+        panel.set_enabled(false); panel.set_enabled(true);
+        assert!(panel.draft_snapshot().target(old.identity().unwrap(), "stale".into(), None).is_err());
+        let mut other = no_launch_panel(); other.set_enabled(true);
+        assert!(other.draft_snapshot().target(old.identity().unwrap(), "wrong editor".into(), None).is_err());
+        panel.prompt.version_for_test(Some("max-case".into()), u64::MAX - 1);
+        let last = panel.draft_snapshot();
+        assert!(matches!(panel.replace_draft_if_current(last.target(last.identity().unwrap(), "final".into(), None).unwrap()), Ok(DraftEditResult::Applied)));
+        assert!(!panel.draft_snapshot().editable());
+        panel.set_prompt_for_test("native remains editable".into());
+        assert_eq!(panel.prompt_text_for_test(), "native remains editable");
+    }
+
+    #[test]
+    fn coding_agent_draft_send_clears_only_on_local_success() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct SwitchWriter(Arc<AtomicBool>);
+        impl Write for SwitchWriter {
+            fn write(&mut self, bytes:&[u8]) -> std::io::Result<usize> {
+                if self.0.load(Ordering::SeqCst) { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(bytes.len()) }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for fails in [false,true] {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            let fail = Arc::new(AtomicBool::new(false));
+            let client = Client::new(reader, SwitchWriter(fail.clone()));
+            let mut panel = AgentPanel::with_launcher(|_| Err("test never launches".into()));
+            panel.set_enabled(true); panel.attach(client, None, None);
+            writeln!(writer, "{}", json!({"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}})).unwrap();
+            let deadline = Instant::now() + WAIT;
+            while !panel.state().ready { assert!(Instant::now() < deadline); panel.pump(); std::thread::yield_now(); }
+            panel.set_prompt_for_test("native Send text".into());
+            let before = panel.draft_snapshot(); fail.store(fails, Ordering::SeqCst);
+            panel.send();
+            if fails {
+                assert_eq!(panel.prompt_text_for_test(), "native Send text");
+                assert_eq!(panel.draft_snapshot().identity(), before.identity());
+                assert_eq!(panel.status(), "Send failed");
+            } else {
+                assert_eq!(panel.prompt_text_for_test(), "");
+                assert_ne!(panel.draft_snapshot().identity(), before.identity());
+            }
+        }
+    }
+
+    #[test]
     fn coding_agent_set_canonical_transitions_never_launch_or_retry_retained_failure() {
         let (mut panel, _agent, _) = active_panel_endpoint();
         let owner = panel.owner();
-        *panel.prompt_mut() = "Retained opt-in prompt".into();
+        panel.set_prompt_for_test("Retained opt-in prompt".into());
         let mut attempts = 0;
         assert!(matches!(panel.set_enabled_with(false, |_| {
             attempts += 1;
@@ -2171,7 +2427,7 @@ mod tests {
         assert!(matches!(result, AgentSetResult::Disabled { stop:Some(StopResult::Stopped { approval_reply_failed:false }) }));
         assert_eq!(attempts, 2);
         assert_eq!((panel.status(), panel.error(), panel.owner()), ("Idle", None, None));
-        assert_eq!(panel.prompt_mut(), "Retained opt-in prompt");
+        assert_eq!(panel.prompt_text_for_test(), "Retained opt-in prompt");
 
         let mut empty = no_launch_panel();
         empty.fail("Old failure", "preserved until disable".into());
@@ -2253,7 +2509,7 @@ mod tests {
         use crate::editor_test_support::Harness;
         use egui::accesskit::Role;
         let (mut panel, _agent, _) = active_panel_endpoint();
-        *panel.prompt_mut() = "Retained checkbox prompt".into();
+        panel.set_prompt_for_test("Retained checkbox prompt".into());
         let mut settings = Settings::empty();
         Harness::new().click(Role::CheckBox, "Enable coding agent (ACP)", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -2262,7 +2518,7 @@ mod tests {
         });
         assert!(!panel.is_enabled() && panel.owner().is_none());
         assert_eq!(panel.status(), "Idle");
-        assert_eq!(panel.prompt_mut(), "Retained checkbox prompt");
+        assert_eq!(panel.prompt_text_for_test(), "Retained checkbox prompt");
     }
 
     fn http_post(port: u16, token: Option<&str>, body: &str) -> String {
@@ -2294,7 +2550,7 @@ mod tests {
     fn active_panel_endpoint() -> (AgentPanel<PipeWriter>, Agent, Value) {
         let (mut panel, mut agent) = panel_over_pipes();
         panel.set_enabled(true);
-        *panel.prompt_mut() = "panel approval".into();
+        panel.set_prompt_for_test("panel approval".into());
         panel.send();
         let session = agent.recv();
         agent.send(json!({"jsonrpc":"2.0", "id":session["id"], "result":{"sessionId":"panel-test"}}));
@@ -2337,11 +2593,11 @@ mod tests {
         assert!(matches!(panel.stop_if_current(&target), Err(StopRefusal::StaleTarget)));
         assert_eq!(panel.run.as_ref().unwrap().stop_epoch, 1, "an old admission must not attempt shutdown twice");
         panel.enabled = false;
-        *panel.prompt_mut() = "Retained retry text".into();
+        panel.set_prompt_for_test("Retained retry text".into());
         let retry = StopTarget::External(panel.stop_owner().unwrap());
         assert!(matches!(panel.stop_if_current(&retry), Ok(StopResult::Stopped { approval_reply_failed:false })));
         assert!(panel.owner().is_none() && !panel.is_enabled());
-        assert_eq!(panel.prompt_mut(), "Retained retry text");
+        assert_eq!(panel.prompt_text_for_test(), "Retained retry text");
     }
 
     #[test]
@@ -2432,13 +2688,13 @@ mod tests {
         use crate::editor_test_support::Harness;
         use egui::accesskit::Role;
         let (mut panel, _agent, _) = active_panel_endpoint();
-        *panel.prompt_mut() = "Retained native Stop prompt".into();
+        panel.set_prompt_for_test("Retained native Stop prompt".into());
         Harness::new().click(Role::Button, "Stop", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| { panel.buttons(ui, &Settings::empty()); });
         });
         assert!(panel.owner().is_none());
         assert_eq!(panel.status(), "Stopped");
-        assert_eq!(panel.prompt_mut(), "Retained native Stop prompt");
+        assert_eq!(panel.prompt_text_for_test(), "Retained native Stop prompt");
     }
 
     #[test]
@@ -2453,7 +2709,7 @@ mod tests {
         let init: Value = serde_json::from_str(&line).unwrap();
         writeln!(agent_stdout, "{}", json!({"jsonrpc":"2.0", "id":init["id"], "result":{"protocolVersion":1}})).unwrap();
         pump_until(&mut panel, |panel| panel.state().ready);
-        *panel.prompt_mut() = "Owned test prompt".into();
+        panel.set_prompt_for_test("Owned test prompt".into());
         panel.send();
         line.clear();
         outgoing.read_line(&mut line).unwrap();
@@ -2464,7 +2720,7 @@ mod tests {
         outgoing.read_line(&mut line).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["method"], "session/prompt");
         let owner = panel.owner();
-        *panel.prompt_mut() = "Retained unsent prompt".into();
+        panel.set_prompt_for_test("Retained unsent prompt".into());
         drop(outgoing);
         assert!(matches!(panel.cancel(), CancelResult::WriteFailed { approval_reply_failed:false }));
         assert_eq!(panel.status(), "Cancel failed");
@@ -2472,7 +2728,7 @@ mod tests {
         assert_eq!(panel.owner(), owner);
         assert!(panel.state().has_client && panel.state().cancelling);
         assert!(!panel.controls().cancel);
-        assert_eq!(panel.prompt_mut(), "Retained unsent prompt");
+        assert_eq!(panel.prompt_text_for_test(), "Retained unsent prompt");
         assert!(matches!(panel.cancel(), CancelResult::Unavailable));
     }
 
@@ -2509,7 +2765,7 @@ mod tests {
         use egui::accesskit::Role;
         let (mut panel, mut agent, _) = active_panel_endpoint();
         let owner = panel.owner();
-        *panel.prompt_mut() = "Retained next prompt".into();
+        panel.set_prompt_for_test("Retained next prompt".into());
         agent.send(json!({"jsonrpc":"2.0", "id":"pending", "method":"session/request_permission", "params":{}}));
         pump_until(&mut panel, |panel| panel.permission().is_some());
         Harness::new().click(Role::Button, "Cancel", |ctx| {
@@ -2528,7 +2784,7 @@ mod tests {
         assert_eq!(late["id"], "late");
         assert_eq!(late["result"]["outcome"]["outcome"], "cancelled");
         assert!(panel.permission().is_none());
-        assert_eq!(panel.prompt_mut(), "Retained next prompt");
+        assert_eq!(panel.prompt_text_for_test(), "Retained next prompt");
         assert_eq!(panel.owner(), owner);
     }
 
@@ -3025,7 +3281,7 @@ mod tests {
     #[test]
     fn every_control_of_a_busy_panel_has_an_accessibility_name() {
         let (mut panel, mut agent) = panel_over_pipes();
-        *panel.prompt_mut() = "go".to_string();
+        panel.set_prompt_for_test("go".to_string());
         panel.send();
         let session_new = agent.recv();
         agent.send(json!({"jsonrpc": "2.0", "id": session_new["id"], "result": {"sessionId": "s1"}}));
