@@ -5494,6 +5494,7 @@ flip-pair partners. The clipboard is used up.",
              node/revision and three positional slots (null or {slot,width,height,displayable}), and hasError. \
              displayable means a texture handle exists, not current visibility or document freshness. \
              A terminal read/decode/GPU-size failure updates the viewer and returns an error; preflight refusals preserve it. \
+             Successful document replacement invalidates loaded images, errors and pending reads, retaining visibility and controls. \
              No implicit opening, document/history/settings write or ACP host approval. Editor only.",
             closed_schema(&[], &[])),
         tool("editor_texture_viewer_set", "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close \
@@ -5502,8 +5503,9 @@ flip-pair partners. The clipboard is used up.",
              Controls are refused with open:false. Read windows.textureViewer and windows.textureViewerState \
              (null when closed, otherwise {slot,zoom}) in the returned editor state. Repeated open preserves omitted controls, \
              loaded images, loading and errors; close drops the viewer and reopening starts unloaded at Slot 0, Zoom 1. \
-             Uses the existing selected-Part texture_get loading path. Retained across document replacement, layout \
-             reset and listener restart; closed on process restart. Editor only, all document formats. No document, \
+             Uses the existing selected-Part texture_get loading path. Visibility and controls survive document replacement, \
+             which clears loaded images, errors, loading and pending reads. Retained across layout reset and listener \
+             restart; closed on process restart. Editor only, all document formats. No document, \
              history or settings write; no ACP host approval is needed.",
             closed_schema(&[
                 ("open", json!({"type":"boolean"})),

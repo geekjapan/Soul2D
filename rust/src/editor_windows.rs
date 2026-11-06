@@ -2678,6 +2678,12 @@ impl Windows {
     pub fn forget_document(&mut self) {
         self.flip = None;
         self.flip_nodes = None;
+        self.texture_request = None;
+        if let Some(viewer) = self.texture.as_mut() {
+            viewer.loaded = None;
+            viewer.error = None;
+            viewer.loading = false;
+        }
     }
 
     pub fn about_open(&self) -> bool {
@@ -5314,6 +5320,11 @@ mod frame_tests {
         assert_eq!(state["pending"], Value::Null);
         assert_eq!(state["loaded"], Value::Null);
         assert_eq!(state["hasError"], true);
+        windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap();
+        windows.forget_document();
+        windows.deliver(McpTarget::Texture(0), Some(texture_response(0, 2, 1)));
+        assert_eq!(windows.texture_viewer_load_state(),
+            json!({"loading":false,"pending":null,"loaded":null,"hasError":false}));
         rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([]);
         assert!(windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap().is_empty());
         assert_eq!(windows.texture_viewer_load_state(), json!({"loading":false,"pending":null,"hasError":false,
