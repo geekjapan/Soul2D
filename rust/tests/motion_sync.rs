@@ -41,7 +41,7 @@ fn wav(dir: &Path, name: &str) -> String {
 
 fn stub(dir: &Path, name: &str, body: &str) -> String {
     let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/sh\nfor last in \"$@\"; do :; done\necho $$ > '{}/pid-{name}.txt'\n{body}\n", dir.display())).unwrap();
+    fs::write(&path, format!("#!/bin/sh\nfor last in \"$@\"; do :; done\necho $$ > '{}/pid-{name}.txt' || exit 97\n{body}\n", dir.display())).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -229,13 +229,23 @@ mod analyzer {
         fs::read_to_string(dir.join(format!("pid-{name}.txt"))).ok().map(|pid| pid.trim().to_owned())
     }
 
-    fn wait_pid(dir: &Path, name: &str) -> String {
+    fn wait_pid(session: &mut Session, job: u64, dir: &Path, name: &str) -> Result<String, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let path = dir.join(format!("pid-{name}.txt"));
         loop {
-            if let Some(pid) = stub_pid(dir, name).filter(|pid| !pid.is_empty()) {
-                return pid;
+            let read = fs::read_to_string(&path);
+            if let Ok(pid) = &read {
+                if !pid.trim().is_empty() { return Ok(pid.trim().to_owned()); }
             }
-            assert!(Instant::now() < deadline, "the stub did not record its pid");
+            let status = ok(session, json!({"op":"animation.motionsync.status", "job":job}));
+            if status["state"] != "running" {
+                return Err(format!(
+                    "the stub settled before recording its pid at {path:?}; PID read: {read:?}; analyzer: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the stub did not record its pid at {path:?}; PID read: {read:?}; analyzer: {status}"));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -648,7 +658,7 @@ mod analyzer {
         session.set_motion_sync_analyzer(&stub(&dir, "slow", "exec sleep 30"));
         let started = ok(&mut session, json!({"op": "animation.motionsync.start", "path": wav}));
         let job = started["job"].as_u64().unwrap();
-        let pid = wait_pid(&dir, "slow");
+        let pid = wait_pid(&mut session, job, &dir, "slow").unwrap();
         let message = fail(&mut session, json!({"op": "animation.motionsync.start", "path": wav}));
         assert!(message.contains("already running"), "{message}");
         let reply = ok(&mut session, json!({"op": "animation.motionsync.cancel", "job": job}));
@@ -668,6 +678,31 @@ mod analyzer {
     }
 
     #[test]
+    fn readiness_reports_a_terminal_spawn_error_instead_of_a_pid_timeout() {
+        let dir = temp_dir("readiness-spawn-error");
+        let wav = wav(&dir, "voice.wav");
+        let (mut session, _) = open_session(&dir, &wav);
+        session.set_motion_sync_analyzer(&dir.join("missing-analyzer").to_string_lossy());
+        let started = ok(&mut session, json!({"op":"animation.motionsync.start", "path":wav}));
+        let error = wait_pid(&mut session, started["job"].as_u64().unwrap(), &dir, "missing-analyzer").unwrap_err();
+        assert!(error.contains("cannot start the analyzer") && error.contains("\"state\":\"failed\""), "{error}");
+        assert!(error.contains(dir.join("pid-missing-analyzer.txt").to_string_lossy().as_ref()), "{error}");
+    }
+
+    #[test]
+    fn readiness_reports_a_pid_write_failure_instead_of_a_pid_timeout() {
+        let dir = temp_dir("readiness-pid-write-error");
+        let wav = wav(&dir, "voice.wav");
+        let (mut session, _) = open_session(&dir, &wav);
+        fs::create_dir(dir.join("pid-slow.txt")).unwrap();
+        session.set_motion_sync_analyzer(&stub(&dir, "slow", "exec sleep 30"));
+        let started = ok(&mut session, json!({"op":"animation.motionsync.start", "path":wav}));
+        let error = wait_pid(&mut session, started["job"].as_u64().unwrap(), &dir, "slow").unwrap_err();
+        assert!(error.contains("the analyzer exited") && error.contains("\"state\":\"failed\""), "{error}");
+        assert!(error.contains(dir.join("pid-slow.txt").to_string_lossy().as_ref()), "{error}");
+    }
+
+    #[test]
     fn dropping_the_session_reaps_the_child() {
         let dir = temp_dir("drop");
         let wav = wav(&dir, "voice.wav");
@@ -675,8 +710,8 @@ mod analyzer {
         {
             let (mut session, _) = open_session(&dir, &wav);
             session.set_motion_sync_analyzer(&stub(&dir, "slow", "exec sleep 30"));
-            ok(&mut session, json!({"op": "animation.motionsync.start", "path": wav}));
-            pid = wait_pid(&dir, "slow");
+            let started = ok(&mut session, json!({"op": "animation.motionsync.start", "path": wav}));
+            pid = wait_pid(&mut session, started["job"].as_u64().unwrap(), &dir, "slow").unwrap();
         }
         assert_gone(&pid);
     }
