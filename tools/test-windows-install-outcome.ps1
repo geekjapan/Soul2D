@@ -106,6 +106,15 @@ $function = $ast.Find({ param($node)
 if ($null -eq $function) { throw 'Missing observed-process acquisition function.' }
 . ([scriptblock]::Create($function.Extent.Text))
 
+$function = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Find-LiveProcess'
+}, $false)
+if ($null -eq $function) { throw 'Missing live-process discovery function.' }
+. ([scriptblock]::Create($function.Extent.Text))
+$invalidRejected = $false
+try { Find-LiveProcess -1 | Out-Null } catch { $invalidRejected = $true }
+if (-not $invalidRejected) { throw 'Invalid process identity was treated as an absent process.' }
+
 foreach ($expected in @(0, 7)) {
     $start = [Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath)
     $start.UseShellExecute = $false
@@ -119,12 +128,16 @@ foreach ($expected in @(0, 7)) {
     $launcher = [Diagnostics.Process]::Start($start)
     $observed = $null
     try {
+        $candidate = Find-LiveProcess $launcher.Id
+        if ($null -eq $candidate -or $candidate.Id -ne $launcher.Id) { throw 'Live owned child was not discovered.' }
+        $candidate.Dispose()
         $observed = Get-ObservedProcess $launcher.Id
         $launcher.StandardInput.WriteLine('exit')
         $launcher.StandardInput.Close()
         if (-not $observed.WaitForExit(15000)) { throw 'Owned process did not exit.' }
         $actual = $observed.get_ExitCode()
         if ($actual -ne $expected) { throw "Expected exit code $expected, got $actual." }
+        if ($null -ne (Find-LiveProcess $launcher.Id)) { throw 'Exited discovery candidate was retained as live.' }
         Write-Output "PASS independently observed process exit code $expected"
     } finally {
         if (-not $launcher.HasExited) { $launcher.Kill(); $launcher.WaitForExit() }
@@ -132,6 +145,8 @@ foreach ($expected in @(0, 7)) {
         $launcher.Dispose()
     }
 }
+
+Write-Output 'PASS live-process discovery, exited candidates and invalid identity refusal without changing retained exit-code checks.'
 
 $function = $ast.Find({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-DocumentPath'

@@ -74,6 +74,15 @@ function Get-ObservedProcess([int]$ProcessId) {
     return $process
 }
 
+function Find-LiveProcess([ValidateRange(1, 2147483647)][int]$ProcessId) {
+    try { $process = [Diagnostics.Process]::GetProcessById($ProcessId) }
+    catch [ArgumentException] { return $null }
+    try { if (-not $process.HasExited) { return $process } }
+    catch { $process.Dispose(); throw }
+    $process.Dispose()
+    return $null
+}
+
 function Test-DocumentPath($Actual, $Expected) {
     if ($null -eq $Actual -or $null -eq $Expected) { return $null -eq $Actual -and $null -eq $Expected }
     return [String]::Equals([InstalledSoul2D]::CanonicalPath($Actual), [InstalledSoul2D]::CanonicalPath($Expected),
@@ -326,11 +335,13 @@ function Wait-Editor([string]$Kind, [string]$ShellPath, [AllowNull()][object]$Ex
         $matches = @(Get-CimInstance Win32_Process -Filter "Name='soul2d.exe'" | Where-Object { $_.ExecutablePath -eq $editorPath })
         if ($matches.Count -gt 1) { throw 'Multiple installed editor processes make launch ownership ambiguous.' }
         if ($matches.Count -eq 1) {
-            $editor = Get-Process -Id $matches[0].ProcessId
+            if ($null -ne $editor) { $editor.Dispose() }
+            $editor = Find-LiveProcess $matches[0].ProcessId
+            if ($null -eq $editor) { Start-Sleep -Milliseconds 250; continue }
             if (-not $ownedEditors.Contains($editor.Id)) { $ownedEditors.Add($editor.Id) }
             $editor.Refresh()
             $observation.processes = @(@{ pid = $editor.Id; parentPid = $matches[0].ParentProcessId;
-                sessionId = $editor.SessionId; hwnd = $editor.MainWindowHandle.ToInt64();
+                sessionId = $matches[0].SessionId; hwnd = $editor.MainWindowHandle.ToInt64();
                 visible = [InstalledSoul2D]::IsWindowVisible($editor.MainWindowHandle);
                 listeners = @(Get-NetTCPConnection -OwningProcess $editor.Id -State Listen -ErrorAction SilentlyContinue |
                     Select-Object LocalAddress, LocalPort) })
