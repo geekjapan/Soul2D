@@ -79,6 +79,20 @@ jobs:
         run: ./tools/build-rust-core.sh --locked --all-targets --features gui
       - name: Run Rust tests including GUI and doc tests
         run: cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --no-fail-fast
+      - name: Verify the reusable four-color CMO3 fixture
+        run: |
+          cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --example four-color-cmo3
+          cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --test core a_pro_size_cmo3_large_textures_render_and_roundtrip -- --ignored --exact
+          python -I tools/verify-four-color-fixture.py \
+            --example ./out/rust/debug/examples/four-color-cmo3${{ matrix.exe }} --out "$RUNNER_TEMP/four-color-fixture"
+      - name: Upload four-color fixture verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: four-color-fixture-${{ matrix.os }}
+          path: ${{ runner.temp }}/four-color-fixture/run-*/result.json
+          if-no-files-found: warn
+          retention-days: 3
       - name: Verify real video encoding, audio timing and decoding
         if: runner.os == 'Linux'
         run: cargo test --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust --features gui --test export real_ffmpeg -- --ignored

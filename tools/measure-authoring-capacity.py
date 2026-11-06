@@ -126,7 +126,8 @@ def main():
               "cargo": capture("cargo", "--version"), "executableSha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
               "lockSha256": hashlib.sha256((ROOT / "rust/Cargo.lock").read_bytes()).hexdigest(),
               "sourceHashes": {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in (
-                  "rust/tests/core.rs", "rust/src/caff.rs", "rust/src/authoring_scene.rs", "rust/src/animation_source.rs",
+                  "rust/tests/core.rs", "rust/tests/common/authoring_fixture.rs",
+                  "rust/src/caff.rs", "rust/src/authoring_scene.rs", "rust/src/animation_source.rs",
                   "rust/src/native_scene.rs", "rust/src/render.rs", "tools/measure-authoring-capacity.py")},
               "memoryMetric": "Windows peak working set" if os.name == "nt" else "OS child peak resident set",
               "runs": [], "summary": {}}

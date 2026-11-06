@@ -24,6 +24,26 @@ The last three tests are ignored in the ordinary parallel suite and run explicit
 and sequentially in capacity CI. Large images are decoded during rendering;
 opening a file or counting its texture records alone would not prove that work.
 
+## Reusable four-texture fixture
+
+Generate the fixed, owned four-color CMO3 used by the large-texture regression:
+
+```sh
+cargo run --locked --offline --manifest-path rust/Cargo.toml --target-dir out/rust \
+  --example four-color-cmo3 -- /existing/directory/four-color.cmo3
+```
+
+The destination's parent must exist. The producer takes exactly one destination and refuses existing
+files, directories and symlinks. A failed write can leave a partial new file. It shares the regression's
+XML, four 2048×2048 RGBA textures and CAFF encoder; it adds no product API or configurable limits.
+This synthetic fixture is input for future GUI workloads, not practical-capacity or vendor acceptance.
+
+Rust CI explicitly checks the example and original ignored render/edit/history/save/reopen case on
+all three supported platforms. `tools/verify-four-color-fixture.py` independently decodes the actual
+CLI output, checks deterministic generation, Unicode paths, argument errors and overwrite refusal,
+and emits a JSON receipt. CI uploads that receipt only. Generated CMO3 files and executables are excluded.
+Byte identity across platforms requires matching the three receipts' fixture hashes.
+
 ## Reproduction and evidence
 
 Run the **Authoring capacity** GitHub Actions workflow with `workflow_dispatch`,
