@@ -880,7 +880,8 @@ impl EditorView<'_> {
                 return Err("Not a New session request".into());
             }
             if !identified_stop { return Err("New session requires an identified request with a reply writer".into()); }
-            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_)) { return Err(CLOSING_MESSAGE.into()); }
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
+                || self.ctx.input(|input| input.viewport().close_requested()) { return Err(CLOSING_MESSAGE.into()); }
             let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
             let target = self.agent_set_snapshot.clone().map_err(|_| "New session identity unavailable".to_owned())?
                 .new_session_target(&self.tools.store, approval)?;
@@ -2608,7 +2609,8 @@ impl EditorApp {
     }
 
     fn finish_agent_new_session(&mut self, ctx: &egui::Context) {
-        let closing = self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_));
+        let closing = self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_))
+            || ctx.input(|input| input.viewport().close_requested());
         if let RemoteAgentNewSession::Reviewing { attempt, target } = &self.agent_new_session {
             let failure = if closing { Some(AgentNewSessionOutcome::EditorClosing) }
                 else { self.agent.new_session_status(target, &self.tools.store, false).err().map(AgentNewSessionOutcome::Refused) };
@@ -17023,6 +17025,132 @@ mod editor_state_tests {
         reply.write_line(&mut Vec::new()).unwrap(); finish_agent_new_session(&mut app);
         assert!(!app.agent.state().has_client && app.agent.error().is_none());
         assert!(refused(&mut app, "editor_coding_agent_new_session", json!({})).contains("closing"));
+    }
+
+    #[test]
+    fn coding_agent_new_session_native_close_frame_cancels_delivery_before_any_launch() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for gate in ["clean", "modified", "draft"] {
+            let mut app = app(&format!("coding-agent-new-session-close-frame-{gate}"));
+            app.agent.set_enabled(true);
+            app.tools.store.set("Outline.visible", false).unwrap();
+            app.tools.store.set("SaveProjectOnClose", "Ask".to_owned()).unwrap();
+            if gate == "modified" {
+                assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2,
+                    "name":"Unsaved close-frame edit"}))["succeeded"], true);
+            } else if gate == "draft" {
+                app.select_node_draft(2);
+                app.controller.set_draft_name("Unapplied close-frame edit".into());
+            }
+            let before = app.controller.snapshot().clone();
+            app.agent.set_prompt_for_test("Unsent close-frame message".into());
+            let draft = app.agent.draft_snapshot();
+            request_agent_new_session(&mut app).write_line(&mut Vec::new()).unwrap();
+            let mut harness = Harness::new();
+            harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT)
+                .or_default().events.push(egui::ViewportEvent::Close)));
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            assert_eq!(state(&mut app)["codingAgentNewSession"],
+                json!({"state":"editor_closing", "attempt":1}), "{gate}");
+            assert!(!app.agent.state().has_client && app.agent.error().is_none(), "{gate}");
+            assert_eq!(app.agent.draft_snapshot(), draft);
+            assert_eq!(app.controller.snapshot(), &before);
+            assert_eq!(app.closing, gate == "clean");
+            assert_eq!(app.unsaved.is_some(), gate == "modified");
+            assert_eq!(app.close_blocked, gate == "draft");
+            if gate != "clean" {
+                if gate == "modified" {
+                    harness.click(Role::Button, "Cancel", |ctx| app.update(ctx, &mut frame));
+                    assert!(app.unsaved.is_none());
+                } else {
+                    harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                }
+                assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "editor_closing");
+                assert!(app.agent.error().is_none(), "a cancelled close must not revive the old request");
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_new_session_native_close_frame_refuses_new_host_admission() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-new-session-close-frame-host");
+        app.agent.set_enabled(true);
+        app.select_node_draft(2); app.controller.set_draft_name("Keep the editor open".into());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (reply, written) = std::sync::mpsc::sync_channel(1);
+        app.host_rx = Some(receiver);
+        sender.send(HostMessage::Rpc { request:new_session_message(), reply }).unwrap();
+        let mut harness = Harness::new();
+        harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT)
+            .or_default().events.push(egui::ViewportEvent::Close)));
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        let mut bytes = Vec::new();
+        written.try_recv().unwrap().write_line(&mut bytes).unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("closing"));
+        assert_eq!(state(&mut app)["codingAgentNewSession"], json!({"state":"idle"}));
+        assert!(!app.closing && app.close_blocked && app.agent.error().is_none());
+        let next = request_agent_new_session(&mut app);
+        assert_eq!(state(&mut app)["codingAgentNewSession"], json!({"state":"waiting_for_reply", "attempt":1}));
+        app.begin_closing(); drop(next);
+    }
+
+    #[test]
+    fn coding_agent_new_session_native_close_frame_refuses_and_settles_original_acp_review() {
+        use crate::editor_test_support::{has, Harness};
+        use egui::accesskit::Role;
+        for phase in ["fresh", "reviewing", "allowed", "delivered"] {
+            let mut app = app(&format!("coding-agent-new-session-close-frame-acp-{phase}"));
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let (mut peer, token) = draft_peer(&mut app);
+            app.select_node_draft(2); app.controller.set_draft_name("Keep this owned session".into());
+            app.agent.set_prompt_for_test("Unsent message survives native close".into());
+            let draft = app.agent.draft_snapshot();
+            let before = app.controller.snapshot().clone();
+            let owner = app.agent.owner();
+            let mut original = Some(draft_http(&app, &token, &new_session_message()));
+            if phase != "fresh" {
+                serve_agent_requests(&mut app);
+                assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "awaiting_human");
+            }
+            let path = app.tools.store_path.clone();
+            if matches!(phase, "allowed" | "delivered") {
+                Harness::new().click(Role::Button, "Allow once", |ctx|
+                    app.agent.host_approval_window(ctx, path.as_deref()));
+            }
+            if phase == "delivered" {
+                serve_agent_requests(&mut app);
+                assert_eq!(lifecycle_http_result(original.take().unwrap(), "new-session-admission")
+                    ["structuredContent"]["codingAgentNewSession"]["state"], "admitted");
+            }
+            let mut harness = Harness::new();
+            harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT)
+                .or_default().events.push(egui::ViewportEvent::Close)));
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            if let Some(original) = original {
+                assert_eq!(lifecycle_http_result(original, "new-session-admission")["isError"], true, "{phase}");
+            }
+            let expected = if phase == "fresh" { json!({"state":"idle"}) }
+                else { json!({"state":"editor_closing", "attempt":1}) };
+            assert_eq!(state(&mut app)["codingAgentNewSession"], expected, "{phase}");
+            assert_eq!(app.agent.owner(), owner);
+            assert!(app.agent.state().turn_active && !app.agent.state().closed);
+            assert_eq!(app.agent.draft_snapshot(), draft);
+            assert_eq!(app.controller.snapshot(), &before);
+            assert!(app.controller.draft_dirty() && !app.closing && app.close_blocked);
+            let output = harness.frame(Vec::new(), |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            assert!(!has(&output, Role::Button, "Allow once"), "{phase}: original review must finish");
+            harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+            assert_eq!(state(&mut app)["codingAgentNewSession"], expected, "{phase}: original must not revive");
+            assert_eq!(app.agent.owner(), owner);
+            peer.finish(&mut app);
+        }
     }
 
     fn configure_owned_new_session_fixture(app: &mut EditorApp, name: &str) -> PathBuf {
