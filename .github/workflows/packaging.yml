@@ -77,7 +77,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+          for apt_source in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$apt_source" ]; then
+              sudo sed -i -E 's|https?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$apt_source"
+            fi
+          done
           sudo apt-get update
           # Keep the recommends: flatpak-builder needs appstream-compose for the metainfo step.
           sudo apt-get install -y flatpak flatpak-builder dbus-daemon
