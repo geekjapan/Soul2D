@@ -11879,6 +11879,31 @@
       ]
     },
     {
+      "description": "Action: admit the session-only coding-agent checkbox transition after identified local reply delivery and matching state. Enabling does not launch, bind, save settings or clear errors. Disabling uses native Stop once, then sets enabled=false even if shutdown fails and retains the closed owner without its endpoint. Same-value requests do nothing and never retry Stop. ACP self-disable that stops an owner requires original-call human Allow once, without successful-turn waiting. Read codingAgentSet and match its attempt; admission is not execution. Preserves unsent text, document, drafts, history and settings. Failed, lost or expired delivery never executes. No automatic retry. Headless, notifications and internal calls refuse.",
+      "effect": "application-lifecycle",
+      "guiEntry": [
+        "Coding agent > Enable coding agent (ACP)"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_set",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: admit Stop of the exact retained coding-agent run after local reply delivery. ACP self-Stop requires human approval of the original authenticated call, without waiting for a successful turn. Stops and may kill/reap the owned child; successful release discards its conversation but preserves unsent text, document, drafts, history and settings. Failed shutdown can retain a closed owner after removing its endpoint. Read codingAgentStop for the latest attempt and independent approval-write failure; admission is not execution. No automatic retry, provider-completion guarantee, launch or disable. Headless, notifications and internal calls refuse.",
       "effect": "application-lifecycle",
       "guiEntry": [

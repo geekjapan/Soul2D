@@ -315,6 +315,64 @@ const QUIT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_QUIT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const AGENT_CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_SET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum AgentSetOutcome {
+    Applied(crate::editor_agent::AgentSetResult),
+    Refused(crate::editor_agent::StopRefusal),
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+enum RemoteAgentSet {
+    Idle,
+    Reviewing { attempt: u64, target: crate::editor_agent::AgentSetTarget },
+    Waiting { attempt: u64, target: crate::editor_agent::AgentSetTarget,
+        receipt: Receiver<Result<(), String>>, deadline: Instant },
+    Finished { attempt: u64, outcome: AgentSetOutcome, invalid: crate::editor_agent::AgentSetTarget },
+}
+
+impl RemoteAgentSet {
+    fn attempt(&self) -> u64 {
+        match self {
+            Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt,
+        }
+    }
+
+    fn state(&self) -> Value {
+        use crate::editor_agent::{AgentSetResult, StopRefusal, StopResult};
+        let (attempt, target, state, stop, failed) = match self {
+            Self::Idle => return json!({"state":"idle"}),
+            Self::Reviewing { attempt, target } => (attempt, target, "awaiting_human", None, None),
+            Self::Waiting { attempt, target, .. } => (attempt, target, "waiting_for_reply", None, None),
+            Self::Finished { attempt, outcome, invalid } => {
+                let (state, stop, failed) = match outcome {
+                    AgentSetOutcome::Applied(AgentSetResult::NoOp) => ("no_op", None, None),
+                    AgentSetOutcome::Applied(AgentSetResult::Enabled) => ("enabled", None, None),
+                    AgentSetOutcome::Applied(AgentSetResult::Disabled { stop:None }) => ("disabled", Some("not_needed"), None),
+                    AgentSetOutcome::Applied(AgentSetResult::Disabled { stop:Some(StopResult::Stopped { approval_reply_failed }) }) =>
+                        ("disabled", Some("stopped"), Some(*approval_reply_failed)),
+                    AgentSetOutcome::Applied(AgentSetResult::Disabled { stop:Some(StopResult::FailedRetained { approval_reply_failed }) }) =>
+                        ("disabled_retained", Some("failed_retained"), Some(*approval_reply_failed)),
+                    AgentSetOutcome::Refused(StopRefusal::StaleTarget) => ("stale_target", None, None),
+                    AgentSetOutcome::Refused(StopRefusal::ConsentInvalid) => ("consent_invalid", None, None),
+                    AgentSetOutcome::ReplyNotProduced => ("reply_not_produced", None, None),
+                    AgentSetOutcome::ReplyFailed => ("reply_failed", None, None),
+                    AgentSetOutcome::ReplyLost => ("reply_lost", None, None),
+                    AgentSetOutcome::ReplyExpired => ("reply_expired", None, None),
+                };
+                (attempt, invalid, state, stop, failed)
+            }
+        };
+        let mut value = json!({"state":state, "attempt":attempt, "enabled":target.enabled});
+        if let Some(stop) = stop { value["stop"] = json!(stop); }
+        if let Some(failed) = failed { value["approval_reply_failed"] = json!(failed); }
+        value
+    }
+}
 
 enum AgentStopOutcome {
     Stopped { approval_reply_failed: bool },
@@ -482,6 +540,8 @@ struct EditorView<'a> {
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
     agent_stop: &'a mut RemoteAgentStop,
     agent_stop_owner: Option<crate::editor_agent::StopOwner>,
+    agent_set: &'a mut RemoteAgentSet,
+    agent_set_snapshot: Result<crate::editor_agent::AgentSetSnapshot, String>,
     animation_draft: &'a mut AnimationDraft,
     timeline_value_draft: &'a mut Option<(TimelineSelection, f64)>,
     timeline_tension_draft: &'a mut Option<(TimelineSelection, f64)>,
@@ -553,6 +613,8 @@ macro_rules! editor_view {
             agent_cancel_target: $app.agent.cancel_target(),
             agent_stop: &mut $app.agent_stop,
             agent_stop_owner: $app.agent.stop_owner(),
+            agent_set: &mut $app.agent_set,
+            agent_set_snapshot: $app.agent.set_snapshot(),
             animation_draft: &mut $app.animation_draft,
             timeline_value_draft: &mut $app.timeline_value_draft,
             timeline_tension_draft: &mut $app.timeline_tension_draft,
@@ -671,6 +733,19 @@ impl EditorView<'_> {
                     _ => self.agent_stop.attempt().checked_add(1).map(|_| target).ok_or("Stop identity exhausted".into()),
                 }
             });
+        let set_target = self.agent_set_snapshot.clone().and_then(|snapshot| {
+            let enabled = message["params"]["arguments"]["enabled"].as_bool().ok_or("enabled must be a boolean")?;
+            let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
+            snapshot.target(enabled, approval)
+        }).and_then(|target| {
+            match &*self.agent_set {
+                RemoteAgentSet::Reviewing { target: expected, .. } if expected == &target && target.needs_approval() => Ok(target),
+                RemoteAgentSet::Reviewing { .. } | RemoteAgentSet::Waiting { .. } => Err("Coding agent Set already pending; read editor state".into()),
+                RemoteAgentSet::Finished { invalid, .. } if invalid == &target && target.needs_approval() =>
+                    Err("This original Set request was invalidated; make a fresh request".into()),
+                _ => self.agent_set.attempt().checked_add(1).map(|_| target).ok_or("Coding agent Set identity exhausted".into()),
+            }
+        });
         let acp_quit = match &origin { McpOrigin::Agent(approval) => approval.quit_target().ok(), _ => None };
         let is_quit = message["method"] == "tools/call" && message["params"]["name"] == "editor_quit";
         let read_only = matches!(message["method"].as_str(), Some("tools/list" | "resources/list" | "resources/templates/list" | "resources/read" | "ping" | "initialize"))
@@ -697,6 +772,7 @@ impl EditorView<'_> {
                     _ => Ok(target.clone()),
                 }
             });
+        let mut set_receipt = None;
         let mut quit_receipt = None;
         let mut cancel_receipt = None;
         let mut stop_receipt = None;
@@ -719,6 +795,12 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.coding_agent.set" {
+                    if !identified_stop { return Err("Coding agent Set requires an identified request with a reply writer".into()); }
+                    let target = set_target.clone()?;
+                    if !target.needs_approval() { return Ok(()); }
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::CodingAgentSet(target)), None);
+                }
                 if call["op"] == "editor.coding_agent.stop" {
                     if !identified_stop { return Err("Stop requires an identified request with a reply writer".into()); }
                     return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::Stop(stop_target.clone()?)), None);
@@ -849,6 +931,24 @@ impl EditorView<'_> {
             }
             Ok(())
         }, &mut |controller, call| {
+            if call["op"] == "editor.coding_agent.set" {
+                if !identified_stop { return Err("Coding agent Set requires an identified request with a reply writer".into()); }
+                let target = set_target.clone()?;
+                let attempt = if target.needs_approval() {
+                    match &*self.agent_set {
+                        RemoteAgentSet::Reviewing { attempt, target: expected } if expected == &target => *attempt,
+                        _ => return Err("The original Set review is no longer valid".into()),
+                    }
+                } else { self.agent_set.attempt().checked_add(1).ok_or("Coding agent Set identity exhausted")? };
+                let enabled = target.enabled;
+                let (sender, receipt) = sync_channel(1);
+                *self.agent_set = RemoteAgentSet::Waiting { attempt, target, receipt,
+                    deadline: Instant::now() + AGENT_SET_REPLY_TIMEOUT };
+                let admitted = json!({"codingAgentSet":{"state":"admitted", "attempt":attempt, "enabled":enabled,
+                    "policy":"after_local_reply_delivery_and_matching_state"}});
+                set_receipt = Some((sender, admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.coding_agent.stop" {
                 if !identified_stop { return Err("Stop requires an identified request with a reply writer".into()); }
                 let target = stop_target.clone()?;
@@ -916,6 +1016,14 @@ impl EditorView<'_> {
             self.handle(controller, call)
         });
         if let McpOrigin::Agent(approval) = &origin {
+            if let Some(target) = approval.set_review() {
+                if !matches!(&*self.agent_set, RemoteAgentSet::Reviewing { .. } | RemoteAgentSet::Waiting { .. })
+                    && !matches!(&*self.agent_set, RemoteAgentSet::Finished { invalid, .. } if invalid == &target) {
+                    if let Some(attempt) = self.agent_set.attempt().checked_add(1) {
+                        *self.agent_set = RemoteAgentSet::Reviewing { attempt, target };
+                    }
+                }
+            }
             if let Some(target) = approval.stop_review() {
                 if !matches!(&*self.agent_stop, RemoteAgentStop::Reviewing { .. } | RemoteAgentStop::Waiting { .. })
                     && !matches!(&*self.agent_stop, RemoteAgentStop::Finished { invalid: Some(invalid), .. } if invalid == &target) {
@@ -946,6 +1054,19 @@ impl EditorView<'_> {
         }
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
+        if let Some((receipt, admitted)) = set_receipt {
+            if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteAgentSet::Waiting { deadline, .. } = self.agent_set {
+                    *deadline = Instant::now() + AGENT_SET_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            let pending = std::mem::replace(self.agent_set, RemoteAgentSet::Idle);
+            let RemoteAgentSet::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            *self.agent_set = RemoteAgentSet::Finished { attempt, outcome:AgentSetOutcome::ReplyNotProduced, invalid:target };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, admitted)) = stop_receipt {
             if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == admitted) {
@@ -1615,6 +1736,7 @@ impl EditorView<'_> {
             },
             "codingAgentCancel": self.agent_cancel.state(),
             "codingAgentStop": self.agent_stop.state(),
+            "codingAgentSet": self.agent_set.state(),
             "selection": {
                 "nodes": controller.selected_nodes(),
                 "bindings": self.parameters.selected_bindings.iter()
@@ -1691,6 +1813,7 @@ pub struct EditorApp {
     remote_quit: RemoteQuit,
     agent_cancel: RemoteAgentCancel,
     agent_stop: RemoteAgentStop,
+    agent_set: RemoteAgentSet,
     #[cfg(test)]
     hold_quit_receipt_for_test: bool,
     #[cfg(test)]
@@ -1821,6 +1944,7 @@ impl EditorApp {
             remote_quit: RemoteQuit::Idle,
             agent_cancel: RemoteAgentCancel::Idle,
             agent_stop: RemoteAgentStop::Idle,
+            agent_set: RemoteAgentSet::Idle,
             #[cfg(test)]
             hold_quit_receipt_for_test: false,
             #[cfg(test)]
@@ -2182,6 +2306,37 @@ impl EditorApp {
         });
         self.agent.invalidate_stop(&target);
         self.agent_stop = RemoteAgentStop::Finished { attempt, outcome, invalid:Some(target) };
+    }
+
+    fn finish_agent_set(&mut self, ctx: &egui::Context) {
+        if let RemoteAgentSet::Reviewing { attempt, target } = &self.agent_set {
+            if let Err(refusal) = self.agent.set_status(target, false) {
+                let (attempt, target) = (*attempt, target.clone());
+                self.agent.invalidate_set(&target);
+                self.agent_set = RemoteAgentSet::Finished { attempt, outcome:AgentSetOutcome::Refused(refusal), invalid:target };
+            }
+            return;
+        }
+        let RemoteAgentSet::Waiting { receipt, deadline, .. } = &mut self.agent_set else { return };
+        let failure = if Instant::now() >= *deadline { Some(AgentSetOutcome::ReplyExpired) } else {
+            match receipt.try_recv() {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => Some(AgentSetOutcome::ReplyFailed),
+                Err(TryRecvError::Disconnected) => Some(AgentSetOutcome::ReplyLost),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(10));
+                    return;
+                }
+            }
+        };
+        let pending = std::mem::replace(&mut self.agent_set, RemoteAgentSet::Idle);
+        let RemoteAgentSet::Waiting { attempt, target, .. } = pending else { unreachable!() };
+        let outcome = failure.unwrap_or_else(|| match self.agent.set_if_current(&target) {
+            Ok(result) => AgentSetOutcome::Applied(result),
+            Err(refusal) => AgentSetOutcome::Refused(refusal),
+        });
+        self.agent.invalidate_set(&target);
+        self.agent_set = RemoteAgentSet::Finished { attempt, outcome, invalid:target };
     }
 
     fn finish_remote_quit(&mut self, ctx: &egui::Context) {
@@ -6965,6 +7120,7 @@ impl eframe::App for EditorApp {
         }
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
+        self.finish_agent_set(ctx);
         self.agent.pump();
         self.observe_remote_quit(ctx);
         let mcp_status = self.mcp_status();
@@ -6997,12 +7153,14 @@ impl eframe::App for EditorApp {
         let approval_path = self.tools.store_path.clone();
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
+        self.finish_agent_set(ctx);
         self.agent.tick(ctx);
         let controller = &mut self.controller;
         let mut view = editor_view!(self, ctx);
         self.agent.serve_mcp(approval_path.as_deref(), &mut |message, approval| view.mcp(controller, message, McpOrigin::Agent(approval)));
         self.finish_agent_cancel(ctx);
         self.finish_agent_stop(ctx);
+        self.finish_agent_set(ctx);
         self.agent.host_approval_window(ctx, approval_path.as_deref());
         self.handle_shortcuts(ctx);
         self.window_chrome(ctx);
@@ -16360,6 +16518,595 @@ mod editor_state_tests {
         CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
     }
 
+    fn request_agent_set(app: &mut EditorApp, enabled: bool) -> RpcReply {
+        let request = json!({"jsonrpc":"2.0", "id":"set-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":enabled}}});
+        CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client))
+    }
+
+    fn request_agent_disable(app: &mut EditorApp) -> RpcReply { request_agent_set(app, false) }
+
+    fn finish_agent_set(app: &mut EditorApp) { CTX.with(|ctx| app.finish_agent_set(ctx)); }
+
+    #[test]
+    fn coding_agent_set_no_owner_enable_disable_and_noop_are_session_only() {
+        let mut app = app("coding-agent-set-no-owner");
+        let path = app.tools.store_path.clone().unwrap();
+        std::fs::write(&path, b"{\"DarkMode\":true}").unwrap();
+        app.tools.store.set("ACP.Command", "private-owned-test-sentinel".to_owned()).unwrap();
+        let snapshot = app.controller.snapshot().clone();
+        for (enabled, expected) in [(false,"no_op"), (true,"enabled"), (true,"no_op"), (false,"disabled")] {
+            let before = app.agent.state().enabled;
+            let reply = request_agent_set(&mut app, enabled);
+            assert_eq!(app.agent.state().enabled, before);
+            reply.write_line(&mut Vec::new()).unwrap();
+            finish_agent_set(&mut app);
+            assert_eq!(app.agent.state().enabled, enabled);
+            assert_eq!(state(&mut app)["codingAgentSet"]["state"], expected);
+            assert!(!app.agent.state().has_client && app.agent.mcp_url().is_none());
+        }
+        assert_eq!(state(&mut app)["codingAgentSet"]["stop"], "not_needed");
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        assert_eq!(std::fs::read(path).unwrap(), b"{\"DarkMode\":true}");
+    }
+
+    #[test]
+    fn coding_agent_set_strict_envelopes_arguments_and_internal_origin_never_admit() {
+        let mut app = app("coding-agent-set-boundaries");
+        for arguments in [Value::Null, json!({}), json!({"enabled":1}), json!({"enabled":"false"}),
+            json!({"enabled":false,"extra":true})] {
+            let _ = refused(&mut app, "editor_coding_agent_set", arguments);
+        }
+        for id in [Value::Null, json!(false), json!([]), json!({}), json!(0.5)] {
+            let message = json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"editor_coding_agent_set","arguments":{"enabled":true}}});
+            let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &message, McpOrigin::Client));
+            if let Some(reply) = reply.into_message() { assert!(reply["result"]["isError"] == true || reply.get("error").is_some()); }
+        }
+        let message = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set","arguments":{"enabled":true}}});
+        let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &message, McpOrigin::Internal)).into_message().unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        let mut notification = message.clone(); notification.as_object_mut().unwrap().remove("id");
+        assert!(CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &notification, McpOrigin::Client)).into_message().is_none());
+        finish_agent_set(&mut app);
+        assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"idle"}));
+        assert!(!app.agent.state().enabled);
+        let target = app.agent.set_snapshot().unwrap().target(true, None).unwrap();
+        app.agent_set = RemoteAgentSet::Finished { attempt:u64::MAX, outcome:AgentSetOutcome::ReplyLost, invalid:target };
+        assert!(refused(&mut app, "editor_coding_agent_set", json!({"enabled":true})).contains("identity exhausted"));
+        app.agent.set_enabled(true);
+        assert!(app.agent.state().enabled);
+    }
+
+    #[test]
+    fn coding_agent_set_stales_flag_and_no_owner_cycles_without_retargeting() {
+        for owner_cycle in [false,true] {
+            let mut app = app(&format!("coding-agent-set-cycle-{owner_cycle}"));
+            let reply = request_agent_set(&mut app, true);
+            if owner_cycle {
+                let mut peer = LifecyclePeer::attach(&mut app, None);
+                peer.finish(&mut app);
+                app.agent.set_enabled(false);
+            } else {
+                app.agent.set_enabled(true); app.agent.set_enabled(false);
+            }
+            reply.write_line(&mut Vec::new()).unwrap();
+            finish_agent_set(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSet"]["state"], "stale_target");
+            assert!(!app.agent.state().enabled && !app.agent.state().has_client);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_and_stop_use_readiness_order_without_double_release() {
+        for set_admitted_first in [false,true] {
+            for set_delivered_first in [false,true] {
+                let mut app = app(&format!("coding-agent-set-stop-{set_admitted_first}-{set_delivered_first}"));
+                let mut peer = LifecyclePeer::attach(&mut app, None);
+                let (set, stop) = if set_admitted_first {
+                    let set = request_agent_disable(&mut app); (set, request_agent_stop(&mut app))
+                } else {
+                    let stop = request_agent_stop(&mut app); (request_agent_disable(&mut app), stop)
+                };
+                if set_delivered_first {
+                    set.write_line(&mut Vec::new()).unwrap();
+                    finish_agent_stop(&mut app); finish_agent_set(&mut app);
+                    stop.write_line(&mut Vec::new()).unwrap();
+                    finish_agent_stop(&mut app);
+                    assert_eq!(state(&mut app)["codingAgentSet"]["state"], "disabled");
+                    assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stale_target");
+                    assert!(!app.agent.state().enabled);
+                } else {
+                    set.write_line(&mut Vec::new()).unwrap(); stop.write_line(&mut Vec::new()).unwrap();
+                    finish_agent_stop(&mut app); finish_agent_set(&mut app);
+                    assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+                    assert_eq!(state(&mut app)["codingAgentSet"]["state"], "stale_target");
+                    assert!(app.agent.state().enabled);
+                }
+                assert!(!app.agent.state().has_client);
+                peer.finish(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_noop_keeps_pending_stop_valid() {
+        let mut app = app("coding-agent-set-noop-stop");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        let stop = request_agent_stop(&mut app);
+        request_agent_set(&mut app, true).write_line(&mut Vec::new()).unwrap();
+        finish_agent_stop(&mut app); finish_agent_set(&mut app);
+        assert_eq!(state(&mut app)["codingAgentSet"]["state"], "no_op");
+        assert!(app.agent.state().has_client);
+        stop.write_line(&mut Vec::new()).unwrap();
+        finish_agent_stop(&mut app);
+        assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_follows_cancel_and_stop_in_the_same_real_frame() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-set-all-controls");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
+        request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();
+        request_agent_cancel(&mut app).write_line(&mut Vec::new()).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentCancel"]["state"], "requested");
+        assert_eq!(state(&mut app)["codingAgentStop"]["state"], "stopped");
+        assert_eq!(state(&mut app)["codingAgentSet"]["state"], "stale_target");
+        assert!(app.agent.state().enabled && !app.agent.state().has_client && !app.closing);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_admission_precedes_frame_owned_release() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("coding-agent-set-admission");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        *app.agent.prompt_mut() = "Retained next prompt".into();
+        let before = app.controller.snapshot().clone();
+        let request = json!({"jsonrpc":"2.0", "id":"stop-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
+        let reply = CTX.with(|ctx| editor_view!(app, ctx).mcp(&mut app.controller, &request, McpOrigin::Client));
+        let mut bytes = Vec::new();
+        reply.write_line(&mut bytes).unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentSet"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert!(!app.agent.state().has_client);
+        assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"disabled", "enabled":false, "stop":"stopped", "attempt":1, "approval_reply_failed":false}));
+        assert_eq!(app.agent.prompt_mut(), "Retained next prompt");
+        assert_eq!(app.controller.snapshot(), &before);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_failed_lost_and_expired_replies_keep_owner_and_require_fresh_attempt() {
+        struct BadWriter { remaining: usize, fail_flush: bool }
+        impl std::io::Write for BadWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                let n = bytes.len().min(self.remaining);
+                self.remaining -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+            }
+        }
+        for case in ["partial", "flush", "drop", "consumer", "expired"] {
+            let mut app = app(&format!("coding-agent-set-reply-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let before = app.controller.snapshot().clone();
+            let reply = request_agent_disable(&mut app);
+            finish_agent_set(&mut app);
+            assert!(app.agent.state().has_client);
+            assert_eq!(state(&mut app)["codingAgentSet"]["state"], "waiting_for_reply");
+            assert!(refused(&mut app, "editor_coding_agent_set", json!({"enabled":false})).contains("already pending"));
+            match case {
+                "partial" | "flush" => assert!(reply.write_line(&mut BadWriter {
+                    remaining:if case == "partial" { 4 } else { usize::MAX }, fail_flush:case == "flush" }).is_err()),
+                "drop" => drop(reply),
+                "consumer" => { assert!(reply.into_message().is_some()); }
+                _ => {
+                    reply.write_line(&mut Vec::new()).unwrap();
+                    let RemoteAgentSet::Waiting { deadline, .. } = &mut app.agent_set else { panic!() };
+                    *deadline = Instant::now() - Duration::from_millis(1);
+                }
+            }
+            finish_agent_set(&mut app);
+            let expected = match case { "partial" | "flush" => "reply_failed", "expired" => "reply_expired", _ => "reply_lost" };
+            assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":expected, "enabled":false, "attempt":1}));
+            assert!(app.agent.state().has_client && app.agent.state().turn_active);
+            assert_eq!(app.controller.snapshot(), &before);
+            request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
+            finish_agent_set(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"disabled", "enabled":false, "stop":"stopped", "attempt":2, "approval_reply_failed":false}));
+            finish_agent_set(&mut app);
+            assert!(!app.agent.state().has_client);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_original_authenticated_call_alone_consumes_human_approval() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-set-original-acp");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"same-stop-id", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
+        let original = lifecycle_http(&endpoint, &request);
+        let second = lifecycle_http(&endpoint, &request);
+        let address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let token = endpoint.token_for_test().to_owned();
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        let mut harness = Harness::new();
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"awaiting_human", "enabled":false, "attempt":1}));
+        assert!(app.agent.state().has_client);
+        assert_eq!(lifecycle_http_result(second, "same-stop-id")["isError"], true);
+        assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":"Changed during Stop review"}))["succeeded"], true);
+        app.select_node_draft(2);
+        app.controller.set_draft_name("Unapplied Stop review draft".into());
+        let _ = state(&mut app);
+        let snapshot = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone();
+        harness.click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        let late_duplicate = {
+            use std::io::Write;
+            let mut stream = std::net::TcpStream::connect(&address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body = request.to_string();
+            write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            stream
+        };
+        harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        let result = lifecycle_http_result(original, "same-stop-id");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["codingAgentSet"]["state"], "admitted");
+        assert_eq!(lifecycle_http_result(late_duplicate, "same-stop-id")["isError"], true);
+        assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"disabled", "enabled":false, "stop":"stopped", "attempt":1, "approval_reply_failed":false}));
+        assert!(!app.agent.state().has_client);
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Unapplied Stop review draft"));
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_denied_expired_or_changed_review_never_stops_the_owner() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["denied", "timeout", "completed", "permission"] {
+            let mut app = app(&format!("coding-agent-set-review-{case}"));
+            let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+            let request = json!({"jsonrpc":"2.0", "id":"review-stop", "method":"tools/call",
+                "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
+            let stream = lifecycle_http(&endpoint, &request);
+            let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+            lifecycle_prompt(&mut app, &peer);
+            serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSet"]["state"], "awaiting_human");
+            match case {
+                "denied" => {
+                    let path = app.tools.store_path.clone();
+                    Harness::new().click(Role::Button, "Deny changes this turn", |ctx|
+                        app.agent.host_approval_window(ctx, path.as_deref()));
+                }
+                "timeout" => app.agent.expire_host_approval_for_test(),
+                "completed" => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    app.agent.pump();
+                }
+                _ => peer.enqueue(lifecycle_permission()),
+            }
+            finish_agent_set(&mut app);
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(stream, "review-stop")["isError"], true);
+            assert_eq!(state(&mut app)["codingAgentSet"], json!({"state":"consent_invalid", "enabled":false, "attempt":1}));
+            assert!(app.agent.state().has_client);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_acp_execution_uses_owner_observed_turn_and_reader_permission_cutoffs() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["decoded_completion", "observed_completion", "new_prompt", "permission", "disconnect"] {
+            let mut app = app(&format!("coding-agent-set-cutoff-{case}"));
+            let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+            let request = json!({"jsonrpc":"2.0", "id":"cutoff-stop", "method":"tools/call",
+                "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
+            let stream = lifecycle_http(&endpoint, &request);
+            let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+            lifecycle_prompt(&mut app, &peer);
+            serve_agent_requests(&mut app);
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            let result = lifecycle_http_result(stream, "cutoff-stop");
+            assert_eq!(result["isError"], false, "{result}");
+            assert!(app.agent.state().has_client);
+            match case {
+                "permission" => peer.enqueue(lifecycle_permission()),
+                "disconnect" => {
+                    peer.frames.take();
+                    let RemoteAgentSet::Waiting { target, .. } = &app.agent_set else { panic!() };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.agent.set_status(target, true).is_ok() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                }
+                _ => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    if case != "decoded_completion" { app.agent.pump(); }
+                    if case == "new_prompt" {
+                        *app.agent.prompt_mut() = "New independently sent fixture turn".into();
+                        app.agent.send();
+                    }
+                }
+            }
+            if case == "decoded_completion" {
+                let mut frame = eframe::Frame::_new_kittest();
+                Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                assert_eq!(state(&mut app)["codingAgentSet"]["state"], "disabled");
+                assert!(!app.agent.state().has_client);
+            } else {
+                finish_agent_set(&mut app);
+                assert_eq!(state(&mut app)["codingAgentSet"]["state"], "consent_invalid");
+                assert!(app.agent.state().has_client);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_external_action_handles_every_retained_lifecycle_state() {
+        for case in ["initializing", "ready", "queued", "running", "cancelling", "closed"] {
+            let mut app = app(&format!("coding-agent-set-state-{case}"));
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
+            else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
+            if case == "queued" { *app.agent.prompt_mut() = "Owned queued turn".into(); app.agent.send(); }
+            if case == "cancelling" { app.agent.cancel(); }
+            if case == "closed" {
+                peer.frames.take();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.agent.state().closed {
+                    assert!(Instant::now() < deadline);
+                    app.agent.pump();
+                    std::thread::yield_now();
+                }
+            }
+            assert!(app.agent.state().has_client);
+            *app.agent.prompt_mut() = "Retained after Stop".into();
+            request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
+            finish_agent_set(&mut app);
+            assert!(!app.agent.state().has_client, "{case}");
+            assert_eq!(state(&mut app)["codingAgentSet"]["state"], "disabled");
+            assert_eq!(app.agent.prompt_mut(), "Retained after Stop");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_ordinary_http_delivers_before_canonical_release() {
+        use std::io::Write;
+        let mut app = app("coding-agent-set-http");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
+        let token = "owned-stop-http-token";
+        let server = mcp_listener::McpServer::start(&settings, Some(token.into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = json!({"jsonrpc":"2.0", "id":"stop-http", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}}).to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server);
+        CTX.with(|ctx| app.serve_mcp(ctx));
+        let result = lifecycle_http_result(stream, "stop-http");
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["codingAgentSet"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        finish_agent_set(&mut app);
+        assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_stdio_worker_flushes_admission_before_release() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct Output(Arc<Mutex<Vec<u8>>>, std::sync::mpsc::SyncSender<()>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.1.send(()).unwrap(); Ok(()) }
+        }
+        let mut app = app("coding-agent-set-stdio");
+        let mut peer = LifecyclePeer::attach(&mut app, None);
+        lifecycle_prompt(&mut app, &peer);
+        let (input, mut writer) = std::io::pipe().unwrap();
+        let (host, receive) = std::sync::mpsc::sync_channel(1);
+        let (flushed, flush) = std::sync::mpsc::sync_channel(1);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Output(bytes.clone(), flushed);
+        let worker = std::thread::spawn(move || crate::editor_stdio::serve_lines(
+            std::io::BufReader::new(input), output, &host, &egui::Context::default()));
+        app.host_rx = Some(receive);
+        writeln!(writer, "{}", json!({"jsonrpc":"2.0", "id":"stop-stdio", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.agent_set, RemoteAgentSet::Waiting { .. }) {
+            assert!(Instant::now() < deadline);
+            CTX.with(|ctx| app.drain_host(ctx));
+            std::thread::yield_now();
+        }
+        flush.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response: Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "stop-stdio");
+        assert_eq!(response["result"]["structuredContent"]["codingAgentSet"]["state"], "admitted");
+        assert!(app.agent.state().has_client);
+        while app.agent.state().has_client {
+            assert!(Instant::now() < deadline);
+            finish_agent_set(&mut app);
+            std::thread::yield_now();
+        }
+        assert_eq!(state(&mut app)["codingAgentSet"]["state"], "disabled");
+        drop(writer);
+        worker.join().unwrap();
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_preserves_actual_edit_history_private_draft_settings_and_human_dialogs() {
+        for format in ["inx", "live2d.cmo3", "live2d.can3"] {
+            let mut app = match format {
+                "live2d.cmo3" => runtime_export_app("coding-agent-set-cmo3", false),
+                "live2d.can3" => can3_scene_app("coding-agent-set-can3"),
+                _ => app("coding-agent-set-inx"),
+            };
+            let mut models = Vec::new();
+            models.push(app.controller.snapshot()["model"].clone());
+            for name in ["First", "Second"] {
+                let revision = app.controller.snapshot()["revision"].clone();
+                let edit = match format {
+                    "inx" => json!({"op":"node.rename", "id":2, "name":name}),
+                    "live2d.cmo3" => json!({"op":"live2d.rename", "guid":"parameter-guid", "name":name, "expectedRevision":revision}),
+                    _ => json!({"op":"live2d.animation.scene.set", "sceneGuid":"scene-guid", "name":name, "expectedRevision":revision}),
+                };
+                let result = app.controller.core_request(&edit);
+                assert_eq!(result["succeeded"], true, "{format}: {result}");
+                models.push(app.controller.snapshot()["model"].clone());
+            }
+            assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+            if format == "inx" {
+                app.select_node_draft(2);
+                app.controller.set_draft_name("Retained Stop edit draft".into());
+            }
+            app.unsaved = Some(unsaved_dialog());
+            app.tools.prompt = Some(restore_prompt());
+            let dialog = app.unsaved.as_ref().unwrap().dialog.clone();
+            let restore = app.tools.prompt.clone();
+            let settings_path = app.tools.store_path.clone().unwrap();
+            std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+            std::fs::write(&settings_path, b"{\"DarkMode\":true}").unwrap();
+            let mut peer = LifecyclePeer::attach(&mut app, None);
+            lifecycle_prompt(&mut app, &peer);
+            let private = "stop-private-unsent-sentinel";
+            *app.agent.prompt_mut() = private.into();
+            app.agent.set_briefing(Some(private.into()));
+            app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
+            app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
+            let _ = state(&mut app);
+            let before = app.controller.snapshot().clone();
+            let mut bytes = Vec::new();
+            request_agent_disable(&mut app).write_line(&mut bytes).unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains(private));
+            finish_agent_set(&mut app);
+            let observed = state(&mut app);
+            assert_eq!(observed["codingAgentSet"], json!({"state":"disabled", "enabled":false, "stop":"stopped", "attempt":1, "approval_reply_failed":false}));
+            assert_eq!(observed["codingAgent"].as_object().unwrap().len(), 7);
+            assert!(!observed["codingAgentSet"].to_string().contains(private));
+            assert_eq!(app.controller.snapshot(), &before);
+            assert_eq!(app.agent.prompt_mut(), private);
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog, dialog);
+            assert_eq!(app.tools.prompt, restore);
+            assert_eq!(std::fs::read(settings_path).unwrap(), b"{\"DarkMode\":true}");
+            if format == "inx" {
+                assert_eq!((&before["canUndo"], &before["canRedo"]), (&json!(true), &json!(true)));
+                assert!(matches!(app.controller.draft_view(), Some(DraftView::NodeName { value, .. }) if value == "Retained Stop edit draft"));
+                app.controller.discard_draft();
+            }
+            assert_eq!((&before["canUndo"], &before["canRedo"]), (&json!(true), &json!(true)));
+            for (op, model) in [("redo", &models[2]), ("undo", &models[1]), ("undo", &models[0])] {
+                assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"], true);
+                assert_eq!(&app.controller.snapshot()["model"], model);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_external_drain_releases_endpoint_before_the_existing_second_pump() {
+        use crate::editor_test_support::Harness;
+        use std::io::Write;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let mut app = app("coding-agent-set-second-pump");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let agent_address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
+        let token = "owned-stop-order-token";
+        let server = mcp_listener::McpServer::start(&settings, Some(token.into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = json!({"jsonrpc":"2.0", "id":"before-second-stop", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}}).to_string();
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        app.mcp_server = Some(server);
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        app.agent.before_next_tick_for_test(move || {
+            assert!(std::net::TcpStream::connect(&agent_address).is_err(), "Stop must release the agent endpoint before tick pumps");
+            observed.store(true, Ordering::SeqCst);
+        });
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(lifecycle_http_result(stream, "before-second-stop")["isError"], false);
+        assert!(!app.agent.state().has_client);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_set_invalidates_accepted_acp_quit_without_closing_the_editor() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-set-quit");
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"quit-before-stop", "method":"tools/call",
+            "params":{"name":"editor_quit", "arguments":{}}});
+        let stream = lifecycle_http(&endpoint, &request);
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(stream, "quit-before-stop")["isError"], false);
+        request_agent_disable(&mut app).write_line(&mut Vec::new()).unwrap();
+        finish_agent_set(&mut app);
+        assert_eq!(finish_quit(&mut app), 0);
+        assert!(!app.closing && !app.agent.state().has_client);
+        assert_eq!(state(&mut app)["quit"]["state"], "cancelled");
+        peer.finish(&mut app);
+    }
+
     #[test]
     fn coding_agent_stop_admission_precedes_frame_owned_release() {
         use crate::editor_test_support::Harness;
@@ -16879,6 +17626,32 @@ mod editor_state_tests {
             assert!(!app.agent.state().has_client);
             peer.finish(&mut app);
         }
+    }
+
+    #[test]
+    fn coding_agent_set_self_consent_is_invalidated_by_deliverable_cancel() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("coding-agent-set-self-cancel");
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
+        let request = json!({"jsonrpc":"2.0", "id":"self-stop", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_set", "arguments":{"enabled":false}}});
+        let stream = lifecycle_http(&endpoint, &request);
+        let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
+        lifecycle_prompt(&mut app, &peer);
+        serve_agent_requests(&mut app);
+        let path = app.tools.store_path.clone();
+        Harness::new().click(Role::Button, "Allow once", |ctx| app.agent.host_approval_window(ctx, path.as_deref()));
+        serve_agent_requests(&mut app);
+        assert_eq!(lifecycle_http_result(stream, "self-stop")["isError"], false);
+        request_agent_cancel(&mut app).write_line(&mut Vec::new()).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        Harness::new().frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        assert_eq!(state(&mut app)["codingAgentCancel"]["state"], "requested");
+        assert_eq!(state(&mut app)["codingAgentSet"]["state"], "consent_invalid");
+        assert!(app.agent.state().has_client && app.agent.state().cancelling);
+        peer.finish(&mut app);
     }
 
     #[test]

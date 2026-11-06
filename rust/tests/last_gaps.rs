@@ -398,7 +398,7 @@ fn the_manifest_is_stable_sorted_and_states_only_what_is_true() {
     assert_eq!(
         editor_only,
         [
-            "editor_about_set", "editor_address_dialog", "editor_armed_set", "editor_camera_fit", "editor_camera_set", "editor_camera_sync", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_command_browser_set", "editor_grid_set", "editor_guides_set",
+            "editor_about_set", "editor_address_dialog", "editor_armed_set", "editor_camera_fit", "editor_camera_set", "editor_camera_sync", "editor_coding_agent_cancel", "editor_coding_agent_set", "editor_coding_agent_stop", "editor_command_browser_set", "editor_grid_set", "editor_guides_set",
             "editor_layout_reset", "editor_native_parameters_set", "editor_onion_set", "editor_panel_set", "editor_parameters_set", "editor_physics_preview_set", "editor_playback_set", "editor_quit", "editor_recovery_keep", "editor_recovery_list", "editor_recovery_restore",
             "editor_selection_set", "editor_settings_get", "editor_settings_set", "editor_shortcut_set", "editor_solo_set",
             "editor_texture_viewer_load", "editor_texture_viewer_set", "editor_timeline_zoom_set", "editor_tool_set", "editor_viewport_set", "editor_welcome_set", "editor_workspace_apply", "editor_workspace_delete", "editor_workspace_save",
@@ -410,7 +410,7 @@ fn the_manifest_is_stable_sorted_and_states_only_what_is_true() {
         if command["headless_ok"] == false {
             let effect = match id {
                 "editor_address_dialog" => Some("clipboard-write"),
-                "editor_quit" | "editor_coding_agent_stop" => Some("application-lifecycle"),
+                "editor_quit" | "editor_coding_agent_stop" | "editor_coding_agent_set" => Some("application-lifecycle"),
                 "editor_recovery_restore" => Some("project-reset"),
                 "editor_settings_set" | "editor_shortcut_set" | "editor_panel_set" | "editor_layout_reset" | "editor_workspace_save" | "editor_workspace_apply" | "editor_workspace_delete" => {
                     Some("file-write")

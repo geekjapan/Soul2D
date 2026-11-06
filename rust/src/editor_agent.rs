@@ -391,6 +391,7 @@ pub(crate) struct ApprovalDocument {
 pub(crate) enum ApprovalTarget {
     Quit(AcpInvocation),
     Stop(StopTarget),
+    CodingAgentSet(AgentSetTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
     Outputs(Vec<PathBuf>),
@@ -443,7 +444,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
+        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
             || matches!(call["op"].as_str(), Some("automesh.preset.save" | "automesh.preset.delete" | "physics.preset.save" |
@@ -473,6 +474,12 @@ impl HostApproval {
         let request = self.request.as_ref()?;
         if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
         match &request.target { ApprovalTarget::Stop(target) => Some(target.clone()), _ => None }
+    }
+
+    pub(crate) fn set_review(&self) -> Option<AgentSetTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        match &request.target { ApprovalTarget::CodingAgentSet(target) => Some(target.clone()), _ => None }
     }
 
     pub(crate) fn invalidate_quit(&mut self, target: &AcpInvocation) {
@@ -508,7 +515,7 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
@@ -597,6 +604,12 @@ impl HostApproval {
                     ui.label("Successful Stop discards this conversation, while preserving unsent text, document, drafts, undo and settings. Failure can retain a closed client after its endpoint was removed; no automatic retry.");
                     ui.label("Stop consent follows the owner-observed prompt. A queued completion may not yet be observed; new permissions or disconnection invalidate consent before intake is sealed.");
                 },
+                ApprovalTarget::CodingAgentSet(_) => {
+                    ui.label("Target: disable this coding-agent panel and stop its owned run");
+                    ui.label("After this original reply is delivered locally, Soul2D stops the agent without waiting for a successful turn. Shutdown may kill and reap the owned child and discard its conversation.");
+                    ui.label("The checkbox becomes disabled even if shutdown fails and retains the closed client. Its endpoint is removed; no automatic retry. Enabling later does not launch or retry it.");
+                    ui.label("Unsent text, document, drafts, undo and settings are preserved. New permissions, disconnection or an owner-observed prompt change invalidate consent before intake is sealed.");
+                },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
                     let kind = if path.is_dir() { "Output folder" } else { "Output file" };
@@ -676,7 +689,7 @@ impl HostApproval {
                 ui.label("Replaces the current document. Source paths are read when this call runs.");
             }
             ui.label("The original call waits here. Allow applies this exact change once.");
-            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered file writes, document replacement, Quit and Stop for this turn.");
+            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered file writes, document replacement, Quit, Stop and owned disable for this turn.");
             if ui.add_enabled(matches!(request.decision, ApprovalDecision::Pending), egui::Button::new("Allow once")).clicked() {
                 request.decision = ApprovalDecision::AllowedOnce;
             }
@@ -754,8 +767,46 @@ pub(crate) enum StopRefusal {
     ConsentInvalid,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentSetSnapshot {
+    enabled: bool,
+    epoch: u64,
+    next_run: u64,
+    owner: Option<StopOwner>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentSetTarget {
+    before: AgentSetSnapshot,
+    pub(crate) enabled: bool,
+    stop: Option<StopTarget>,
+}
+
+impl AgentSetSnapshot {
+    pub(crate) fn target(self, enabled: bool, approval: Option<&HostApproval>) -> Result<AgentSetTarget, String> {
+        let stop = if self.enabled && !enabled {
+            self.owner.map(|owner| match approval {
+                Some(approval) => approval.stop_target(owner),
+                None => Ok(StopTarget::External(owner)),
+            }).transpose()?
+        } else { None };
+        Ok(AgentSetTarget { before: self, enabled, stop })
+    }
+}
+
+impl AgentSetTarget {
+    pub(crate) fn needs_approval(&self) -> bool { matches!(self.stop, Some(StopTarget::Acp { .. })) }
+}
+
+pub(crate) enum AgentSetResult {
+    NoOp,
+    Enabled,
+    Disabled { stop: Option<StopResult> },
+}
+
 pub struct AgentPanel<W: Write = ChildStdin> {
     enabled: bool,
+    opt_in_epoch: u64,
     status: String,
     error: Option<String>,
     prompt: String,
@@ -794,6 +845,7 @@ impl<W: Write> AgentPanel<W> {
     pub fn with_launcher(launch: fn(&LaunchSpec) -> Result<Client<W>, String>) -> Self {
         Self {
             enabled: false,
+            opt_in_epoch: 0,
             status: "Idle".to_string(),
             error: None,
             prompt: String::new(),
@@ -858,11 +910,53 @@ impl<W: Write> AgentPanel<W> {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        if self.enabled && !enabled {
-            self.stop();
+        let _ = self.set_enabled_with(enabled, Client::shutdown);
+    }
+
+    fn set_enabled_with(&mut self, enabled: bool,
+        shutdown: impl FnOnce(&mut Client<W>) -> Result<Option<std::process::ExitStatus>, String>) -> AgentSetResult {
+        if self.enabled == enabled { return AgentSetResult::NoOp; }
+        self.opt_in_epoch = self.opt_in_epoch.saturating_add(1);
+        let result = if !enabled {
+            let stop = self.stop_with(shutdown);
             if self.run.is_none() { self.status = "Idle".to_string(); }
-        }
+            AgentSetResult::Disabled { stop }
+        } else { AgentSetResult::Enabled };
         self.enabled = enabled;
+        result
+    }
+
+    pub(crate) fn set_snapshot(&self) -> Result<AgentSetSnapshot, String> {
+        if self.opt_in_epoch == u64::MAX || (self.run.is_some() && self.stop_owner().is_none()) {
+            return Err("Coding agent Set identity exhausted".into());
+        }
+        Ok(AgentSetSnapshot { enabled: self.enabled, epoch: self.opt_in_epoch,
+            next_run: self.next_run, owner: self.stop_owner() })
+    }
+
+    pub(crate) fn set_status(&self, target: &AgentSetTarget, admitted: bool) -> Result<(), StopRefusal> {
+        if self.set_snapshot().ok() != Some(target.before) { return Err(StopRefusal::StaleTarget); }
+        if let Some(stop) = &target.stop { self.stop_status(stop, true)?; }
+        if target.needs_approval() && !admitted {
+            let approval = &self.run.as_ref().unwrap().host_approval;
+            if approval.set_review().as_ref() != Some(target) || approval.request.as_ref().is_none_or(|request|
+                request.created.elapsed() >= HOST_APPROVAL_TIMEOUT) { return Err(StopRefusal::ConsentInvalid); }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_set(&mut self, target: &AgentSetTarget) {
+        if let Some(run) = &mut self.run {
+            if run.host_approval.set_review().as_ref() == Some(target) {
+                if let Some(request) = &mut run.host_approval.request { request.decision = ApprovalDecision::Stale; }
+            }
+        }
+    }
+
+    pub(crate) fn set_if_current(&mut self, target: &AgentSetTarget) -> Result<AgentSetResult, StopRefusal> {
+        self.set_status(target, true)?;
+        if let Some(stop) = &target.stop { self.seal_stop(stop)?; }
+        Ok(self.set_enabled_with(target.enabled, Client::shutdown))
     }
 
     #[cfg(test)]
@@ -978,12 +1072,17 @@ impl<W: Write> AgentPanel<W> {
 
     pub(crate) fn stop_if_current(&mut self, target: &StopTarget) -> Result<StopResult, StopRefusal> {
         self.stop_status(target, true)?;
+        self.seal_stop(target)?;
+        self.stop_with(Client::shutdown).ok_or(StopRefusal::StaleTarget)
+    }
+
+    fn seal_stop(&mut self, target: &StopTarget) -> Result<(), StopRefusal> {
         if let StopTarget::Acp { invocation, .. } = target {
             if !self.run.as_mut().unwrap().client.seal_permission_intake(invocation.permissions) {
                 return Err(StopRefusal::ConsentInvalid);
             }
         }
-        self.stop_with(Client::shutdown).ok_or(StopRefusal::StaleTarget)
+        Ok(())
     }
 
     pub(crate) fn owner(&self) -> Option<u64> {
@@ -2045,6 +2144,127 @@ mod tests {
 
     // -------------------------------------------------------------------- MCP over the non-blocking listener
 
+    #[test]
+    fn coding_agent_set_canonical_transitions_never_launch_or_retry_retained_failure() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let owner = panel.owner();
+        *panel.prompt_mut() = "Retained opt-in prompt".into();
+        let mut attempts = 0;
+        assert!(matches!(panel.set_enabled_with(false, |_| {
+            attempts += 1;
+            Err("owned shutdown unconfirmed".into())
+        }), AgentSetResult::Disabled { stop:Some(StopResult::FailedRetained { approval_reply_failed:false }) }));
+        assert_eq!(attempts, 1);
+        assert!(!panel.is_enabled() && panel.state().closed && panel.mcp_url().is_none());
+        assert_eq!(panel.owner(), owner);
+        let error = panel.error().unwrap().to_owned();
+        let status = panel.status().to_owned();
+        let snapshot = panel.set_snapshot().unwrap();
+        assert!(matches!(panel.set_enabled_with(false, |_| panic!("no automatic retry")), AgentSetResult::NoOp));
+        assert_eq!(panel.set_snapshot().unwrap(), snapshot);
+        assert!(matches!(panel.set_enabled_with(true, |_| panic!("enable cannot shut down")), AgentSetResult::Enabled));
+        assert_eq!((panel.error(), panel.status()), (Some(error.as_str()), status.as_str()));
+        assert_eq!(panel.owner(), owner);
+        assert!(panel.mcp_url().is_none());
+        assert!(matches!(panel.set_enabled_with(true, |_| panic!("same-value cannot shut down")), AgentSetResult::NoOp));
+        let result = panel.set_enabled_with(false, |client| { attempts += 1; client.shutdown() });
+        assert!(matches!(result, AgentSetResult::Disabled { stop:Some(StopResult::Stopped { approval_reply_failed:false }) }));
+        assert_eq!(attempts, 2);
+        assert_eq!((panel.status(), panel.error(), panel.owner()), ("Idle", None, None));
+        assert_eq!(panel.prompt_mut(), "Retained opt-in prompt");
+
+        let mut empty = no_launch_panel();
+        empty.fail("Old failure", "preserved until disable".into());
+        empty.set_enabled(true);
+        assert_eq!(empty.error(), Some("preserved until disable"));
+        assert!(empty.run.is_none() && empty.mcp_url().is_none());
+        assert!(matches!(empty.set_enabled_with(false, |_| panic!("no owner")), AgentSetResult::Disabled { stop:None }));
+        assert_eq!((empty.status(), empty.error()), ("Idle", None));
+    }
+
+    #[test]
+    fn coding_agent_set_snapshot_catches_flag_owner_and_failed_stop_cycles() {
+        let mut panel = no_launch_panel();
+        let target = panel.set_snapshot().unwrap().target(true, None).unwrap();
+        panel.set_enabled(true);
+        panel.set_enabled(false);
+        assert!(matches!(panel.set_if_current(&target), Err(StopRefusal::StaleTarget)));
+
+        let target = panel.set_snapshot().unwrap().target(true, None).unwrap();
+        let (client, _agent) = connect();
+        panel.attach(client, None, None);
+        panel.stop();
+        assert!(matches!(panel.set_if_current(&target), Err(StopRefusal::StaleTarget)));
+
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let target = panel.set_snapshot().unwrap().target(false, None).unwrap();
+        let _ = panel.stop_with(|_| Err("unconfirmed shutdown".into()));
+        assert!(matches!(panel.set_if_current(&target), Err(StopRefusal::StaleTarget)));
+        assert_eq!(panel.run.as_ref().unwrap().stop_epoch, 1);
+        assert!(panel.is_enabled());
+        panel.stop();
+    }
+
+    #[test]
+    fn coding_agent_set_exhaustion_never_converts_retained_owner_to_no_owner() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.run.as_mut().unwrap().stop_epoch = u64::MAX;
+        assert!(panel.set_snapshot().is_err() && panel.owner().is_some());
+        panel.set_enabled(false);
+        assert!(!panel.is_enabled() && panel.owner().is_none());
+        panel.opt_in_epoch = u64::MAX - 1;
+        let target = panel.set_snapshot().unwrap().target(true, None).unwrap();
+        panel.set_enabled(true);
+        assert!(panel.set_snapshot().is_err());
+        assert!(matches!(panel.set_if_current(&target), Err(StopRefusal::StaleTarget)));
+        panel.set_enabled(false);
+        assert!(!panel.is_enabled());
+    }
+
+    #[test]
+    fn coding_agent_set_failed_winner_invalidates_the_other_captured_lifecycle_action() {
+        for set_first in [false,true] {
+            let (mut panel, _agent, _) = active_panel_endpoint();
+            let stop = StopTarget::External(panel.stop_owner().unwrap());
+            let set = panel.set_snapshot().unwrap().target(false, None).unwrap();
+            let owner = panel.owner();
+            let mut attempts = 0;
+            if set_first {
+                assert!(matches!(panel.set_enabled_with(false, |_| {
+                    attempts += 1; Err("owned shutdown unconfirmed".into())
+                }), AgentSetResult::Disabled { stop:Some(StopResult::FailedRetained { .. }) }));
+                assert!(matches!(panel.stop_if_current(&stop), Err(StopRefusal::StaleTarget)));
+                assert!(!panel.is_enabled());
+            } else {
+                let _ = panel.stop_with(|_| { attempts += 1; Err("owned shutdown unconfirmed".into()) });
+                assert!(matches!(panel.set_if_current(&set), Err(StopRefusal::StaleTarget)));
+                assert!(panel.is_enabled());
+            }
+            assert_eq!(attempts, 1);
+            assert_eq!(panel.owner(), owner);
+            assert_eq!(panel.run.as_ref().unwrap().stop_epoch, 1);
+            assert!(panel.state().closed && panel.mcp_url().is_none());
+            panel.stop();
+        }
+    }
+
+    #[test]
+    fn coding_agent_set_native_checkbox_uses_canonical_owned_disable() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        *panel.prompt_mut() = "Retained checkbox prompt".into();
+        let mut settings = Settings::empty();
+        Harness::new().click(Role::CheckBox, "Enable coding agent (ACP)", |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(!panel.show(ui, &mut settings, &Value::Null));
+            });
+        });
+        assert!(!panel.is_enabled() && panel.owner().is_none());
+        assert_eq!(panel.status(), "Idle");
+        assert_eq!(panel.prompt_mut(), "Retained checkbox prompt");
+    }
+
     fn http_post(port: u16, token: Option<&str>, body: &str) -> String {
         let auth = token.map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
         let request = format!(
@@ -2136,6 +2356,41 @@ mod tests {
         assert!(panel.controls().stop);
         panel.stop();
         assert!(panel.owner().is_none());
+    }
+
+    #[test]
+    fn coding_agent_set_preserves_both_refusal_write_and_shutdown_failure_dimensions() {
+        for shutdown_fails in [false, true] {
+            let (mut panel, _agent, _) = active_panel_endpoint();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let control = stream.try_clone().unwrap();
+            let body = json!({"jsonrpc":"2.0", "id":7, "method":"ping"}).to_string();
+            write!(peer, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let pending = handle_connection_deferred(stream, None, WAIT, &mut |_| HttpDispatch::Defer).unwrap().unwrap();
+            control.shutdown(std::net::Shutdown::Write).unwrap();
+            panel.run.as_mut().unwrap().pending_reply = Some((7, pending));
+            let owner = panel.owner();
+            let mut attempts = 0;
+            let AgentSetResult::Disabled { stop:result } = panel.set_enabled_with(false, |_| {
+                attempts += 1;
+                if shutdown_fails { Err("owned reaping not confirmed".into()) } else { Ok(None) }
+            }) else { panic!("canonical disable result") };
+            assert!(!panel.is_enabled());
+            assert_eq!(attempts, 1);
+            if shutdown_fails {
+                assert!(matches!(result, Some(StopResult::FailedRetained { approval_reply_failed:true })));
+                assert_eq!(panel.owner(), owner);
+                let run = panel.run.as_ref().unwrap();
+                assert!(run.closed && run.endpoint.is_none() && run.pending_reply.is_none());
+                assert!(!run.host_approval.active && run.host_approval.request.is_none());
+                assert!(panel.error().unwrap().contains("owned reaping not confirmed"));
+            } else {
+                assert!(matches!(result, Some(StopResult::Stopped { approval_reply_failed:true })));
+                assert!(panel.owner().is_none());
+            }
+        }
     }
 
     #[test]

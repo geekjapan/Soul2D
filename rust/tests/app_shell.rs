@@ -772,6 +772,7 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         ("editor_quit", json!({})),
         ("editor_coding_agent_cancel", json!({})),
         ("editor_coding_agent_stop", json!({})),
+        ("editor_coding_agent_set", json!({"enabled":true})),
         ("editor_selection_set", json!({"nodes": [2]})),
         ("editor_armed_set", json!({"parameter": 10})),
         ("editor_camera_set", json!({"centre": [0.0, 0.0], "zoom": 1.0})),
