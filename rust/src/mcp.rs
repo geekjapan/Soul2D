@@ -106,7 +106,7 @@ pub(crate) const EDITOR_TOOLS: &[&str] = &[
     "editor_quit",
     "editor_selection_set", "editor_armed_set", "editor_camera_set", "editor_camera_fit", "editor_camera_sync", "editor_tool_set", "editor_grid_set",
     "editor_guides_set", "editor_physics_preview_set", "editor_solo_set", "editor_onion_set", "editor_playback_set", "editor_timeline_zoom_set", "editor_viewport_set", "editor_address_dialog", "editor_about_set", "editor_welcome_set", "editor_command_browser_set", "editor_texture_viewer_set", "editor_parameters_set", "editor_panel_set", "editor_layout_reset", "editor_workspace_save",
-    "editor_workspace_apply", "editor_native_parameters_set",
+    "editor_workspace_apply", "editor_native_parameters_set", "editor_texture_viewer_load",
     "editor_workspace_delete", "editor_recovery_list", "editor_recovery_keep", "editor_recovery_restore",
     "editor_settings_get", "editor_settings_set", "editor_shortcut_set",
 ];
@@ -342,6 +342,7 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         "editor_about_set" => json!({"op":"editor.about.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
         "editor_welcome_set" => json!({"op":"editor.welcome.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
         "editor_command_browser_set" => json!({"op":"editor.command.browser.set", "open":args["open"].as_bool().ok_or("open must be a boolean")?}),
+        "editor_texture_viewer_load" => json!({"op":"editor.texture.viewer.load"}),
         "editor_texture_viewer_set" => {
             let open = args["open"].as_bool().ok_or("open must be a boolean")?;
             if !open && (args.contains_key("slot") || args.contains_key("zoom")) {
@@ -5486,6 +5487,15 @@ flip-pair partners. The clipboard is used up.",
              across document replacement, layout reset and listener restart; closed on process restart. Editor only, \
              all document formats. No document, history or settings write; no ACP host approval is needed.",
             closed_schema(&[("open", json!({"type":"boolean"}))], &["open"])),
+        tool("editor_texture_viewer_load", "Action: load the selected Part's textures into the already-open Texture Viewer, \
+             sharing its Load textures operation. Refuses a closed viewer, pending load or selection that is not a Part. \
+             Preserves Slot/Zoom and uses the existing texture_get, decoding and GPU-size checks. \
+             Read windows.textureViewerLoadState: null closed, otherwise loading, pending node/revision, loaded \
+             node/revision and three positional slots (null or {slot,width,height,displayable}), and hasError. \
+             displayable means a texture handle exists, not current visibility or document freshness. \
+             A terminal read/decode/GPU-size failure updates the viewer and returns an error; preflight refusals preserve it. \
+             No implicit opening, document/history/settings write or ACP host approval. Editor only.",
+            closed_schema(&[], &[])),
         tool("editor_texture_viewer_set", "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close \
              button do. With open:true, optional slot selects position 0 Albedo, 1 Emissive or 2 Bump, not a texture ID, \
              and optional zoom sets a finite display multiplier clamped to 0.1..10 before conversion to f32. \

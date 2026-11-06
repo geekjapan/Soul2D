@@ -12492,6 +12492,26 @@
       ]
     },
     {
+      "description": "Action: load the selected Part's textures into the already-open Texture Viewer, sharing its Load textures operation. Refuses a closed viewer, pending load or selection that is not a Part. Preserves Slot/Zoom and uses the existing texture_get, decoding and GPU-size checks. Read windows.textureViewerLoadState: null closed, otherwise loading, pending node/revision, loaded node/revision and three positional slots (null or {slot,width,height,displayable}), and hasError. displayable means a texture handle exists, not current visibility or document freshness. A terminal read/decode/GPU-size failure updates the viewer and returns an error; preflight refusals preserve it. No implicit opening, document/history/settings write or ACP host approval. Editor only.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Texture Viewer > Load textures",
+        "Tools > Texture Viewer"
+      ],
+      "headless_ok": false,
+      "id": "editor_texture_viewer_load",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: open or close Texture Viewer, as Tools > Texture Viewer and its close button do. With open:true, optional slot selects position 0 Albedo, 1 Emissive or 2 Bump, not a texture ID, and optional zoom sets a finite display multiplier clamped to 0.1..10 before conversion to f32. Controls are refused with open:false. Read windows.textureViewer and windows.textureViewerState (null when closed, otherwise {slot,zoom}) in the returned editor state. Repeated open preserves omitted controls, loaded images, loading and errors; close drops the viewer and reopening starts unloaded at Slot 0, Zoom 1. Uses the existing selected-Part texture_get loading path. Retained across document replacement, layout reset and listener restart; closed on process restart. Editor only, all document formats. No document, history or settings write; no ACP host approval is needed.",
       "effect": "editor-state",
       "guiEntry": [
@@ -21270,6 +21290,7 @@
       "description": "Read the stored bytes (base64 PNG or TGA) and decoded size of one texture slot.",
       "effect": "-",
       "guiEntry": [
+        "Texture Viewer > Load textures",
         "Tools > Texture Viewer"
       ],
       "headless_ok": true,

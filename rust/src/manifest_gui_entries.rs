@@ -197,6 +197,10 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_shortcut_set", &[
         "Edit > Settings",
     ]),
+    ("editor_texture_viewer_load", &[
+        "Texture Viewer > Load textures",
+        "Tools > Texture Viewer",
+    ]),
     ("editor_texture_viewer_set", &[
         "Texture Viewer > Close window",
         "Texture Viewer > Slot",
@@ -529,6 +533,7 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "Tools > Puppet Texturing > Export textures...",
     ]),
     ("texture_get", &[
+        "Texture Viewer > Load textures",
         "Tools > Texture Viewer",
     ]),
     ("texture_replace", &[

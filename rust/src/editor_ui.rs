@@ -1075,6 +1075,15 @@ impl EditorView<'_> {
             "editor.about.set" => self.windows.set_about_open(call["open"].as_bool().unwrap()),
             "editor.welcome.set" => self.windows.set_welcome_open(call["open"].as_bool().unwrap(), &self.tools.store),
             "editor.command.browser.set" => self.windows.set_command_browser_open(call["open"].as_bool().unwrap()),
+            "editor.texture.viewer.load" => {
+                let requests = self.windows.begin_texture_viewer_load(self.ctx, controller.snapshot(), controller.selected_node())?;
+                for (target, request) in requests {
+                    self.windows.deliver(target, controller.mcp_request(&request));
+                }
+                if let Some(error) = self.windows.texture_viewer_load_error() {
+                    return Err(error.to_owned());
+                }
+            }
             "editor.texture.viewer.set" => self.windows.set_texture_viewer(
                 call["open"].as_bool().unwrap(),
                 call.get("slot").map(|slot| slot.as_u64().unwrap() as usize),
@@ -1432,6 +1441,7 @@ impl EditorView<'_> {
                 "commandBrowser": self.windows.command_browser_open(),
                 "textureViewer": self.windows.texture_viewer_open(),
                 "textureViewerState": self.windows.texture_viewer_state(),
+                "textureViewerLoadState": self.windows.texture_viewer_load_state(),
                 "recoveryOffer": {"pending": !self.recovery_offer.is_empty(),
                     "drawEligible": self.recovery_offer_draw_eligible()},
                 // The dialogs that wait for the user's answer; while one is open, document-replacing calls are
@@ -20332,6 +20342,93 @@ mod editor_state_tests {
     }
 
     #[test]
+    fn texture_viewer_load_populates_cache_through_rpc_before_first_draw() {
+        let mut app = app("texture-viewer-load-rpc");
+        app.controller.select_nodes(&[2]).unwrap();
+        let before = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone().unwrap();
+        let settings = std::fs::read(&path).ok();
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":2,"zoom":2.75}));
+        let image = call(&mut app, "texture_get", json!({"slot":0}));
+        assert_eq!(image["slot"], 0);
+        let unloaded = state(&mut app);
+        let loaded = call(&mut app, "editor_texture_viewer_load", json!({}));
+        assert_eq!(unloaded["windows"]["textureViewerLoadState"].get("loaded"), Some(&Value::Null));
+        let expected = json!({"loading":false,"pending":null,"hasError":false,
+            "loaded":{"node":2,"revision":before["revision"],"slots":[
+                {"slot":0,"width":1,"height":1,"displayable":true},null,null]}});
+        assert_eq!(loaded["windows"]["textureViewerLoadState"], expected);
+        assert_eq!(loaded["windows"]["textureViewerState"], json!({"slot":2,"zoom":2.75}));
+        assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        for arguments in [json!(null), json!([]), json!(true), json!({"node":2}), json!({"slot":0}),
+            json!({"open":true}), json!({"expectedRevision":1})] {
+            refused(&mut app, "editor_texture_viewer_load", arguments);
+            assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        }
+        app.controller.select_nodes(&[]).unwrap();
+        refused(&mut app, "editor_texture_viewer_load", json!({}));
+        assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        app.controller.select_nodes(&[1]).unwrap();
+        refused(&mut app, "editor_texture_viewer_load", json!({}));
+        assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        app.controller.select_nodes(&[1, 2]).unwrap();
+        refused(&mut app, "editor_texture_viewer_load", json!({}));
+        assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        app.controller.select_nodes(&[2, 1]).unwrap();
+        assert_eq!(rpc(&mut app, "tools/call", json!({"name":"editor_texture_viewer_load"}))["isError"], false);
+        assert_eq!(state(&mut app)["windows"], loaded["windows"]);
+        call(&mut app, "editor_texture_viewer_set", json!({"open":false}));
+        refused(&mut app, "editor_texture_viewer_load", json!({}));
+        assert_eq!(state(&mut app)["windows"].get("textureViewerLoadState"), Some(&Value::Null));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(path).ok(), settings);
+    }
+
+    #[test]
+    fn texture_viewer_load_reports_execution_failure_after_draining_and_recovers() {
+        let mut app = app("texture-viewer-load-gpu-failure");
+        let (mut model, _) = model_and_texture();
+        model["nodes"]["children"][0]["textures"] = json!([0, 1]);
+        let textures = [(1025, [255, 0, 0, 255]), (1, [0, 255, 0, 255])].map(|(width, color)| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(width, 1, image::Rgba(color)).write_to(&mut png, image::ImageFormat::Png).unwrap();
+            soul2d_core::model_import::Texture { tag:0, data:png.into_inner() }
+        });
+        let project = app.controller.project_path().unwrap().to_owned();
+        std::fs::write(&project, soul2d_core::model_import::inx_bytes(&model, &textures).unwrap()).unwrap();
+        app.command(json!({"op":"open","path":project}));
+        app.controller.select_nodes(&[2]).unwrap();
+        call(&mut app, "editor_texture_viewer_set", json!({"open":true,"slot":1,"zoom":4.5}));
+        let before = app.controller.snapshot().clone();
+        let path = app.tools.store_path.clone().unwrap();
+        let settings = std::fs::read(&path).ok();
+        let limit = CTX.with(|ctx| {
+            let limit = ctx.input(|input| input.max_texture_side);
+            let _ = ctx.run(egui::RawInput { max_texture_side:Some(1024), ..Default::default() }, |_| {});
+            limit
+        });
+        let error = refused(&mut app, "editor_texture_viewer_load", json!({}));
+        assert!(error.contains("larger than the 1024 px"), "{error}");
+        let failed = state(&mut app)["windows"]["textureViewerLoadState"].clone();
+        assert_eq!(failed["loading"], false);
+        assert_eq!(failed["pending"], Value::Null);
+        assert_eq!(failed["hasError"], true);
+        assert_eq!(failed["loaded"]["slots"], json!([
+            {"slot":0,"width":1025,"height":1,"displayable":false},
+            {"slot":1,"width":1,"height":1,"displayable":true},null]));
+        assert!(!failed.to_string().contains("larger than"));
+        CTX.with(|ctx| { let _ = ctx.run(egui::RawInput { max_texture_side:Some(limit), ..Default::default() }, |_| {}); });
+        let recovered = call(&mut app, "editor_texture_viewer_load", json!({}));
+        let load = &recovered["windows"]["textureViewerLoadState"];
+        assert_eq!(load["hasError"], false);
+        assert_eq!(load["pending"], Value::Null);
+        assert_eq!(load["loaded"]["slots"][0]["displayable"], true);
+        assert_eq!(recovered["windows"]["textureViewerState"], json!({"slot":1,"zoom":4.5}));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(path).ok(), settings);
+    }
+
+    #[test]
     fn texture_viewer_controls_roundtrip_and_refuse_atomically() {
         let mut app = app("texture-viewer-controls");
         let before = app.controller.snapshot().clone();
@@ -20407,6 +20504,8 @@ mod editor_state_tests {
         let mut harness = Harness::new();
         let out = harness.click(Role::Button, "Load textures", |ctx| draw(&mut app, ctx));
         assert!(has(&out, Role::Slider, "Zoom"));
+        let native_load = state(&mut app)["windows"]["textureViewerLoadState"].clone();
+        assert_eq!(call(&mut app, "editor_texture_viewer_load", json!({}))["windows"]["textureViewerLoadState"], native_load);
         harness.click(Role::ComboBox, "Slot", |ctx| draw(&mut app, ctx));
         let out = harness.click(Role::Button, "Bump (empty)", |ctx| draw(&mut app, ctx));
         assert_eq!(state(&mut app)["windows"]["textureViewerState"], json!({"slot":2,"zoom":1.0}));
@@ -20439,6 +20538,7 @@ mod editor_state_tests {
         let redo = app.controller.snapshot()["model"].clone();
         assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
         app.select_node_draft(2);
+        app.controller.select_nodes(&[2]).unwrap();
         app.controller.set_draft_name("Retained draft".into());
         app.parameters.armed = Some(10);
         let pending = json!({"op":"open","path":"texture-viewer-pending.inx"});
@@ -20476,6 +20576,9 @@ mod editor_state_tests {
         let mut message = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{"name":"editor_texture_viewer_set","arguments":{"open":true,"slot":1,"zoom":3.5}}});
         assert_eq!(agent_rpc(&mut app, &mut approval, &message).unwrap()["result"]["isError"], false);
+        let load_message = json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"editor_texture_viewer_load","arguments":{}}});
+        assert_eq!(agent_rpc(&mut app, &mut approval, &load_message).unwrap()["result"]["isError"], false);
         approval.set_active(true);
         let protected = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"editor_settings_set","arguments":{"key":"NerdStats","value":true}}});
@@ -20483,10 +20586,14 @@ mod editor_state_tests {
         Harness::new().click(Role::Button, "Deny changes this turn", |ctx| approval.show(ctx, app.tools.store_path.as_deref()));
         message["params"]["arguments"]["open"] = json!(true);
         assert_eq!(agent_rpc(&mut app, &mut approval, &message).unwrap()["result"]["isError"], false);
+        assert_eq!(agent_rpc(&mut app, &mut approval, &load_message).unwrap()["result"]["isError"], false);
         let after = state(&mut app);
         let mut windows = initial["windows"].clone();
         windows["textureViewer"] = json!(true);
         windows["textureViewerState"] = json!({"slot":1,"zoom":3.5});
+        windows["textureViewerLoadState"] = json!({"loading":false,"pending":null,"hasError":false,
+            "loaded":{"node":2,"revision":before["revision"],"slots":[
+                {"slot":0,"width":1,"height":1,"displayable":true},null,null]}});
         assert_eq!(after["windows"], windows);
         for key in ["guides", "viewport", "selection", "armed", "drafts", "camera", "panels"] {
             assert_eq!(after[key], initial[key], "{key}");

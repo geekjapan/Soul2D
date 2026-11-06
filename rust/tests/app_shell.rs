@@ -792,6 +792,8 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         ("editor_command_browser_set", json!({"open":false})),
         ("editor_command_browser_set", json!({"open":null,"extra":1})),
         ("editor_texture_viewer_set", json!({"open":true})),
+        ("editor_texture_viewer_load", json!({})),
+        ("editor_texture_viewer_load", json!({"node":2})),
         ("editor_texture_viewer_set", json!({"open":true,"slot":2,"zoom":2.75})),
         ("editor_texture_viewer_set", json!({"open":true,"slot":1})),
         ("editor_texture_viewer_set", json!({"open":true,"zoom":1e300})),

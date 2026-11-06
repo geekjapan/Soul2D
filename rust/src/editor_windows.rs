@@ -2416,7 +2416,7 @@ impl TextureViewer {
     }
 
     /// Returns (still open, load requested for this node).
-    fn show(&mut self, env: &Env) -> (bool, Option<u64>) {
+    fn show(&mut self, env: &Env, load_pending: bool) -> (bool, Option<u64>) {
         let mut open = true;
         let mut load = None;
         let part = env.selected.and_then(|id| find_node(&env.snapshot["model"]["nodes"], id).map(|node| (id, node)));
@@ -2440,8 +2440,7 @@ impl TextureViewer {
                     .map(|(name, slot)| format!("{name}: {}", slot.map_or("-".to_owned(), |slot| slot.to_string())))
                     .collect();
                 ui.label(format!("Texture slots in the model: {}", listed.join(", ")));
-                if ui.add_enabled(!self.loading, egui::Button::new("Load textures")).clicked() {
-                    self.loading = true;
+                if ui.add_enabled(!self.loading && !load_pending, egui::Button::new("Load textures")).clicked() {
                     load = Some(id);
                 }
                 if let Some(error) = &self.error {
@@ -2717,6 +2716,54 @@ impl Windows {
         self.texture.as_ref().map_or(Value::Null, |viewer| {
             json!({"slot":viewer.controls.slot, "zoom":viewer.controls.zoom})
         })
+    }
+
+    pub(super) fn texture_viewer_load_state(&self) -> Value {
+        self.texture.as_ref().map_or(Value::Null, |viewer| json!({
+            "loading":viewer.loading,
+            "pending":self.texture_request.as_ref().map(|load| json!({"node":load.node,"revision":load.revision})),
+            "loaded":viewer.loaded.as_ref().map(|loaded| json!({
+                "node":loaded.node,"revision":loaded.revision,
+                "slots":loaded.slots.iter().zip(&loaded.handles).map(|(image, handle)| image.as_ref().map(|image| json!({
+                    "slot":image.slot,"width":image.width,"height":image.height,"displayable":handle.is_some(),
+                }))).collect::<Vec<_>>(),
+            })),
+            "hasError":viewer.error.is_some(),
+        }))
+    }
+
+    pub(super) fn texture_viewer_load_error(&self) -> Option<&str> {
+        self.texture.as_ref().and_then(|viewer| viewer.error.as_deref())
+    }
+
+    pub(super) fn begin_texture_viewer_load(
+        &mut self, ctx: &egui::Context, snapshot: &Value, selected: Option<u64>,
+    ) -> Result<Vec<(McpTarget, Value)>, String> {
+        if self.texture.is_none() {
+            return Err("Texture Viewer is closed".into());
+        }
+        if self.texture_request.is_some() {
+            return Err("Texture Viewer load is already pending".into());
+        }
+        let (node, part) = selected.and_then(|id| find_node(&snapshot["model"]["nodes"], id).map(|part| (id, part)))
+            .filter(|(_, part)| part["type"] == "Part").ok_or("Select a Part to load its textures")?;
+        let revision = snapshot["revision"].as_u64().unwrap_or(0);
+        let mut pending = TextureLoad { node, revision, waiting:[false; 3], slots:[None, None, None], error:None };
+        let mut requests = Vec::new();
+        for (position, slot) in model_slots(part).into_iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            pending.waiting[position] = true;
+            requests.push((McpTarget::Texture(position as u8), call_request("texture_get", json!({"slot":slot}))));
+        }
+        self.ctx = Some(ctx.clone());
+        let viewer = self.texture.as_mut().unwrap();
+        viewer.loading = true;
+        if requests.is_empty() {
+            viewer.deliver(ctx, node, revision, Ok(pending.slots));
+        } else {
+            self.texture_request = Some(pending);
+        }
+        Ok(requests)
     }
 
     pub fn welcome_open(&self) -> bool {
@@ -3370,26 +3417,17 @@ impl Windows {
                     call_request("editor_command_browser_set", json!({"open":false}))));
             }
         }
+        let load_pending = self.texture_request.is_some();
         if let Some(viewer) = self.texture.as_mut() {
-            let (keep, load) = viewer.show(env);
+            let (keep, load) = viewer.show(env, load_pending);
             if !keep {
                 env.out.push(Request::Mcp(McpTarget::Layout,
                     call_request("editor_texture_viewer_set", json!({"open":false}))));
             }
             if let Some(node) = load {
-                let revision = env.snapshot["revision"].as_u64().unwrap_or(0);
-                let listed = find_node(&env.snapshot["model"]["nodes"], node).map_or([None; 3], model_slots);
-                let mut pending = TextureLoad { node, revision, waiting: [false; 3], slots: [None, None, None], error: None };
-                for (position, slot) in listed.iter().enumerate() {
-                    let Some(slot) = slot else { continue };
-                    pending.waiting[position] = true;
-                    let call = call_request("texture_get", json!({"slot": slot}));
-                    env.out.push(Request::Mcp(McpTarget::Texture(position as u8), call));
-                }
-                if pending.waiting.contains(&true) {
-                    self.texture_request = Some(pending);
-                } else {
-                    viewer.deliver(env.ctx, node, revision, Ok(pending.slots));
+                match self.begin_texture_viewer_load(env.ctx, env.snapshot, Some(node)) {
+                    Ok(requests) => env.out.extend(requests.into_iter().map(|(target, call)| Request::Mcp(target, call))),
+                    Err(error) => env.out.push(Request::Notice(error)),
                 }
             }
         }
@@ -5192,6 +5230,95 @@ mod frame_tests {
         let answer = json!({"slot": slot, "width": width, "height": height, "format": "png",
             "base64": base64::engine::general_purpose::STANDARD.encode(data.into_inner())});
         json!({"result": {"isError": false, "content": [{"type": "text", "text": "{}"}], "structuredContent": answer}})
+    }
+
+    #[test]
+    fn texture_viewer_load_pending_survives_refusal_and_reopen() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([4, 7, 5]);
+        let mut windows = Windows::new();
+        assert!(windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).is_err());
+        assert!(windows.ctx.is_none() && windows.texture_request.is_none());
+        windows.set_texture_viewer(true, Some(2), Some(2.75));
+        let requests = windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap();
+        assert_eq!(requests, [(0, 4), (1, 7), (2, 5)].map(|(position, slot)|
+            (McpTarget::Texture(position), call_request("texture_get", json!({"slot":slot})))).to_vec());
+        windows.deliver(McpTarget::Texture(2), Some(texture_response(5, 1, 1)));
+        let waiting = windows.texture_request.as_ref().unwrap().waiting;
+        let pixels = windows.texture_request.as_ref().unwrap().slots[2].as_ref().unwrap().rgba.clone();
+        let before = windows.texture_viewer_load_state();
+        assert!(windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).is_err());
+        assert_eq!(windows.texture_viewer_load_state(), before);
+        assert_eq!(windows.texture_request.as_ref().unwrap().waiting, waiting);
+        assert_eq!(windows.texture_viewer_state(), json!({"slot":2,"zoom":2.75}));
+        windows.set_texture_viewer(false, None, None);
+        assert_eq!(windows.texture_viewer_load_state(), Value::Null);
+        windows.set_texture_viewer(true, None, None);
+        assert_eq!(windows.texture_viewer_load_state()["loading"], false);
+        assert_eq!(windows.texture_viewer_load_state()["pending"], json!({"node":9,"revision":3}));
+        let mut empty = rig.snapshot.clone();
+        empty["model"]["nodes"]["children"][0]["textures"] = json!([]);
+        assert!(windows.begin_texture_viewer_load(&ctx, &empty, rig.selected).is_err());
+        let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Load textures");
+        assert!(requests.is_empty());
+        assert_eq!(windows.texture_request.as_ref().unwrap().waiting, waiting);
+        assert_eq!(windows.texture_request.as_ref().unwrap().slots[2].as_ref().unwrap().rgba, pixels);
+        windows.deliver(McpTarget::Texture(0), Some(texture_response(4, 3, 2)));
+        assert!(windows.texture_request.is_some());
+        windows.deliver(McpTarget::Texture(1), Some(texture_response(7, 2, 2)));
+        let state = windows.texture_viewer_load_state();
+        assert_eq!(state["pending"], Value::Null);
+        assert_eq!((state["loaded"]["node"].clone(), state["loaded"]["revision"].clone()), (json!(9), json!(3)));
+        assert_eq!(state["loaded"]["slots"], json!([
+            {"slot":4,"width":3,"height":2,"displayable":true},
+            {"slot":7,"width":2,"height":2,"displayable":true},
+            {"slot":5,"width":1,"height":1,"displayable":true}]));
+        assert_eq!(windows.texture_viewer_state(), json!({"slot":0,"zoom":1.0}));
+        assert!(windows.begin_texture_viewer_load(&ctx, &empty, rig.selected).unwrap().is_empty());
+    }
+
+    #[test]
+    fn texture_viewer_load_failure_retry_and_empty_share_delivery() {
+        let ctx = context();
+        let _ = ctx.run(egui::RawInput { max_texture_side:Some(1024), ..Default::default() }, |_| {});
+        let mut rig = Rig::new();
+        let mut windows = Windows::new();
+        windows.set_texture_viewer(true, Some(2), Some(2.75));
+        windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap();
+        windows.deliver(McpTarget::Texture(0), Some(texture_response(0, 1025, 1)));
+        let state = windows.texture_viewer_load_state();
+        assert_eq!(state["hasError"], true);
+        assert_eq!(state["loaded"]["slots"][0], json!({"slot":0,"width":1025,"height":1,"displayable":false}));
+        assert!(windows.texture_viewer_load_error().unwrap().contains("larger than the 1024 px"));
+        windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap();
+        assert_eq!(windows.texture_viewer_load_state()["hasError"], true);
+        windows.deliver(McpTarget::Texture(0), Some(texture_response(0, 2, 1)));
+        assert_eq!(windows.texture_viewer_load_state()["hasError"], false);
+        let loaded = windows.texture.as_ref().unwrap().loaded.as_ref().unwrap();
+        let pixels = loaded.slots[0].as_ref().unwrap().rgba.clone();
+        let handle = loaded.handles[0].as_ref().unwrap().id();
+        windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap();
+        let before = windows.texture_viewer_load_state();
+        assert!(windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).is_err());
+        assert_eq!(windows.texture_viewer_load_state(), before);
+        let loaded = windows.texture.as_ref().unwrap().loaded.as_ref().unwrap();
+        assert_eq!(loaded.slots[0].as_ref().unwrap().rgba, pixels);
+        assert_eq!(loaded.handles[0].as_ref().unwrap().id(), handle);
+        let mut garbled = texture_response(0, 2, 1);
+        garbled["result"]["structuredContent"]["base64"] = json!("not-base64");
+        windows.deliver(McpTarget::Texture(0), Some(garbled));
+        let state = windows.texture_viewer_load_state();
+        assert_eq!(state["pending"], Value::Null);
+        assert_eq!(state["loaded"], Value::Null);
+        assert_eq!(state["hasError"], true);
+        rig.snapshot["model"]["nodes"]["children"][0]["textures"] = json!([]);
+        assert!(windows.begin_texture_viewer_load(&ctx, &rig.snapshot, rig.selected).unwrap().is_empty());
+        assert_eq!(windows.texture_viewer_load_state(), json!({"loading":false,"pending":null,"hasError":false,
+            "loaded":{"node":9,"revision":3,"slots":[null,null,null]}}));
+        assert_eq!(windows.texture_viewer_state(), json!({"slot":2,"zoom":2.75}));
     }
 
     #[test]
