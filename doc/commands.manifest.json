@@ -11952,6 +11952,25 @@
       ]
     },
     {
+      "description": "Action: admit native Start only with the enabled panel and no open owned client. Identified local reply delivery and matching owner, opt-in and launch configuration precede one start. Rechecks native eligibility; a captured closed retained owner is stopped before configuration or launch. Read codingAgentStart and match attempt: admission and initialize requested do not prove handshake, session or provider success. The child receives initialize only, never session/new or a prompt. Authenticated ACP self-Start refuses without review. Shares pending exclusion with New session. Failed, lost or expired output never executes; no automatic retry. Preserves unsent text/identity, document, drafts and settings. No auto-enable, Send, permission grant or settings save. Headless, notifications and internal calls refuse.",
+      "effect": "application-lifecycle",
+      "guiEntry": [
+        "Coding agent > Start"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_start",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: admit Stop of the exact retained coding-agent run after local reply delivery. ACP self-Stop requires human approval of the original authenticated call, without waiting for a successful turn. Stops and may kill/reap the owned child; successful release discards its conversation but preserves unsent text, document, drafts, history and settings. Failed shutdown can retain a closed owner after removing its endpoint. Read codingAgentStop for the latest attempt and independent approval-write failure; admission is not execution. No automatic retry, provider-completion guarantee, launch or disable. Headless, notifications and internal calls refuse.",
       "effect": "application-lifecycle",
       "guiEntry": [

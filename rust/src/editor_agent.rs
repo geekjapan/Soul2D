@@ -847,17 +847,29 @@ pub(crate) struct AgentSetTarget {
     stop: Option<StopTarget>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentLaunchAction { Start, NewSession }
+
+impl AgentLaunchAction {
+    pub(crate) fn label(self) -> &'static str {
+        match self { Self::Start => "Start", Self::NewSession => "New session" }
+    }
+}
+
 impl AgentSetSnapshot {
-    pub(crate) fn new_session_target(self, settings: &Settings, approval: Option<&HostApproval>) -> Result<NewSessionTarget, String> {
-        if !self.enabled { return Err("Enable the coding-agent panel before requesting New session".into()); }
+    pub(crate) fn launch_target(self, action: AgentLaunchAction, settings: &Settings, approval: Option<&HostApproval>) -> Result<AgentLaunchTarget, String> {
+        if !self.enabled { return Err(format!("Enable the coding-agent panel before requesting {}", action.label())); }
         if self.next_run == u64::MAX { return Err("Coding-agent run identity unavailable".into()); }
+        if action == AgentLaunchAction::Start && approval.is_some() {
+            return Err("ACP Start is unavailable for an owned invocation".into());
+        }
         let invocation = match approval {
             Some(approval) => Some(approval.invocation.clone().filter(|call| approval.active && call.permissions != u64::MAX
                 && self.owner.is_some_and(|owner| owner.run == call.run))
                 .ok_or("ACP New session needs its original authenticated transmitted uncancelled prompt")?),
             None => None,
         };
-        Ok(NewSessionTarget { before:self, config:LaunchConfigSnapshot::capture(settings), invocation })
+        Ok(AgentLaunchTarget { action, before:self, config:LaunchConfigSnapshot::capture(settings), invocation })
     }
 
     pub(crate) fn target(self, enabled: bool, approval: Option<&HostApproval>) -> Result<AgentSetTarget, String> {
@@ -894,7 +906,8 @@ impl LaunchConfigSnapshot {
 }
 
 #[derive(Clone, PartialEq)]
-pub(crate) struct NewSessionTarget {
+pub(crate) struct AgentLaunchTarget {
+    action: AgentLaunchAction,
     before: AgentSetSnapshot,
     config: LaunchConfigSnapshot,
     invocation: Option<AcpInvocation>,
@@ -906,15 +919,17 @@ pub(crate) struct NewSessionReviewTarget {
     invocation: AcpInvocation,
 }
 
-impl NewSessionTarget {
+impl AgentLaunchTarget {
+    pub(crate) fn action(&self) -> AgentLaunchAction { self.action }
     pub(crate) fn invocation(&self) -> Option<&AcpInvocation> { self.invocation.as_ref() }
     pub(crate) fn review(&self) -> Option<NewSessionReviewTarget> {
+        if self.action != AgentLaunchAction::NewSession { return None; }
         Some(NewSessionReviewTarget { before:self.before, invocation:self.invocation.clone()? })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NewSessionRefusal { Disabled, IdentityUnavailable, StaleTarget, ConfigurationChanged, ConsentInvalid }
+pub(crate) enum AgentLaunchRefusal { Disabled, StartUnavailable, IdentityUnavailable, StaleTarget, ConfigurationChanged, ConsentInvalid }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DraftSnapshot {
@@ -1133,21 +1148,24 @@ impl<W: Write> AgentPanel<W> {
         Ok(self.set_enabled_with(target.enabled, Client::shutdown))
     }
 
-    pub(crate) fn new_session_status(&self, target: &NewSessionTarget, settings: &Settings, admitted: bool) -> Result<(), NewSessionRefusal> {
-        if !self.enabled { return Err(NewSessionRefusal::Disabled); }
-        let current = self.set_snapshot().map_err(|_| NewSessionRefusal::IdentityUnavailable)?;
-        if current.next_run == u64::MAX { return Err(NewSessionRefusal::IdentityUnavailable); }
-        if current != target.before { return Err(NewSessionRefusal::StaleTarget); }
-        if !target.config.matches(settings) { return Err(NewSessionRefusal::ConfigurationChanged); }
+    pub(crate) fn launch_status(&self, target: &AgentLaunchTarget, settings: &Settings, admitted: bool) -> Result<(), AgentLaunchRefusal> {
+        if !self.enabled { return Err(AgentLaunchRefusal::Disabled); }
+        let current = self.set_snapshot().map_err(|_| AgentLaunchRefusal::IdentityUnavailable)?;
+        if current.next_run == u64::MAX { return Err(AgentLaunchRefusal::IdentityUnavailable); }
+        if current != target.before { return Err(AgentLaunchRefusal::StaleTarget); }
+        if !target.config.matches(settings) { return Err(AgentLaunchRefusal::ConfigurationChanged); }
+        if target.action == AgentLaunchAction::Start && !self.controls().start {
+            return Err(AgentLaunchRefusal::StartUnavailable);
+        }
         if let Some(invocation) = &target.invocation {
-            let run = self.run.as_ref().ok_or(NewSessionRefusal::ConsentInvalid)?;
+            let run = self.run.as_ref().ok_or(AgentLaunchRefusal::ConsentInvalid)?;
             if run.id != invocation.run || run.closed || run.client.active_prompt() != Some(invocation.prompt)
                 || invocation.permissions == u64::MAX || run.client.permission_epoch() != invocation.permissions {
-                return Err(NewSessionRefusal::ConsentInvalid);
+                return Err(AgentLaunchRefusal::ConsentInvalid);
             }
             if !admitted && (run.host_approval.new_session_review() != target.review()
                 || run.host_approval.request.as_ref().is_none_or(|request| request.created.elapsed() >= HOST_APPROVAL_TIMEOUT)) {
-                return Err(NewSessionRefusal::ConsentInvalid);
+                return Err(AgentLaunchRefusal::ConsentInvalid);
             }
         }
         Ok(())
@@ -1173,14 +1191,17 @@ impl<W: Write> AgentPanel<W> {
         }
     }
 
-    pub(crate) fn new_session_if_current(&mut self, target: &NewSessionTarget, settings: &Settings) -> Result<AgentRestartResult, NewSessionRefusal> {
-        self.new_session_status(target, settings, true)?;
+    pub(crate) fn launch_if_current(&mut self, target: &AgentLaunchTarget, settings: &Settings) -> Result<AgentRestartResult, AgentLaunchRefusal> {
+        self.launch_status(target, settings, true)?;
         if let Some(invocation) = &target.invocation {
             if !self.run.as_mut().unwrap().client.seal_permission_intake(invocation.permissions) {
-                return Err(NewSessionRefusal::ConsentInvalid);
+                return Err(AgentLaunchRefusal::ConsentInvalid);
             }
         }
-        Ok(self.new_session(settings))
+        Ok(match target.action {
+            AgentLaunchAction::Start => self.start(settings),
+            AgentLaunchAction::NewSession => self.new_session(settings),
+        })
     }
 
     pub(crate) fn draft_snapshot(&self) -> DraftSnapshot {
@@ -2400,50 +2421,196 @@ mod tests {
     }
 
     #[test]
-    fn coding_agent_new_session_config_snapshot_keeps_raw_presence_types_and_ignores_unrelated_settings() {
+    fn coding_agent_start_config_snapshot_keeps_raw_presence_types_and_ignores_unrelated_settings() {
         let panel = no_launch_panel();
         let settings = Settings::empty();
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
         for key in LAUNCH_CONFIG_KEYS {
             let changed = Settings::parse(serde_json::to_vec(&json!({key:Value::Null})).unwrap().as_slice()).unwrap();
-            assert_eq!(panel.new_session_status(&target, &changed, true), Err(NewSessionRefusal::ConfigurationChanged));
+            assert_eq!(panel.launch_status(&target, &changed, true), Err(AgentLaunchRefusal::ConfigurationChanged));
         }
         let mut unrelated = settings.clone();
         unrelated.set("ViewportZoomSpeed", 9.0).unwrap();
-        assert_eq!(panel.new_session_status(&target, &unrelated, true), Ok(()));
+        assert_eq!(panel.launch_status(&target, &unrelated, true), Ok(()));
         let mut malformed = Settings::empty();
         malformed.set("MCP.Headers", "owned malformed first".to_owned()).unwrap();
-        let target = panel.set_snapshot().unwrap().new_session_target(&malformed, None).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &malformed, None).unwrap();
         malformed.set("MCP.Headers", "owned malformed second".to_owned()).unwrap();
-        assert_eq!(panel.new_session_status(&target, &malformed, true), Err(NewSessionRefusal::ConfigurationChanged));
+        assert_eq!(panel.launch_status(&target, &malformed, true), Err(AgentLaunchRefusal::ConfigurationChanged));
+    }
+
+    #[test]
+    fn coding_agent_start_snapshot_stales_on_opt_in_and_ownerless_lifecycle_cycles() {
+        let mut panel = no_launch_panel();
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        panel.set_enabled(false);
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::Disabled));
+        panel.set_enabled(true);
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::StaleTarget));
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        let (client, _agent) = connect();
+        panel.attach(client, None, None);
+        panel.stop();
+        assert!(panel.owner().is_none());
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::StaleTarget));
+    }
+
+    #[test]
+    fn coding_agent_start_distinguishes_initialize_write_from_handshake_and_write_failure() {
+        let mut settings = Settings::empty();
+        settings.set("ACP.Command", "owned-unused-launch-spec".to_owned()).unwrap();
+        let mut panel = AgentPanel::with_launcher(|_| {
+            let (mut reader, writer) = pipe().unwrap();
+            std::thread::spawn(move || { let _ = reader.read_to_end(&mut Vec::new()); });
+            Ok(Client::new(std::io::empty(), writer))
+        });
+        panel.set_enabled(true);
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::InitializationRequested);
+        assert!(result.stop.is_none());
+        assert!(panel.state().has_client && !panel.state().ready);
+        panel.stop();
+        let mut panel = AgentPanel::with_launcher(|_| {
+            let (reader, writer) = pipe().unwrap();
+            drop(reader);
+            Ok(Client::new(std::io::empty(), writer))
+        });
+        panel.set_enabled(true);
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::InitializeWriteFailedRetained);
+        assert!(panel.state().has_client && !panel.state().ready);
+        assert!(panel.error().is_some());
+    }
+
+    #[test]
+    fn coding_agent_start_reports_stop_before_invalid_configuration_and_preserves_unsent_identity() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.run.as_mut().unwrap().closed = true;
+        panel.set_prompt_for_test("  unsent 日本語  ".into());
+        panel.set_briefing(Some("retained briefing".into()));
+        let draft = panel.draft_snapshot();
+        let opt_in = panel.opt_in_epoch;
+        let before = panel.next_run;
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::StartFailed);
+        assert!(matches!(result.stop, Some(StopResult::Stopped { .. })));
+        assert!(panel.run.is_none());
+        assert_eq!(panel.next_run, before);
+        assert_eq!(panel.draft_snapshot(), draft);
+        assert_eq!(panel.prompt_text_for_test(), "  unsent 日本語  ");
+        assert_eq!(panel.briefing.as_deref(), Some("retained briefing"));
+        assert_eq!(panel.opt_in_epoch, opt_in);
+        assert!(panel.is_enabled());
+        assert_eq!(panel.status(), "Start failed");
+    }
+
+
+    #[test]
+    fn coding_agent_start_refuses_a_live_owner_and_releases_only_the_same_closed_owner() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let settings = Settings::empty();
+        let before = panel.set_snapshot().unwrap();
+        let target = before.launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        assert_eq!(target.action(), AgentLaunchAction::Start);
+        assert!(target.review().is_none());
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::StartUnavailable));
+        assert!(matches!(panel.launch_if_current(&target, &settings), Err(AgentLaunchRefusal::StartUnavailable)));
+        assert_eq!(panel.set_snapshot().unwrap(), before);
+        let restart = before.launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
+        assert!(target != restart);
+        assert_eq!(panel.launch_status(&restart, &settings, true), Ok(()));
+        panel.run.as_mut().unwrap().closed = true;
+        assert!(panel.controls().start);
+        assert_eq!(panel.launch_status(&target, &settings, true), Ok(()));
+        let result = panel.launch_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::StartFailed);
+        assert!(matches!(result.stop, Some(StopResult::Stopped { .. })));
+        assert!(panel.owner().is_none());
+    }
+
+    #[test]
+    fn coding_agent_start_never_reinterprets_an_owned_acp_invocation_as_external() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        let settings = Settings::empty();
+        for closed in [false, true] {
+            panel.run.as_mut().unwrap().closed = closed;
+            let before = panel.set_snapshot().unwrap();
+            let approval = &panel.run.as_ref().unwrap().host_approval;
+            let error = before.launch_target(AgentLaunchAction::Start, &settings, Some(approval)).err().unwrap();
+            assert!(error.contains("ACP Start"), "{error}");
+            assert!(panel.run.as_ref().unwrap().host_approval.request.is_none());
+            assert_eq!(panel.set_snapshot().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn coding_agent_start_binds_current_state_not_ownerless_failed_attempt_history() {
+        let mut panel = no_launch_panel();
+        let settings = Settings::empty();
+        panel.set_prompt_for_test("Owned unsent Start message".into());
+        let draft = panel.draft_snapshot();
+        let before = panel.set_snapshot().unwrap();
+        let target = before.launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        assert_eq!(panel.start(&settings).phase, AgentRestartPhase::StartFailed);
+        assert_eq!(panel.set_snapshot().unwrap(), before);
+        assert_eq!(panel.launch_status(&target, &settings, true), Ok(()));
+        let result = panel.launch_if_current(&target, &settings).unwrap();
+        assert_eq!(result.phase, AgentRestartPhase::StartFailed);
+        assert!(result.stop.is_none() && panel.owner().is_none());
+        assert_eq!(panel.draft_snapshot(), draft);
+        assert_eq!(panel.prompt_text_for_test(), "Owned unsent Start message");
+    }
+
+    #[test]
+    fn coding_agent_new_session_config_snapshot_keeps_raw_presence_types_and_ignores_unrelated_settings() {
+        let panel = no_launch_panel();
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
+        for key in LAUNCH_CONFIG_KEYS {
+            let changed = Settings::parse(serde_json::to_vec(&json!({key:Value::Null})).unwrap().as_slice()).unwrap();
+            assert_eq!(panel.launch_status(&target, &changed, true), Err(AgentLaunchRefusal::ConfigurationChanged));
+        }
+        let mut unrelated = settings.clone();
+        unrelated.set("ViewportZoomSpeed", 9.0).unwrap();
+        assert_eq!(panel.launch_status(&target, &unrelated, true), Ok(()));
+        let mut malformed = Settings::empty();
+        malformed.set("MCP.Headers", "owned malformed first".to_owned()).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &malformed, None).unwrap();
+        malformed.set("MCP.Headers", "owned malformed second".to_owned()).unwrap();
+        assert_eq!(panel.launch_status(&target, &malformed, true), Err(AgentLaunchRefusal::ConfigurationChanged));
     }
 
     #[test]
     fn coding_agent_new_session_snapshot_stales_on_opt_in_and_ownerless_lifecycle_cycles() {
         let mut panel = no_launch_panel();
         let settings = Settings::empty();
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
         panel.set_enabled(false);
-        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::Disabled));
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::Disabled));
         panel.set_enabled(true);
-        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::StaleTarget));
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::StaleTarget));
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
         let (client, _agent) = connect();
         panel.attach(client, None, None);
         panel.stop();
         assert!(panel.owner().is_none());
-        assert_eq!(panel.new_session_status(&target, &settings, true), Err(NewSessionRefusal::StaleTarget));
+        assert_eq!(panel.launch_status(&target, &settings, true), Err(AgentLaunchRefusal::StaleTarget));
     }
 
     #[test]
     fn coding_agent_new_session_identity_exhaustion_never_releases_an_existing_owner() {
         let (mut panel, _agent, _) = active_panel_endpoint();
         let settings = Settings::empty();
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
         let owner = panel.owner();
         panel.next_run = u64::MAX;
-        assert!(panel.set_snapshot().unwrap().new_session_target(&settings, None).is_err());
-        assert!(matches!(panel.new_session_if_current(&target, &settings), Err(NewSessionRefusal::IdentityUnavailable)));
+        assert!(panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).is_err());
+        assert!(matches!(panel.launch_if_current(&target, &settings), Err(AgentLaunchRefusal::IdentityUnavailable)));
         assert_eq!(panel.owner(), owner);
         assert!(!panel.state().closed);
         assert!(panel.mcp_url().is_some());
@@ -2461,7 +2628,7 @@ mod tests {
             permissions:run.client.permission_epoch() };
         run.host_approval.set_active(true);
         run.host_approval.invocation = Some(invocation.clone());
-        let target = before.new_session_target(&settings, Some(&run.host_approval)).unwrap();
+        let target = before.launch_target(AgentLaunchAction::NewSession, &settings, Some(&run.host_approval)).unwrap();
         assert_eq!(target.invocation(), Some(&invocation));
         let review = target.review().unwrap();
         let approval_target = ApprovalTarget::CodingAgentNewSession(review.clone());
@@ -2469,10 +2636,10 @@ mod tests {
         assert!(!debug.contains("owned-private"));
         let call = json!({"op":"editor.coding_agent.new_session"});
         assert!(run.host_approval.guard(&call, Ok(approval_target), None).unwrap_err().starts_with("Waiting for host approval"));
-        assert_eq!(panel.new_session_status(&target, &settings, false), Ok(()));
+        assert_eq!(panel.launch_status(&target, &settings, false), Ok(()));
         panel.run.as_mut().unwrap().host_approval.request.as_mut().unwrap().decision = ApprovalDecision::Denied;
         panel.invalidate_new_session_review(&review);
-        assert_eq!(panel.new_session_status(&target, &settings, false), Err(NewSessionRefusal::ConsentInvalid));
+        assert_eq!(panel.launch_status(&target, &settings, false), Err(AgentLaunchRefusal::ConsentInvalid));
         assert!(matches!(panel.run.as_ref().unwrap().host_approval.request.as_ref().unwrap().decision, ApprovalDecision::Denied));
         panel.close_new_session_review(&review);
         assert!(panel.run.as_ref().unwrap().host_approval.request.is_none());
@@ -2488,8 +2655,8 @@ mod tests {
             Ok(Client::new(std::io::empty(), writer))
         });
         panel.set_enabled(true);
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
-        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
         assert_eq!(result.phase, AgentRestartPhase::InitializationRequested);
         assert!(result.stop.is_none());
         assert!(panel.state().has_client && !panel.state().ready);
@@ -2500,11 +2667,25 @@ mod tests {
             Ok(Client::new(std::io::empty(), writer))
         });
         panel.set_enabled(true);
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
-        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
         assert_eq!(result.phase, AgentRestartPhase::InitializeWriteFailedRetained);
         assert!(panel.state().has_client && !panel.state().ready);
         assert!(panel.error().is_some());
+    }
+
+    #[test]
+    fn coding_agent_start_identity_exhaustion_keeps_the_closed_retained_owner() {
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.run.as_mut().unwrap().closed = true;
+        let settings = Settings::empty();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).unwrap();
+        let owner = panel.owner();
+        panel.next_run = u64::MAX;
+        assert!(panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::Start, &settings, None).is_err());
+        assert!(matches!(panel.launch_if_current(&target, &settings), Err(AgentLaunchRefusal::IdentityUnavailable)));
+        assert_eq!(panel.owner(), owner);
+        assert!(panel.state().has_client && panel.state().closed && panel.mcp_url().is_some());
     }
 
     #[test]
@@ -2516,8 +2697,8 @@ mod tests {
         let opt_in = panel.opt_in_epoch;
         let before = panel.next_run;
         let settings = Settings::empty();
-        let target = panel.set_snapshot().unwrap().new_session_target(&settings, None).unwrap();
-        let result = panel.new_session_if_current(&target, &settings).unwrap();
+        let target = panel.set_snapshot().unwrap().launch_target(AgentLaunchAction::NewSession, &settings, None).unwrap();
+        let result = panel.launch_if_current(&target, &settings).unwrap();
         assert_eq!(result.phase, AgentRestartPhase::StartFailed);
         assert!(matches!(result.stop, Some(StopResult::Stopped { .. })));
         assert!(panel.run.is_none());

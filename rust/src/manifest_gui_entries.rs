@@ -142,6 +142,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_coding_agent_set", &[
         "Coding agent > Enable coding agent (ACP)",
     ]),
+    ("editor_coding_agent_start", &[
+        "Coding agent > Start",
+    ]),
     ("editor_coding_agent_stop", &[
         "Coding agent > Stop",
     ]),
