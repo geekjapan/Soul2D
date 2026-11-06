@@ -130,6 +130,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_camera_sync", &[
         "View tabs > Same display position",
     ]),
+    ("editor_coding_agent_cancel", &[
+        "Coding agent > Cancel",
+    ]),
     ("editor_command_browser_set", &[
         "Command Browser > Close window; Escape",
         "Edit > Command Browser",

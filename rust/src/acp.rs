@@ -1141,6 +1141,14 @@ impl<W: Write> Client<W> {
         self.prompt.active_id().is_some()
     }
 
+    /// The queued or uncancelled running prompt that a cancellation can still target.
+    pub fn cancellable_prompt(&self) -> Option<PromptId> {
+        match &self.prompt {
+            PromptState::Queued { id, .. } | PromptState::Running { id, cancelled: false } => Some(*id),
+            _ => None,
+        }
+    }
+
     /// Only an actually transmitted, uncancelled prompt can initiate lifecycle consent.
     pub fn active_prompt(&self) -> Option<PromptId> {
         if self.permission_epoch() == u64::MAX { return None; }

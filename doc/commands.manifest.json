@@ -11860,6 +11860,25 @@
       ]
     },
     {
+      "description": "Action: admit cancellation of the coding agent's current queued or running turn. After this identified reply is locally delivered, the editor rechecks the same run and prompt before using native Cancel. Read codingAgentCancel in editor state and match its attempt: admitted is not executed; requested is not turn completion. Failed, dropped or expired reply delivery never executes. Cancellation-write failure may leave partial remote effects; do not retry automatically. Preserves unsent text, document, drafts and settings; cancels permissions rather than approving them. Does not start an agent or send a new prompt. Headless, notifications and internal calls refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Coding agent > Cancel"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_cancel",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: open or close the Command Browser, as Edit > Command Browser, its shortcut, close button and Escape do. Read windows.commandBrowser in the returned editor state. Repeated open preserves the current search, selection, argument draft and result; closing clears them. Retained across document replacement, layout reset and listener restart; closed on process restart. Editor only, all document formats. No document, history or settings write; no ACP host approval is needed.",
       "effect": "editor-state",
       "guiEntry": [

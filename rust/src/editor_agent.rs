@@ -681,15 +681,29 @@ struct Run<W: Write> {
 }
 
 impl<W: Write> Run<W> {
-    fn clear_approval(&mut self, reason: &str) {
+    fn clear_approval(&mut self, reason: &str) -> bool {
         self.host_approval.set_active(false);
         if let Some((_, pending)) = self.pending_reply.take() {
             if let Err(error) = pending.finish(&mut |message| RpcReply::plain(Some(json!({"jsonrpc":"2.0", "id":message["id"], "result":{
                 "isError":true, "content":[{"type":"text", "text":reason}]}})))) {
                 eprintln!("acp-mcp: response failed: {error}");
+                return false;
             }
         }
+        true
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CancelTarget {
+    run: u64,
+    prompt: PromptId,
+}
+
+pub(crate) enum CancelResult {
+    Unavailable,
+    Requested { approval_reply_failed: bool },
+    WriteFailed { approval_reply_failed: bool },
 }
 
 pub struct AgentPanel<W: Write = ChildStdin> {
@@ -941,15 +955,32 @@ impl<W: Write> AgentPanel<W> {
         }
     }
 
-    pub fn cancel(&mut self) {
+    pub(crate) fn cancel_target(&self) -> Option<CancelTarget> {
+        if !self.controls().cancel { return None; }
+        let run = self.run.as_ref()?;
+        Some(CancelTarget { run: run.id, prompt: run.client.cancellable_prompt()? })
+    }
+
+    pub(crate) fn cancel_if_current(&mut self, expected: CancelTarget) -> Option<CancelResult> {
+        if self.cancel_target() != Some(expected) { return None; }
+        Some(self.cancel())
+    }
+
+    pub(crate) fn cancel(&mut self) -> CancelResult {
         if !self.controls().cancel {
-            return;
+            return CancelResult::Unavailable;
         }
-        let Some(run) = self.run.as_mut() else { return };
-        run.clear_approval("The ACP prompt was cancelled before the operation was approved");
+        let Some(run) = self.run.as_mut() else { return CancelResult::Unavailable };
+        let approval_reply_failed = !run.clear_approval("The ACP prompt was cancelled before the operation was approved");
         match run.client.cancel() {
-            Ok(()) => self.status = "Cancelling".to_string(),
-            Err(error) => self.fail("Cancel failed", error),
+            Ok(()) => {
+                self.status = "Cancelling".to_string();
+                CancelResult::Requested { approval_reply_failed }
+            }
+            Err(error) => {
+                self.fail("Cancel failed", error);
+                CancelResult::WriteFailed { approval_reply_failed }
+            }
         }
     }
 
@@ -1975,6 +2006,97 @@ mod tests {
     }
 
     #[test]
+    fn coding_agent_cancel_reports_broken_acp_writer_and_preserves_the_owned_run() {
+        let (agent_stdin, client_writer) = pipe().unwrap();
+        let (client_reader, mut agent_stdout) = pipe().unwrap();
+        let mut outgoing = BufReader::new(agent_stdin);
+        let mut panel = no_launch_panel();
+        panel.attach(Client::new(client_reader, client_writer), None, None);
+        let mut line = String::new();
+        outgoing.read_line(&mut line).unwrap();
+        let init: Value = serde_json::from_str(&line).unwrap();
+        writeln!(agent_stdout, "{}", json!({"jsonrpc":"2.0", "id":init["id"], "result":{"protocolVersion":1}})).unwrap();
+        pump_until(&mut panel, |panel| panel.state().ready);
+        *panel.prompt_mut() = "Owned test prompt".into();
+        panel.send();
+        line.clear();
+        outgoing.read_line(&mut line).unwrap();
+        let session: Value = serde_json::from_str(&line).unwrap();
+        writeln!(agent_stdout, "{}", json!({"jsonrpc":"2.0", "id":session["id"], "result":{"sessionId":"broken-writer"}})).unwrap();
+        pump_until(&mut panel, |panel| panel.status() == "Session ready");
+        line.clear();
+        outgoing.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["method"], "session/prompt");
+        let owner = panel.owner();
+        *panel.prompt_mut() = "Retained unsent prompt".into();
+        drop(outgoing);
+        assert!(matches!(panel.cancel(), CancelResult::WriteFailed { approval_reply_failed:false }));
+        assert_eq!(panel.status(), "Cancel failed");
+        assert!(panel.error().is_some());
+        assert_eq!(panel.owner(), owner);
+        assert!(panel.state().has_client && panel.state().cancelling);
+        assert!(!panel.controls().cancel);
+        assert_eq!(panel.prompt_mut(), "Retained unsent prompt");
+        assert!(matches!(panel.cancel(), CancelResult::Unavailable));
+    }
+
+    #[test]
+    fn coding_agent_cancel_sends_once_even_when_parked_http_refusal_write_fails() {
+        let (mut panel, agent, _) = active_panel_endpoint();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let control = stream.try_clone().unwrap();
+        let body = json!({"jsonrpc":"2.0", "id":7, "method":"ping"}).to_string();
+        write!(peer, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let pending = handle_connection_deferred(stream, None, WAIT, &mut |_| HttpDispatch::Defer)
+            .unwrap().expect("the owned request is parked");
+        control.shutdown(std::net::Shutdown::Write).unwrap();
+        panel.run.as_mut().unwrap().pending_reply = Some((7, pending));
+        let owner = panel.owner();
+        assert!(matches!(panel.cancel(), CancelResult::Requested { approval_reply_failed:true }));
+        let cancel = agent.recv();
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "panel-test");
+        assert_eq!(panel.status(), "Cancelling");
+        assert_eq!(panel.owner(), owner);
+        let run = panel.run.as_ref().unwrap();
+        assert!(run.pending_reply.is_none());
+        assert!(!run.host_approval.active && run.host_approval.request.is_none());
+        assert!(matches!(panel.cancel(), CancelResult::Unavailable));
+        assert!(agent.lines.try_recv().is_err(), "a duplicate must not emit another cancellation");
+    }
+
+    #[test]
+    fn coding_agent_cancel_native_button_denies_permissions_and_preserves_unsent_text() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let (mut panel, mut agent, _) = active_panel_endpoint();
+        let owner = panel.owner();
+        *panel.prompt_mut() = "Retained next prompt".into();
+        agent.send(json!({"jsonrpc":"2.0", "id":"pending", "method":"session/request_permission", "params":{}}));
+        pump_until(&mut panel, |panel| panel.permission().is_some());
+        Harness::new().click(Role::Button, "Cancel", |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+        });
+        assert_eq!(agent.recv()["method"], "session/cancel");
+        assert_eq!(agent.recv()["result"]["outcome"]["outcome"], "cancelled");
+        agent.send(json!({"jsonrpc":"2.0", "id":"late", "method":"session/request_permission", "params":{}}));
+        let deadline = Instant::now() + WAIT;
+        let late = loop {
+            panel.pump();
+            if let Ok(line) = agent.lines.try_recv() { break serde_json::from_str::<Value>(&line).unwrap(); }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(late["id"], "late");
+        assert_eq!(late["result"]["outcome"]["outcome"], "cancelled");
+        assert!(panel.permission().is_none());
+        assert_eq!(panel.prompt_mut(), "Retained next prompt");
+        assert_eq!(panel.owner(), owner);
+    }
+
+    #[test]
     fn quit_evidence_requires_post_admission_completion_and_unchanged_permission_history() {
         for case in ["early", "late", "permission", "replacement", "failed_stop"] {
             let (mut panel, mut agent, prompt) = active_panel_endpoint();
@@ -2174,7 +2296,7 @@ mod tests {
             let mut executed = Vec::new();
             let client = park_settings(&mut panel, &mut executed, tool);
             match event {
-                "cancel" => panel.cancel(),
+                "cancel" => { panel.cancel(); },
                 "done" => {
                     agent.as_mut().unwrap().send(json!({"jsonrpc":"2.0", "id":prompt["id"], "result":{"stopReason":"end_turn"}}));
                     pump_until(&mut panel, |panel| !panel.state().turn_active);
@@ -2312,7 +2434,7 @@ mod tests {
             }
             assert!(panel.run.as_ref().unwrap().pending_reply.is_some(), "{tool}/{event}");
             match event {
-                "cancel" => panel.cancel(),
+                "cancel" => { panel.cancel(); },
                 "done" => {
                     agent.as_mut().unwrap().send(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}));
                     pump_until(&mut panel, |panel| !panel.state().turn_active);

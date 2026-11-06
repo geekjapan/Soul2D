@@ -2330,9 +2330,9 @@ Counts: covered 74, tracked 4, absent 22, no counterpart 3.
 
 ## Soul2D editor panels (`rust/src/editor_ui.rs`)
 
-Read from the source on 2026-10-20: the 118 distinct control labels of `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers), grouped by panel, 20 rows. `covered` means every control of the group ends in a Session operation that an MCP tool also reaches; `GUI-only` names a group that does not.
+Read from the source on 2026-10-20: the 118 distinct control labels of `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers), grouped by panel, 21 rows (Cancel is listed separately). `covered` means every control of the group ends in a Session operation that an MCP tool also reaches; `GUI-only` names a group that does not.
 
-Counts: covered 19, GUI-only 1.
+Counts: covered 20, GUI-only 1.
 
 | Panel | Controls | Session operation / tool | Status |
 |---|---|---|---|
@@ -2353,6 +2353,7 @@ Counts: covered 19, GUI-only 1.
 | Live2D runtime panels | Resource binding, Attach linked file, Pose3 (Attach Pose, Reset Pose), Physics3 (Attach Physics3, Step Physics3, Stabilize, Reset Physics3), Expressions (Import expression, Reset expression), Model parameters / facial controls, Runtime motions (Reset motion, Fit preview) | live2d_animation_bindings, live2d_model_attach, live2d_pose_attach, live2d_pose_reset, live2d_physics_attach, live2d_physics_step, live2d_physics_stabilize, live2d_physics_reset, live2d_expression_import, live2d_expression_reset, live2d_parameter_set, motion3_reset | covered (live2d_model_attach) |
 | History | Undo history, Clear history | history_summary, history_goto, history_clear | covered (history_goto) |
 | Part split review | Part split review, Apply split | split_plan, split_apply | covered (split_apply) |
+| Coding agent > Cancel | Cancel | editor_coding_agent_cancel | bounded current-turn Cancel after exact local reply delivery and matching owner; latest attempt under `codingAgentCancel`, local request acceptance is not peer processing or turn completion |
 | Coding agent | Coding agent (ACP session, prompt, permission replies) |  | GUI-only controls; lifecycle is partially observable through `resource://soul2d/editor/state` under `codingAgent` (seven nonsecret processed-state booleans). Start/Stop, sessions, prompts and permission replies remain native controls; ACP tool calls reach the shared Session through the editor's MCP endpoint |
 | Viewport | Zoom in, Zoom out, 1: follows the parents, 2: model coordinates | editor_camera_set, editor_viewport_set | covered (editor_camera_set) |
 | Dialogs | Save As, Keep for later, Add with suffix, Confirm / Cancel deletions, Discard new ... | save, editor_recovery_restore, editor_recovery_keep | covered (editor_recovery_keep); Keep for later dismisses the startup offer only; other confirmations remain host-owned, the operations refuse or apply in one call |

@@ -28,7 +28,7 @@ pub fn spawn_stdin(ctx: &egui::Context) -> Receiver<HostMessage> {
     rx
 }
 
-fn serve_lines(
+pub(crate) fn serve_lines(
     input: impl BufRead,
     mut stdout: impl Write,
     tx: &SyncSender<HostMessage>,
