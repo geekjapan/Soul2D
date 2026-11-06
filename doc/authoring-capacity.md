@@ -44,6 +44,40 @@ CLI output, checks deterministic generation, Unicode paths, argument errors and 
 and emits a JSON receipt. CI uploads that receipt only. Generated CMO3 files and executables are excluded.
 Byte identity across platforms requires matching the three receipts' fixture hashes.
 
+## Native preview window correctness
+
+Rust CI also runs `tools/verify-editor-native-preview.py` in a fresh Linux Xvfb display, using
+the unchanged fixture produced by the example. It captures the actual production editor window
+through the compositor. The six stages separately present the four colors, a camera pan, its return,
+an opacity edit, a refused stale edit and Undo. Two matching captures are required per stage;
+the edited frame must appear before Undo is requested. Document snapshots bracket the captures.
+
+The unique viewport background anchors the screen coordinates and checks the requested scale1.
+At camera zoom12, each triangle has 24-point legs. The predicate checks core colors, absolute
+positions, background exclusion and half-coverage triangle extents and row spans, with fixed
+allowances for the source's 768-pixel preview cap, linear interpolation and shader dithering.
+Its pure selftest exercises phased, rounded and dithered triangles plus blank, swapped, stale,
+wrong-scale, square, rectangle and sparse-outline controls on all three supported platforms.
+These finite tests are not a proof of every sampling phase. The existing Texture Viewer pixel
+thresholds, fixture geometry and product limits are unchanged.
+
+The receipt retains source, fixture, executable and settings hashes, identified MCP traffic,
+failed and successful PNG captures, the last accepted Quit and the owned process's natural exit0.
+Forced cleanup leaves a failed result. CI uploads JSON, JSONL, logs and PNGs only; the CMO3 and
+executables remain excluded. Reproduce after building the GUI and example:
+
+```sh
+xvfb-run -a -s '-screen 0 1600x1000x24' \
+  python -I tools/verify-editor-native-preview.py \
+  --editor ./out/rust/debug/soul2d-editor --example ./out/rust/debug/examples/four-color-cmo3 \
+  --out /existing/evidence-directory
+```
+
+This witness checks synthetic Linux window correctness. Native preview composites the four source
+images on the CPU and presents one preview texture. It does not demonstrate four source GPU uploads,
+other-platform window acceptance, practical authoring capacity, latency or memory budgets, vendor
+interoperability, or formal proof. Those remain separate acceptance work.
+
 ## Reproduction and evidence
 
 Run the **Authoring capacity** GitHub Actions workflow with `workflow_dispatch`,

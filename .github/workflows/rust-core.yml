@@ -72,6 +72,7 @@ jobs:
           python tools/verify-version.py
           python tools/check-project-artifacts.py
           python -I tools/verify-editor-texture-cache.py --self-test
+          python -I tools/verify-editor-native-preview.py --self-test
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
       - name: Build shared core, CLI, editor and test targets
@@ -163,6 +164,25 @@ jobs:
             ${{ runner.temp }}/editor-texture-cache/**/*.jsonl
             ${{ runner.temp }}/editor-texture-cache/**/*.log
             ${{ runner.temp }}/editor-texture-cache/**/*.png
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Verify native CMO3 preview in a production X11 window
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a -s '-screen 0 1600x1000x24' \
+            python -I tools/verify-editor-native-preview.py \
+            --editor ./out/rust/debug/soul2d-editor --example ./out/rust/debug/examples/four-color-cmo3 \
+            --out "$RUNNER_TEMP/editor-native-preview"
+      - name: Upload native CMO3 preview window evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-native-preview
+          path: |
+            ${{ runner.temp }}/editor-native-preview/**/*.json
+            ${{ runner.temp }}/editor-native-preview/**/*.jsonl
+            ${{ runner.temp }}/editor-native-preview/**/*.log
+            ${{ runner.temp }}/editor-native-preview/**/*.png
           if-no-files-found: warn
           retention-days: 3
       - name: Launch the editor on X11 and Wayland
