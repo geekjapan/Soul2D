@@ -2,6 +2,14 @@ param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string]$Ev
     [Parameter(Mandatory)][string]$ExpectedCopyright)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+function Publish-PropertiesReady([string]$FilePath, [string]$EvidenceDirectory) {
+    $ready = [ordered]@{ protocol = 1; phase = 'ready'; pid = $PID;
+        file = [IO.Path]::GetFullPath($FilePath); evidence = [IO.Path]::GetFullPath($EvidenceDirectory);
+        readyUtcTicks = [DateTime]::UtcNow.Ticks }
+    $temporary = Join-Path $EvidenceDirectory 'ready.pending.json'
+    [IO.File]::WriteAllText($temporary, ($ready | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    [IO.File]::Move($temporary, (Join-Path $EvidenceDirectory 'ready.json'))
+}
 if ($PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess `
     -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'Properties verification requires owned Windows x64 GitHub Actions and Windows PowerShell 5.1.'
@@ -21,6 +29,7 @@ Add-Type -Path @((Join-Path $PSScriptRoot 'windows-editor-observation.cs'),
 Write-Output 'PASS: observed Properties pair, invalid/replaced dialog and stub, and baseline refusal checks.'
 [PropertiesObservation]::VerifyPngEncoding($EvidenceDirectory)
 Write-Output 'PASS: lossless BGRX-to-RGB PNG conversion ignores the unused fourth byte.'
+Publish-PropertiesReady -FilePath $FilePath -EvidenceDirectory $EvidenceDirectory
 $result = [PropertiesObservation]::Run($FilePath, $EvidenceDirectory, $ExpectedCopyright)
 $result | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'observation.json') -Encoding UTF8
 if ($result.status -ne 'PASS') { throw 'Properties verification did not complete; see observation.json.' }

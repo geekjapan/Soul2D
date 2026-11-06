@@ -1,6 +1,24 @@
-param([string]$ProgressChildDirectory)
+param([string]$ProgressChildDirectory, [string]$ReadyChildDirectory, [string]$ReadyChildFile,
+    [int]$PrepareDelayMs = 0, [int]$ObservationDelayMs = 0, [int]$ReadyExitCode = 0, [switch]$OmitReady)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+foreach ($pair in @(@('observe-windows-properties.ps1', 'Publish-PropertiesReady'), @('verify-windows-properties.ps1', 'Wait-PropertiesHelper'))) {
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $pair[0]), [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { throw 'Properties readiness source does not parse.' }
+    $name = $pair[1]
+    $found = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $false))
+    if ($found.Count -ne 1) { throw 'Expected one production readiness function.' }
+    . ([scriptblock]::Create($found[0].Extent.Text))
+}
+if ($ReadyChildDirectory) {
+    if ($PrepareDelayMs -gt 0) { Start-Sleep -Milliseconds $PrepareDelayMs }
+    if (-not $OmitReady) { Publish-PropertiesReady -FilePath $ReadyChildFile -EvidenceDirectory $ReadyChildDirectory }
+    if ($ObservationDelayMs -gt 0) { Start-Sleep -Milliseconds $ObservationDelayMs }
+    exit $ReadyExitCode
+}
 $source = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'windows-properties-observation.cs')
 $parts = foreach ($pattern in @(
     '(?m)^    private enum ProgressActor \{[^\r\n]+\}',
@@ -230,3 +248,84 @@ foreach ($change in $detailCases) {
     if (-not $rejected) { throw 'Invalid Copyright association passed.' }
 }
 Write-Output "PASS: six General filename/stem cases, captured Copyright row, $($generalCases.Count + $detailCases.Count) target/association/refusal cases."
+
+$readyRoot = Join-Path ([IO.Path]::GetTempPath()) ('soul2d-properties-ready-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory $readyRoot | Out-Null
+try {
+    $publication = Join-Path $readyRoot 'publication'; New-Item -ItemType Directory $publication | Out-Null
+    $target = Join-Path $readyRoot 'owned-fixture'
+    Publish-PropertiesReady -FilePath $target -EvidenceDirectory $publication
+    $first = [IO.File]::ReadAllText((Join-Path $publication 'ready.json'))
+    $duplicateRejected = $false
+    try { Publish-PropertiesReady -FilePath $target -EvidenceDirectory $publication } catch { $duplicateRejected = $true }
+    if (-not $duplicateRejected -or [IO.File]::ReadAllText((Join-Path $publication 'ready.json')) -cne $first) {
+        throw 'Readiness publication overwrote an existing marker.'
+    }
+    $cases = @(
+        @{ name = 'delayed-ready'; prepare = 1500; run = 100; code = 0; omit = $false; startup = 15000; runtime = 1000; expected = 'exited' },
+        @{ name = 'ready-error-exit'; prepare = 0; run = 0; code = 7; omit = $false; startup = 15000; runtime = 1000; expected = 'exited' },
+        @{ name = 'early-zero'; prepare = 0; run = 0; code = 0; omit = $true; startup = 15000; runtime = 1000; expected = 'preparation' },
+        @{ name = 'early-error'; prepare = 0; run = 0; code = 7; omit = $true; startup = 15000; runtime = 1000; expected = 'preparation' },
+        @{ name = 'no-ready-timeout'; prepare = 0; run = 30000; code = 0; omit = $true; startup = 100; runtime = 1000; expected = 'preparation' },
+        @{ name = 'runtime-timeout'; prepare = 0; run = 30000; code = 0; omit = $false; startup = 15000; runtime = 100; expected = 'observation' }
+    )
+    foreach ($case in $cases) {
+        $directory = Join-Path $readyRoot $case.name; New-Item -ItemType Directory $directory | Out-Null
+        $child = $null; $timing = @{}; $failure = $null; $forced = $false
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $arguments = @('-NoProfile', '-File', "`"$PSCommandPath`"", '-ReadyChildDirectory', "`"$directory`"",
+                '-ReadyChildFile', "`"$target`"", '-PrepareDelayMs', $case.prepare, '-ObservationDelayMs', $case.run, '-ReadyExitCode', $case.code)
+            if ($case.omit) { $arguments += '-OmitReady' }
+            $child = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -ArgumentList $arguments `
+                -RedirectStandardOutput (Join-Path $directory 'stdout.log') -RedirectStandardError (Join-Path $directory 'stderr.log')
+            try {
+                Wait-PropertiesHelper -Helper $child -FilePath $target -EvidenceDirectory $directory -StartupClock $clock `
+                    -Timing $timing -StartupBudgetMs $case.startup -RuntimeBudgetMs $case.runtime
+            } catch { $failure = $_.Exception.Message }
+            if ($timing.phase -cne $case.expected -or (($null -eq $failure) -ne ($case.expected -eq 'exited'))) {
+                throw "Readiness case $($case.name) differs: $failure"
+            }
+            if ($case.expected -eq 'exited') {
+                if (-not $child.HasExited -or $child.get_ExitCode() -ne $case.code -or $timing.ready.pid -ne $child.Id) {
+                    throw 'Readiness changed child exit semantics or identity.'
+                }
+                if ($case.name -ceq 'delayed-ready' -and $timing.preparationElapsedMs -le $case.runtime) {
+                    throw 'Delayed preparation did not exceed the independent runtime budget.'
+                }
+            }
+        } finally {
+            if ($null -ne $child) {
+                if (-not $child.HasExited) { $forced = $true; $child.Kill(); if (-not $child.WaitForExit(5000)) { throw 'Readiness child termination unconfirmed.' } }
+                $child.Dispose()
+            }
+        }
+        if ($case.name -like '*timeout' -and -not $forced) { throw 'Timeout case did not retain ownership through termination.' }
+    }
+    $invalid = @(
+        { param($r) $r.protocol = 2 }, { param($r) $r.protocol = '1' }, { param($r) $r.pid += 1 },
+        { param($r) $r.file = $r.file + '.other' }, { param($r) $r.evidence = $r.evidence + '.other' },
+        { param($r) $r.phase = 'starting' }, { param($r) $r.readyUtcTicks = 0 },
+        { param($r) $r | Add-Member -NotePropertyName extra -NotePropertyValue 1 }
+    )
+    $index = 0
+    foreach ($change in $invalid) {
+        $directory = Join-Path $readyRoot ('invalid-' + (++$index)); New-Item -ItemType Directory $directory | Out-Null
+        $record = $first | ConvertFrom-Json; $record.evidence = $directory
+        & $change $record
+        $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'ready.json')
+        $rejected = $false; $timing = @{}
+        try { Wait-PropertiesHelper -Helper (Get-Process -Id $PID) -FilePath $target -EvidenceDirectory $directory `
+            -StartupClock ([Diagnostics.Stopwatch]::StartNew()) -Timing $timing -StartupBudgetMs 1000 -RuntimeBudgetMs 1 } catch { $rejected = $true }
+        if (-not $rejected -or $timing.phase -cne 'preparation' -or $timing.ContainsKey('ready')) { throw 'Invalid readiness passed.' }
+    }
+    foreach ($raw in @('{', '[]', 'null')) {
+        $directory = Join-Path $readyRoot ('malformed-' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory $directory | Out-Null
+        [IO.File]::WriteAllText((Join-Path $directory 'ready.json'), $raw)
+        $rejected = $false; $timing = @{}
+        try { Wait-PropertiesHelper -Helper (Get-Process -Id $PID) -FilePath $target -EvidenceDirectory $directory `
+            -StartupClock ([Diagnostics.Stopwatch]::StartNew()) -Timing $timing -StartupBudgetMs 1000 -RuntimeBudgetMs 1 } catch { $rejected = $true }
+        if (-not $rejected -or $timing.phase -cne 'preparation' -or $timing.ContainsKey('ready')) { throw 'Malformed readiness passed.' }
+    }
+    Write-Output 'PASS: atomic readiness, six owned-child preparation/runtime/exit cases, eight binding refusals and malformed markers; native observation remains untested here.'
+} finally { Remove-Item -LiteralPath $readyRoot -Recurse -Force }
