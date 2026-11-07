@@ -2275,6 +2275,13 @@ fn adopt_recovery(offer: &mut Vec<PathBuf>, recovery: Option<&mut autosave::Reco
     }
 }
 
+#[must_use = "consume the host effect at this frame's close admission boundary"]
+enum HostDrainEffect {
+    None,
+    Eof,
+    TransportUnavailable,
+}
+
 pub struct EditorApp {
     remote_quit: RemoteQuit,
     agent_cancel: RemoteAgentCancel,
@@ -2653,10 +2660,11 @@ impl EditorApp {
         }
     }
 
-    fn drain_host(&mut self, ctx: &egui::Context) {
+    fn drain_host(&mut self, ctx: &egui::Context) -> HostDrainEffect {
         let mut drained = Vec::new();
         let mut disconnected = false;
         let mut eof = false;
+        let mut failed = false;
         if let Some(rx) = &self.host_rx {
             loop {
                 match rx.try_recv() {
@@ -2688,6 +2696,7 @@ impl EditorApp {
                 HostMessage::StdinClosed => { disconnected = true; eof = true; }
                 HostMessage::Failed => {
                     disconnected = true;
+                    failed = true;
                     self.notice = "The stdin MCP transport failed; the editor remains open".into();
                 }
             }
@@ -2695,13 +2704,39 @@ impl EditorApp {
         if disconnected {
             self.stdin_closed = true;
             self.host_rx = None;
-            self.sync_panel_drafts();
-            if eof && matches!(self.remote_quit, RemoteQuit::Idle)
-                && editor_view!(self, ctx).quit_refusal(&self.controller).is_none() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else {
-                self.close_blocked = true;
+            if eof && !failed { HostDrainEffect::Eof } else { HostDrainEffect::TransportUnavailable }
+        } else {
+            HostDrainEffect::None
+        }
+    }
+
+    fn finish_close_requests(&mut self, ctx: &egui::Context, host_effect: HostDrainEffect, confirmation_pending: bool) {
+        self.sync_panel_drafts();
+        let native_requested = ctx.input(|input| input.viewport().close_requested());
+        if native_requested && confirmation_pending && self.unsaved.is_none() && !self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else {
+            self.handle_close_request(ctx);
+        }
+        if self.closing && !self.close_sent {
+            self.close_sent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        match host_effect {
+            HostDrainEffect::Eof if !native_requested && !self.closing => {
+                if matches!(self.remote_quit, RemoteQuit::Idle)
+                    && editor_view!(self, ctx).quit_refusal(&self.controller).is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.close_blocked = true;
+                    ctx.request_repaint();
+                }
             }
+            HostDrainEffect::TransportUnavailable => {
+                self.close_blocked = true;
+                ctx.request_repaint();
+            }
+            _ => {},
         }
     }
 
@@ -7758,7 +7793,7 @@ impl eframe::App for EditorApp {
             self.preview_dirty = true;
             self.psd_depth.deliver(&request, &response);
         }
-        self.drain_host(ctx);
+        let host_effect = self.drain_host(ctx);
         self.serve_mcp(ctx);
         self.observe_remote_quit(ctx);
         let approval_path = self.tools.store_path.clone();
@@ -7817,12 +7852,7 @@ impl eframe::App for EditorApp {
         if self.close_blocked && self.controller.can_close() {
             self.close_blocked = false;
         }
-        self.handle_close_request(ctx);
-        if self.closing && !self.close_sent {
-            self.close_sent = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
+        let confirmation_pending = self.unsaved.is_some();
         let format = self.controller.snapshot()["documentFormat"]
             .as_str()
             .unwrap_or("")
@@ -8242,7 +8272,7 @@ impl eframe::App for EditorApp {
         self.can3_delete_dialog(ctx);
         self.draw_recovery_offer(ctx);
         self.guide_settings_window(ctx);
-        self.sync_panel_drafts();
+        self.finish_close_requests(ctx, host_effect, confirmation_pending);
         self.finish_remote_quit(ctx);
     }
 
@@ -12935,6 +12965,7 @@ impl EditorApp {
                         action: PendingAction::Close,
                         dialog: crate::editor_shell::UnsavedDialog::new(project.as_deref()),
                     });
+                    ctx.request_repaint();
                 }
             }
         }
@@ -16556,7 +16587,7 @@ mod shell_flow_tests {
         assert!(app.close_blocked && !app.closing && harness.close_requests == 0);
         let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
         sender.send(HostMessage::StdinClosed).unwrap();
-        harness.frame(Vec::new(), |ctx| app.drain_host(ctx));
+        harness.frame(Vec::new(), |ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(!app.closing && harness.close_requests == 0 && app.forms.has_draft());
         assert!(!target.exists());
         assert_eq!(app.controller.snapshot(), &before);
@@ -16778,7 +16809,7 @@ mod shell_flow_tests {
             assert_eq!(reply["result"]["isError"],true,"{reply}");
         }
         let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
-        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| app.drain_host(ctx));
+        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(app.stdin_closed && app.close_blocked && !app.closing && harness.close_requests == 0);
         assert!(app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
         harness.click(Role::Button,"Reload and discard all object edits",|ctx| draw(&mut app,ctx));
@@ -17040,7 +17071,7 @@ mod shell_flow_tests {
         harness.frame(Vec::new(),|ctx| app.handle_close_request(ctx));
         assert!(app.close_blocked && !app.closing && harness.close_requests==0);
         let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx=Some(receiver);
-        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| app.drain_host(ctx));
+        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(app.stdin_closed && app.close_blocked && !app.closing && harness.close_requests==0);
         assert!(app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
     }
@@ -17226,6 +17257,7 @@ mod shell_flow_tests {
         harness.next_input=Some(Box::new(close));
         harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
         assert!(app.unsaved.is_some());
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
         let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
         let at=crate::editor_test_support::center(&output,Role::Button,"Cancel");
         let press=|pressed|egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed,
@@ -18014,7 +18046,7 @@ mod editor_state_tests {
         app.host_rx = Some(receive); writeln!(writer, "{}", start_message()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_start, RemoteAgentLaunch::Waiting { .. }) {
-            assert!(Instant::now() < deadline); CTX.with(|ctx| app.drain_host(ctx)); std::thread::yield_now();
+            assert!(Instant::now() < deadline); CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None))); std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
         let response:Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
@@ -18983,7 +19015,7 @@ mod editor_state_tests {
         app.host_rx = Some(receive); writeln!(writer, "{}", new_session_message()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_new_session, RemoteAgentLaunch::Waiting { .. }) {
-            assert!(Instant::now() < deadline); CTX.with(|ctx| app.drain_host(ctx)); std::thread::yield_now();
+            assert!(Instant::now() < deadline); CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None))); std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
         let response:Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
@@ -19317,7 +19349,7 @@ mod editor_state_tests {
         let worker=std::thread::spawn(move||crate::editor_stdio::serve_lines(std::io::BufReader::new(reader),output,&host,&egui::Context::default()));
         app.host_rx=Some(receive);writeln!(writer,"{}",send_message(&app)).unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);
-        while !app.agent_send.pending(){assert!(Instant::now()<deadline);CTX.with(|ctx|app.drain_host(ctx));std::thread::yield_now();}
+        while !app.agent_send.pending(){assert!(Instant::now()<deadline);CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));std::thread::yield_now();}
         flush.recv_timeout(Duration::from_secs(5)).unwrap();assert!(!app.agent.state().turn_active);
         let reply:Value=serde_json::from_slice(&bytes.lock().unwrap()).unwrap();assert_eq!(reply["id"],"send-admission");
         while app.agent_send.pending(){assert!(Instant::now()<deadline);finish_agent_send(&mut app);std::thread::yield_now();}
@@ -20195,7 +20227,7 @@ mod editor_state_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_draft, RemoteAgentDraft::Waiting { .. }) {
             assert!(Instant::now() < deadline);
-            CTX.with(|ctx| app.drain_host(ctx));
+            CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));
             std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -20244,7 +20276,7 @@ mod editor_state_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_set, RemoteAgentSet::Waiting { .. }) {
             assert!(Instant::now() < deadline);
-            CTX.with(|ctx| app.drain_host(ctx));
+            CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));
             std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -20845,7 +20877,7 @@ mod editor_state_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_stop, RemoteAgentStop::Waiting { .. }) {
             assert!(Instant::now() < deadline);
-            CTX.with(|ctx| app.drain_host(ctx));
+            CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));
             std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -21313,7 +21345,7 @@ mod editor_state_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(app.agent_cancel, RemoteAgentCancel::Waiting { .. }) {
             assert!(Instant::now() < deadline);
-            CTX.with(|ctx| app.drain_host(ctx));
+            CTX.with(|ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));
             std::thread::yield_now();
         }
         flush.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -24175,7 +24207,7 @@ mod editor_state_tests {
         assert!(!app.closing);
         let (sender, receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
         sender.send(HostMessage::StdinClosed).unwrap();
-        let output = egui::Context::default().run(Default::default(), |ctx| app.drain_host(ctx));
+        let output = egui::Context::default().run(Default::default(), |ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(output.viewport_output.values().all(|view| !view.commands.contains(&egui::ViewportCommand::Close)));
         assert_eq!(document(&app), before);
         app.controller.set_draft_sound_volume(7.0);
@@ -24592,7 +24624,7 @@ mod editor_state_tests {
             harness.frame(Vec::new(),|ctx|app.handle_close_request(ctx));assert!(!app.closing);
             let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);sender.send(HostMessage::StdinClosed).unwrap();
             let ctx=egui::Context::default();
-            let output=ctx.run(egui::RawInput::default(),|ctx|app.drain_host(ctx));
+            let output=ctx.run(egui::RawInput::default(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
             assert!(!output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));
             assert_eq!(document(&app),before);
             if pending {harness.click(Role::Button,"Cancel track deletion",|ctx|draw_can3_scene_gui(&mut app,ctx));}
@@ -24831,7 +24863,7 @@ mod editor_state_tests {
         harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
         harness.frame(Vec::new(),|ctx|app.handle_close_request(ctx));assert!(!app.closing);
         let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);sender.send(HostMessage::StdinClosed).unwrap();
-        let ctx=egui::Context::default();let output=ctx.run(egui::RawInput::default(),|ctx|app.drain_host(ctx));
+        let ctx=egui::Context::default();let output=ctx.run(egui::RawInput::default(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(!output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));assert_eq!(document(&app),before);
         click_curve_delete(&mut app,&mut harness,"scene-guid","track-guid","live2dParam_ParamTest",None);
         harness.click(Role::Button,"Discard new key",|ctx|draw_can3_scene_gui(&mut app,ctx));assert!(app.can3_key_draft.is_some());
@@ -25058,7 +25090,7 @@ mod editor_state_tests {
             harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
             harness.frame(Vec::new(),|ctx|app.handle_close_request(ctx));assert!(!app.closing);
             let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);sender.send(HostMessage::StdinClosed).unwrap();
-            let ctx=egui::Context::default();let output=ctx.run(egui::RawInput::default(),|ctx|app.drain_host(ctx));
+            let ctx=egui::Context::default();let output=ctx.run(egui::RawInput::default(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
             assert!(!output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));assert_eq!(document(&app),before);
             harness.click(Role::Button,if pending {"Cancel curve deletion"} else {"Discard new curve"},|ctx|draw_can3_scene_gui(&mut app,ctx));
             call(&mut app,"new",json!({}));assert!(app.can3_curve_draft.is_none() && app.can3_delete.is_none());
@@ -25293,7 +25325,7 @@ mod editor_state_tests {
         app.host_rx = Some(receiver);
         sender.send(HostMessage::Rpc { request: json!({"jsonrpc":"2.0","id":"quit-red","method":"tools/call",
             "params":{"name":"editor_quit","arguments":{}}}), reply }).unwrap();
-        let output = egui::Context::default().run(Default::default(), |ctx| app.drain_host(ctx));
+        let output = egui::Context::default().run(Default::default(), |ctx| assert!(matches!(app.drain_host(ctx), HostDrainEffect::None)));
         let response = written.try_recv().unwrap().into_message();
         assert_eq!(response.as_ref().unwrap()["result"]["isError"], false, "{response:?}");
         assert!(!app.closing);
@@ -25650,7 +25682,7 @@ mod editor_state_tests {
             assert_eq!(app.remote_quit.state()["state"], "cancelled");
             let (sender, receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
             sender.send(HostMessage::StdinClosed).unwrap();
-            let output = egui::Context::default().run(Default::default(), |ctx| app.drain_host(ctx));
+            let output = egui::Context::default().run(Default::default(), |ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
             assert!(output.viewport_output.values().all(|viewport| !viewport.commands.iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))));
             assert!(!app.closing);
@@ -25774,7 +25806,7 @@ mod editor_state_tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         app.host_rx = Some(receiver);
         sender.send(HostMessage::StdinClosed).unwrap();
-        let output = egui::Context::default().run(Default::default(), |ctx| app.drain_host(ctx));
+        let output = egui::Context::default().run(Default::default(), |ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
         assert!(output.viewport_output.values().all(|viewport| !viewport.commands.iter()
             .any(|command| matches!(command, egui::ViewportCommand::Close))), "active working geometry must survive EOF");
         assert!(app.mesh_tools.captures());
@@ -25797,7 +25829,7 @@ mod editor_state_tests {
             app.host_rx=Some(receiver);
             sender.send(HostMessage::StdinClosed).unwrap();
             let ctx=egui::Context::default();
-            let output=ctx.run(Default::default(),|ctx|app.drain_host(ctx));
+            let output=ctx.run(Default::default(),|ctx| { let effect = app.drain_host(ctx); app.finish_close_requests(ctx, effect, app.unsaved.is_some()); });
             assert!(app.stdin_closed && app.close_blocked);
             assert!(output.viewport_output.values().all(|viewport|!viewport.commands.iter().any(|command|matches!(command,egui::ViewportCommand::Close))));
             assert_eq!(document(&app),before);
