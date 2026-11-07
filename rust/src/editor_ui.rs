@@ -16621,6 +16621,37 @@ mod shell_flow_tests {
         assert_eq!(app.controller.snapshot(),&before); assert!(app.objects.has_draft());
     }
 
+    fn object_draft_during_pending_dialog(close: bool) {
+        let (mut app,_,mut harness) = object_draft_app(if close {"objects-late-close"} else {"objects-late-new"});
+        app.objects.reset();
+        app.command(json!({"op":"live2d.set_id","guid":"mesh-guid","id":"StoredID",
+            "expectedRevision":app.controller.snapshot()["revision"]}));
+        assert!(modified(&app));
+        app.guard_replace(if close {PendingAction::Close} else {PendingAction::Request(json!({"op":"new"}))});
+        assert!(app.unsaved.is_some());
+        fn draw(app: &mut EditorApp,ctx: &egui::Context) {
+            egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+            app.draw_unsaved(ctx);
+        }
+        harness.text("Name","Object input after the dialog opened",|ctx| draw(&mut app,ctx));
+        assert!(app.objects.has_draft());
+        let before = app.controller.snapshot().clone();
+        harness.click(Role::Button,"Don't Save",|ctx| draw(&mut app,ctx));
+        assert!(!app.closing,"a pending action cannot bypass the current object-draft guard");
+        assert_eq!(app.controller.snapshot(),&before,"late input must still block replacement");
+        assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_drafts_late_dialog_input_blocks_closing() {
+        object_draft_during_pending_dialog(true);
+    }
+
+    #[test]
+    fn object_drafts_late_dialog_input_blocks_replacement() {
+        object_draft_during_pending_dialog(false);
+    }
+
     #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
