@@ -354,6 +354,10 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "CAN3 Outline > scene > Delete scene > Confirm scene deletion",
         "Live2D panels",
     ]),
+    ("live2d_animation_sound_volume_set", &[
+        "CAN3 Outline > scene > Sound > Edit fixed volume > Apply",
+        "Live2D panels",
+    ]),
     ("live2d_animation_track_add", &[
         "CAN3 Outline > New CAN3 track > Add CAN3 track",
         "Live2D panels",

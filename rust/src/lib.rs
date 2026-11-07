@@ -836,6 +836,7 @@ impl Session {
             | "live2d.animation.read" | "live2d.animation.key.set" | "live2d.animation.point.set" | "live2d.animation.point.delete" | "live2d.animation.point.add" | "live2d.animation.bindings"
             | "live2d.animation.scene.set" | "live2d.animation.scene.add"
             | "live2d.animation.handle.set" | "live2d.animation.curve_type.set"
+            | "live2d.animation.sound_volume.set"
             | "live2d.animation.key.add" | "live2d.animation.key.delete"
             | "live2d.animation.curve.add" | "live2d.animation.curve.delete"
             | "live2d.animation.track.add" | "live2d.animation.track.delete" | "live2d.animation.track.duplicate"
@@ -996,6 +997,7 @@ impl Session {
             "live2d.physics3.read" => self.physics_source_view(),
             "live2d.physics3.edit" => self.op_physics_source_edit(request),
             "live2d.animation.key.set" => self.op_animation_set_key(request, animation_source::set_key),
+            "live2d.animation.sound_volume.set" => self.op_animation_set_key(request, animation_source::set_sound_volume),
             "live2d.animation.point.set" => self.op_animation_set_key(request, animation_source::set_point),
             "live2d.animation.point.delete" => self.op_animation_set_key(request, animation_source::delete_point),
             "live2d.animation.point.add" => self.op_animation_set_key(request, animation_source::add_point),
@@ -1906,7 +1908,6 @@ impl Session {
         Ok(self.snapshot())
     }
 
-    /// A CAN3 key, handle or curve-type edit, checked against the document revision.
     fn op_animation_set_key(
         &mut self,
         request: &Value,
@@ -1922,6 +1923,9 @@ impl Session {
             return Err("CAN3 key edit revision conflict".into());
         }
         let candidate = edit(&self.document.model, request)?;
+        if request["op"] == "live2d.animation.sound_volume.set" && candidate == self.document.model {
+            self.document.validate_sound_volume_target(request)?;
+        }
         self.commit_model(candidate)?;
         Ok(self.snapshot())
     }

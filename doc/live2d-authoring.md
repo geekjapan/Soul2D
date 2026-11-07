@@ -68,14 +68,47 @@ deletion. Shared or externally referenced owned storage is refused before histor
 changes; referenced attribute-map keys remain unsupported.
 
 `soundTracks` lists existing Sound track `guid`, `name`, `resourceGuid`, `start`,
-`internalOffset` and `duration`. `live2d.animation.track.delete` can remove a
+`internalOffset` and `duration`, plus optional `fixedVolumeDb` for the bounded
+locally readable fixed-volume layout. Presence does not guarantee editability;
+mutation also checks complete source ownership. Omission means unsupported local
+storage, not zero volume. Ordinary reads avoid document-wide ownership proofs
+for every displayed track.
+`live2d.animation.track.delete` can remove a
 track with one SoundDefault effect and one fixed volume attribute. The track,
 its GUID, effect and volume definition are removed with the source/group members.
 Linked audio resources and shared identity objects stay, even after their final
 track is deleted. Additional effects, shared mutable storage, inconsistent
-memberships and outside references are refused. Retained Sound rows cannot be
-edited or reordered. Sound creation, volume editing and audio playback
-are unsupported.
+memberships and outside references are refused. Sound creation, key editing,
+reordering and audio playback are unsupported.
+
+`live2d.animation.sound_volume.set {sceneGuid, trackGuid, value, expectedRevision}`
+and MCP `live2d_animation_sound_volume_set` change one existing fixed volume in dB.
+The value must be finite and in the inclusive range -48 to 6; it is never clamped.
+The source must have private, consistent SoundDefault ownership, an inline
+`CFixedSequence` with three equal plain `d` values (`baseValue`, `curMin`, `curMax`),
+and explicit standard attribute limits (`rangeMin=-48`, `rangeMax=6`,
+`isRepeat=false`, `repeatMin=-Double.MAX_VALUE`, `repeatMax=Double.MAX_VALUE`).
+Missing, custom, duplicated, referenced or malformed numeric/constraint storage,
+recognized read-only/guide overrides and non-null key-form linkage are refused.
+These stricter volume requirements do not tighten existing copy/delete support.
+
+The edit changes only the three numeric payloads to the same value. It preserves
+track-level `defaultVolume`, timing, speed, start frame, resources and unrelated
+XML. Current-revision equality is a no-op; stale or unsupported equality refuses.
+Equal-value requests prove the target in the encoded current document, including
+unsaved copies, before the history shortcut. Readable externally referenced
+storage refuses both equal and changed requests without losing the draft.
+One Session transaction provides Undo/Redo, unsaved-copy composition and native
+save/reopen. It takes no frame or curve selector and does not create Sound or
+LipSync keys. Audio paths are never opened; stored edits do not establish audio
+playback equivalence or Cubism save acceptance.
+
+The editor exposes **Sound > Edit fixed volume... > Fixed volume (dB) > Apply**
+in CAN3 Outline. Input stays in a revision-bound controller draft until Apply;
+invalid, refused and stale drafts remain available for correction or Discard.
+Dirty drafts retain the existing file-operation, reselection and exit guards.
+The owned fixture `rust/tests/fixtures/can3-sound-volume.xml` is shared by backend,
+controller, accessible egui and real HTTP MCP tests in the supported-host Rust CI.
 
 `guideTracks` lists existing GuideImage tracks with the same six identity and timing
 fields as `soundTracks`, plus the six supported scalar `visualCurves` described below.
@@ -182,6 +215,9 @@ unknown references and shared mutable storage are refused. The copy
 has fresh private identities and serial numbers, while keeping its linked resource,
 timing, full keys and cache bytes. Duplication, including a copy of an unsaved copy,
 is one undo step. Copies survive deletion of their donor and save/reopen.
+Supported Sound fixed-volume edits remain independent across edited donors,
+unsaved copies and copies of copies. The final ordinary writer applies each
+surviving track's current volume after materializing its original donor XML.
 
 CAN3 recovery through `open {path, as}` accepts a saved baseline only if the opened
 document can reproduce its bytes with the baseline's projected model. Unprojected
@@ -296,7 +332,7 @@ The existing segment check runs when the prior affected segment was valid. Endpo
 the final stored type are editable without an interval. Same-frame canonical recreation and new
 keys can receive later handle/type edits before saving. New float scalar writes that overflow finite
 32-bit storage are refused; existing raw scalar units and decimal tokens otherwise retain their current
-handling. Sound controls remain unsupported. Dedicated Image/Guide handle/type editor controls and
+handling. Sound key controls remain unsupported. Dedicated Image/Guide handle/type editor controls and
 Cubism playback equivalence remain unverified.
 `python3 -I tools/verify-can3-image-controls.py --core ./out/rust/debug/soul2d-core --njc ./out/rust/debug/njc`
 checks an owned Image fixture over HTTP MCP on Linux/macOS. It verifies key insertion, handle/type edits,

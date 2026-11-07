@@ -3365,7 +3365,7 @@
       ]
     },
     {
-      "description": "Read CAN3 scenes, model tracks and existing parameter keys without changing the active session. scene.imageTracks separately lists image-track identity, timing, visualCurves and pointChannels for stored xy/anchor coordinates. scene.soundTracks lists existing Sound track guid, name, resourceGuid, start, internalOffset and duration for deletion; it does not decode audio or expose volume. scene.guideTracks lists the same identity and timing fields plus six supported visualCurves and pointChannels for stored xy/anchor coordinates of existing GuideImage tracks; guide directories are never opened. Unsupported or malformed Image/Guide scalar channels are omitted; budget exhaustion fails the read. imageResources lists linked image GUIDs and names/sourceFile paths only where stored; paths are literal and never opened. Values and frames retain stored units; control positions and flags are not evaluated. scene.loop, scene.tag and a parameter curve's baseValue appear only where the file stores them. Does not load linked models, play animation, edit keys, or establish Cubism compatibility.",
+      "description": "Read CAN3 scenes, model tracks and existing parameter keys without changing the active session. scene.imageTracks separately lists image-track identity, timing, visualCurves and pointChannels for stored xy/anchor coordinates. scene.soundTracks lists existing Sound track guid, name, resourceGuid, start, internalOffset and duration, plus fixedVolumeDb for bounded locally readable fixed-volume storage with explicit standard limits. Its presence does not guarantee editability. Mutation also checks complete source ownership. Omitted fixedVolumeDb means unsupported local storage, not zero volume. Audio is never opened. scene.guideTracks lists the same identity and timing fields plus six supported visualCurves and pointChannels for stored xy/anchor coordinates of existing GuideImage tracks; guide directories are never opened. Unsupported or malformed optional scalar channels are omitted; budget exhaustion fails the read. imageResources lists linked image GUIDs and names/sourceFile paths only where stored; paths are literal and never opened. Values and frames retain stored units; control positions and flags are not evaluated. scene.loop, scene.tag and a parameter curve's baseValue appear only where the file stores them. Does not load linked models, play animation, edit keys, or establish Cubism compatibility.",
       "effect": "-",
       "headless_ok": true,
       "id": "Live2DCommand_AnimationRead",
@@ -14059,7 +14059,7 @@
       ]
     },
     {
-      "description": "Move one Bezier handle of an existing CAN3 parameter, modern PartOpacity or legacy-colon or underscore-map PartOpacity key, or supported Image/Guide visual scalar key: side previous or next, frame (fractional) and value, with shared revision, undo/redo and native save. Give at least one of frame and value. A smooth or Bezier segment the handle shapes must stay in frame order if it was. Save rewrites only the handle's posF and doubleValue; its integer pos and isPosOptimized and every other stored field stay as they are. Image/Guide use the six visualCurves IDs and reject partOpacityMapKey; Image requires owned consistent attribute references, and Guide requires complete supported ownership. New float scalar writes must fit finite 32-bit storage. Sound controls remain unsupported. This edits stored controls without proving Image/Guide interpolation or playback equivalence. For underscore-map channels, optional partOpacityMapKey selects the exact raw map key and is required when curveId is ambiguous; a supplied selector never falls back.",
+      "description": "Move one Bezier handle of an existing CAN3 parameter, modern PartOpacity or legacy-colon or underscore-map PartOpacity key, or supported Image/Guide visual scalar key: side previous or next, frame (fractional) and value, with shared revision, undo/redo and native save. Give at least one of frame and value. A smooth or Bezier segment the handle shapes must stay in frame order if it was. Save rewrites only the handle's posF and doubleValue; its integer pos and isPosOptimized and every other stored field stay as they are. Image/Guide use the six visualCurves IDs and reject partOpacityMapKey; Image requires owned consistent attribute references, and Guide requires complete supported ownership. New float scalar writes must fit finite 32-bit storage. Sound key controls remain unsupported. This edits stored controls without proving Image/Guide interpolation or playback equivalence. For underscore-map channels, optional partOpacityMapKey selects the exact raw map key and is required when curveId is ambiguous; a supplied selector never falls back.",
       "effect": "document-edit",
       "guiEntry": [
         "CAN3 Outline > scene > track > curve > Edit previous/next handle > Apply"
@@ -14503,7 +14503,7 @@
       ]
     },
     {
-      "description": "Read CAN3 scenes, model tracks and existing parameter keys without changing the active session. scene.imageTracks separately lists image-track identity, timing, visualCurves and pointChannels for stored xy/anchor coordinates. scene.soundTracks lists existing Sound track guid, name, resourceGuid, start, internalOffset and duration for deletion; it does not decode audio or expose volume. scene.guideTracks lists the same identity and timing fields plus six supported visualCurves and pointChannels for stored xy/anchor coordinates of existing GuideImage tracks; guide directories are never opened. Unsupported or malformed Image/Guide scalar channels are omitted; budget exhaustion fails the read. imageResources lists linked image GUIDs and names/sourceFile paths only where stored; paths are literal and never opened. Values and frames retain stored units; control positions and flags are not evaluated. scene.loop, scene.tag and a parameter curve's baseValue appear only where the file stores them. Does not load linked models, play animation, edit keys, or establish Cubism compatibility.",
+      "description": "Read CAN3 scenes, model tracks and existing parameter keys without changing the active session. scene.imageTracks separately lists image-track identity, timing, visualCurves and pointChannels for stored xy/anchor coordinates. scene.soundTracks lists existing Sound track guid, name, resourceGuid, start, internalOffset and duration, plus fixedVolumeDb for bounded locally readable fixed-volume storage with explicit standard limits. Its presence does not guarantee editability. Mutation also checks complete source ownership. Omitted fixedVolumeDb means unsupported local storage, not zero volume. Audio is never opened. scene.guideTracks lists the same identity and timing fields plus six supported visualCurves and pointChannels for stored xy/anchor coordinates of existing GuideImage tracks; guide directories are never opened. Unsupported or malformed optional scalar channels are omitted; budget exhaustion fails the read. imageResources lists linked image GUIDs and names/sourceFile paths only where stored; paths are literal and never opened. Values and frames retain stored units; control positions and flags are not evaluated. scene.loop, scene.tag and a parameter curve's baseValue appear only where the file stores them. Does not load linked models, play animation, edit keys, or establish Cubism compatibility.",
       "effect": "-",
       "headless_ok": true,
       "id": "live2d_animation_read",
@@ -14709,6 +14709,49 @@
       ]
     },
     {
+      "description": "Set an existing CAN3 Sound track's fixedVolumeDb in one undo step. Requires matching expectedRevision and a finite value from -48 to 6 dB. Only the evidenced owned inline Fixed layout with explicit standard range/repeat metadata and equal baseValue/curMin/curMax is editable; absent, custom, malformed, shared or aliased storage is refused. Changes those three numeric payloads equally, preserving timing, defaultVolume, resources and unrelated XML. Composes with unsaved Sound copies and supports Undo/Redo and native save/reopen. Takes no frame or curve selector; does not create keys, open audio, prove playback or claim Cubism acceptance.",
+      "effect": "document-edit",
+      "guiEntry": [
+        "CAN3 Outline > scene > Sound > Edit fixed volume > Apply",
+        "Live2D panels"
+      ],
+      "headless_ok": true,
+      "id": "live2d_animation_sound_volume_set",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sceneGuid": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "trackGuid": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "value": {
+            "maximum": 6,
+            "minimum": -48,
+            "type": "number"
+          }
+        },
+        "required": [
+          "sceneGuid",
+          "trackGuid",
+          "value",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Add an empty CAN3 model track to an existing scene using an existing linked-model resource. Requires sceneGuid, resourceGuid, name and matching expectedRevision. Returns a session snapshot plus trackGuid. The track gets a new GUID, starts at frame 0 with offset 0, and uses the scene duration. Save copies a model track the file already stores, preferably from the same scene, with its effects, a new CTrackGuid, fresh xs.idx and empty curve lists, and adds it to the scene's root group; the synthetic layout is used only when the scene has no root group or no such track. Preserves unrelated native data and provides one undo step. Does not add model resources or claim Cubism vendor acceptance.",
       "effect": "document-edit",
       "guiEntry": [
@@ -14748,7 +14791,7 @@
       ]
     },
     {
-      "description": "Delete one owned CAN3 Model, Image, supported Sound or supported GuideImage track. Model tracks include owned parameter and modern, legacy-colon and underscore-map PartOpacity definitions; image tracks include their owned VisualDefault attributes. Requires sceneGuid, unique trackGuid and matching expectedRevision. Part maps use exact stored identities; mapped members may be absent or one bare reference. Refuses unowned entries, shared or nested shared storage, referenced map keys and outside references; the effect-kind ids and attribute-map keys Cubism shares across tracks stay, and a null sequence backlink is accepted for older track families. Inline unshared Part inheritance is supported. A track's parameter controls go with it: its ParamCtrlGroups effect and attributes, its marker and point GUIDs, the scene's calculation-order entries naming it, and group heads and drawable identities no other track names. Local FormEdit data with distinct shared keyform and frame definitions is supported when time-remapping links, frame caches and ownership agree; retained form and object identities stay. Empty inline keyforms with private dummy-owned remapping attributes and sparse maps of shared-root attributes are supported; their lists, caches, identities and exclusive references must agree. Foreign parameter-group frame-step attributes remain unchanged and must not reference deleted storage; same-owner attributes use ordinary ownership checks. Global form maps and nonempty inline keyforms are refused. Preserves unrelated XML and linked resources and provides one undo step. Sound deletion requires exactly one SoundDefault effect and one fixed volume attribute; its four private definitions are removed while linked resources and shared identities remain. GuideImage deletion requires the evidenced VisualDefault and GuideImageDefault layout with eleven attributes, including distinct list and named image-number attributes; fifteen private definitions are removed, preserving the linked guide-directory resource. Sound and Guide creation and playback, and Sound key/volume editing remain unsupported. Cubism vendor acceptance is not run.",
+      "description": "Delete one owned CAN3 Model, Image, supported Sound or supported GuideImage track. Model tracks include owned parameter and modern, legacy-colon and underscore-map PartOpacity definitions; image tracks include their owned VisualDefault attributes. Requires sceneGuid, unique trackGuid and matching expectedRevision. Part maps use exact stored identities; mapped members may be absent or one bare reference. Refuses unowned entries, shared or nested shared storage, referenced map keys and outside references; the effect-kind ids and attribute-map keys Cubism shares across tracks stay, and a null sequence backlink is accepted for older track families. Inline unshared Part inheritance is supported. A track's parameter controls go with it: its ParamCtrlGroups effect and attributes, its marker and point GUIDs, the scene's calculation-order entries naming it, and group heads and drawable identities no other track names. Local FormEdit data with distinct shared keyform and frame definitions is supported when time-remapping links, frame caches and ownership agree; retained form and object identities stay. Empty inline keyforms with private dummy-owned remapping attributes and sparse maps of shared-root attributes are supported; their lists, caches, identities and exclusive references must agree. Foreign parameter-group frame-step attributes remain unchanged and must not reference deleted storage; same-owner attributes use ordinary ownership checks. Global form maps and nonempty inline keyforms are refused. Preserves unrelated XML and linked resources and provides one undo step. Sound deletion requires exactly one SoundDefault effect and one fixed volume attribute; its four private definitions are removed while linked resources and shared identities remain. GuideImage deletion requires the evidenced VisualDefault and GuideImageDefault layout with eleven attributes, including distinct list and named image-number attributes; fifteen private definitions are removed, preserving the linked guide-directory resource. Sound and Guide creation and playback, and Sound key editing remain unsupported. Cubism vendor acceptance is not run.",
       "effect": "document-edit",
       "guiEntry": [
         "CAN3 Outline > scene > Image row > Delete image track > Confirm track deletion",

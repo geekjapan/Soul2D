@@ -20,6 +20,7 @@ enum OwnedDraft {
     Can3Anchor { curve_id: String, map_key: Option<String>, frame: i64, original: f64, value: f64 },
     Can3Handle { target: Can3KeyTarget, side: Can3HandleSide, original: Can3HandlePoint, value: Can3HandlePoint },
     Can3CurveType { target: Can3KeyTarget, original: Can3CurveType, value: Can3CurveType },
+    Can3SoundVolume { scene_guid: String, track_guid: String, original: f64, value: f64 },
 }
 
 impl From<DraftView<'_>> for OwnedDraft {
@@ -34,6 +35,9 @@ impl From<DraftView<'_>> for OwnedDraft {
             },
             DraftView::Can3CurveType { target, original, value } => Self::Can3CurveType {
                 target: target.clone(), original, value,
+            },
+            DraftView::Can3SoundVolume { scene_guid, track_guid, original, value } => Self::Can3SoundVolume {
+                scene_guid: scene_guid.to_owned(), track_guid: track_guid.to_owned(), original, value,
             },
         }
     }
@@ -4035,6 +4039,7 @@ impl EditorApp {
 
     fn can3_tree(&mut self, ui: &mut egui::Ui) {
         let mut scalar_action = None;
+        let mut sound_volume = None;
         let mut delete = None;
         let mut delete_track = None;
         let mut delete_curve = None;
@@ -4118,6 +4123,25 @@ impl EditorApp {
                                     }
                                 });
                         }
+                        for track in scene["soundTracks"].as_array().into_iter().flatten() {
+                            let track_guid = track["guid"].as_str().unwrap_or_default();
+                            let name = track["name"].as_str().unwrap_or(track_guid);
+                            egui::CollapsingHeader::new(format!("Sound: {name}"))
+                                .id_salt((&scene_guid, "soundTracks", track_guid)).show(ui, |ui| {
+                                    ui.label(format!("Track GUID: {track_guid}"));
+                                    ui.label(format!("Sound resource GUID: {}", track["resourceGuid"].as_str().unwrap_or_default()));
+                                    ui.label(format!("Start {}, offset {}, duration {}",
+                                        track["start"], track["internalOffset"], track["duration"]));
+                                    if let Some(value) = track["fixedVolumeDb"].as_f64() {
+                                        ui.label(format!("Fixed volume: {value} dB"));
+                                        if ui.add_enabled(can_edit, egui::Button::new("Edit fixed volume...")).clicked() {
+                                            sound_volume = Some((scene_guid.clone(), track_guid.to_owned()));
+                                        }
+                                    } else {
+                                        ui.label("Fixed volume unavailable");
+                                    }
+                                });
+                        }
                         for track in scene["tracks"].as_array().into_iter().flatten() {
                             let track_guid =
                                 track["guid"].as_str().unwrap_or("").to_owned();
@@ -4172,6 +4196,12 @@ impl EditorApp {
             }
         } else {
             ui.label("CAN3 model lacks scenes.");
+        }
+        if let Some((scene, track)) = sound_volume {
+            match self.controller.select_can3_sound_volume(&scene, &track) {
+                Ok(()) => self.notice.clear(),
+                Err(message) => self.notice = message,
+            }
         }
         match scalar_action {
             Some(Can3ScalarAction::Select(target, Can3ScalarKind::Anchor)) => {
@@ -4611,7 +4641,7 @@ impl EditorApp {
         stale: bool,
     ) {
         let Some(mut draft) = draft else {
-            ui.label("No draft selected. Edit an INX node or a CAN3 key.");
+            ui.label("No draft selected. Edit an INX node or a CAN3 value.");
             return;
         };
         match &mut draft {
@@ -4666,15 +4696,20 @@ impl EditorApp {
                     self.controller.set_draft_curve_type(*value);
                 }
             }
+            OwnedDraft::Can3SoundVolume { scene_guid, track_guid, original, value } => {
+                ui.label(format!("Sound {track_guid} in scene {scene_guid} (was {original} dB)"));
+                let label = ui.label("Fixed volume (dB)");
+                if ui.add(egui::DragValue::new(value).speed(0.1)).labelled_by(label.id).changed() {
+                    self.remote_quit.cancel("sound_volume_draft_changed");
+                    self.controller.set_draft_sound_volume(*value);
+                }
+                ui.label("Allowed range: -48 to 6 dB");
+            }
         }
-        let finite = match &draft {
-            OwnedDraft::Can3Anchor { value, .. } => value.is_finite(),
-            OwnedDraft::Can3Handle { value, .. } => value.is_finite(),
-            OwnedDraft::NodeName { .. } | OwnedDraft::Can3CurveType { .. } => true,
-        };
+        let valid = self.controller.draft_valid();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(dirty && !stale && finite, egui::Button::new(tr("Apply")))
+                .add_enabled(dirty && !stale && valid, egui::Button::new(tr("Apply")))
                 .clicked()
             {
                 let response = self.controller.apply_draft();
@@ -23317,6 +23352,108 @@ mod editor_state_tests {
         harness.frame(vec![egui::Event::AccessKitActionRequest(ActionRequest {
             action: Action::SetValue, target, data: Some(ActionData::NumericValue(value)),
         })], |ctx| draw_can3_scalar_gui(app, ctx));
+    }
+
+    #[test]
+    fn can3_sound_fixed_volume_gui_edits_through_accessible_widgets_and_reopens() {
+        use crate::editor_test_support::{has, Harness};
+        use egui::accesskit::Role;
+        let name = "sound-volume-gui";
+        let mut app = can3_app_with_xml(name, include_str!("../tests/fixtures/can3-sound-volume.xml"));
+        let baseline = app.controller.snapshot()["model"].clone();
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1600.0, 4000.0);
+        harness.click(Role::Button, "Scene", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        harness.click(Role::Button, "Sound: Sound 0", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        harness.click(Role::Button, "Edit fixed volume...", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        let output = harness.frame(Vec::new(), |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        assert!(has(&output, Role::SpinButton, "Fixed volume (dB)"));
+        set_can3_scalar_number(&mut app, &mut harness, "Fixed volume (dB)", -12.125);
+        assert_eq!(app.controller.snapshot()["model"], baseline);
+        assert!(app.controller.draft_dirty());
+        harness.click(Role::Button, "Apply", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        let mut expected = baseline.clone();
+        expected["scenes"][0]["soundTracks"][0]["fixedVolumeDb"] = json!(-12.125);
+        assert_eq!(app.controller.snapshot()["model"], expected);
+        assert!(app.controller.draft_view().is_none());
+        app.command(json!({"op":"undo"}));
+        assert_eq!(app.controller.snapshot()["model"], baseline);
+        app.command(json!({"op":"redo"}));
+        let saved = temp_dir(name).join("saved.can3");
+        app.command(json!({"op":"save","path":saved}));
+        assert!(saved.exists(), "{}", app.controller.status());
+        app.command(json!({"op":"open","path":saved}));
+        assert_eq!(app.controller.snapshot()["model"], expected);
+    }
+
+    #[test]
+    fn can3_sound_fixed_volume_gui_retains_invalid_stale_file_and_quit_drafts() {
+        use crate::editor_test_support::{has, Harness};
+        use egui::accesskit::Role;
+        let name = "sound-volume-guards";
+        let xml = include_str!("../tests/fixtures/can3-sound-volume.xml")
+            .replacen("<d xs.n=\"rangeMin\">-48</d>", "", 1);
+        let mut app = can3_app_with_xml(name, &xml);
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1600.0, 4000.0);
+        harness.click(Role::Button, "Scene", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        let output = harness.click(Role::Button, "Sound: Sound 0", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        assert!(!has(&output, Role::Button, "Edit fixed volume..."));
+        app.controller.select_can3_sound_volume("scene-guid", "sound-guid-1").unwrap();
+        request_quit(&mut app).write_line(&mut Vec::new()).unwrap();
+        assert!(matches!(app.remote_quit, RemoteQuit::Waiting { .. }));
+        set_can3_scalar_number(&mut app, &mut harness, "Fixed volume (dB)", -12.0);
+        assert!(matches!(&app.remote_quit, RemoteQuit::Cancelled { reason, .. } if reason == "sound_volume_draft_changed"));
+        assert_eq!(finish_quit(&mut app), 0);
+        let before = document(&app);
+        let saved = temp_dir(name).join("refused.can3");
+        assert_eq!(refused(&mut app, "save", json!({"path":saved})), FILE_OP_BLOCKED_MESSAGE);
+        assert_eq!(refused(&mut app, "new", json!({})), FILE_OP_BLOCKED_MESSAGE);
+        assert!(!saved.exists());
+        assert_eq!(request_quit(&mut app).into_message().unwrap()["result"]["isError"], true);
+        harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT)
+            .or_default().events.push(egui::ViewportEvent::Close)));
+        harness.frame(Vec::new(), |ctx| app.handle_close_request(ctx));
+        assert!(!app.closing);
+        let (sender, receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap();
+        let output = egui::Context::default().run(Default::default(), |ctx| app.drain_host(ctx));
+        assert!(output.viewport_output.values().all(|view| !view.commands.contains(&egui::ViewportCommand::Close)));
+        assert_eq!(document(&app), before);
+        app.controller.set_draft_sound_volume(7.0);
+        let output = harness.frame(Vec::new(), |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        assert!(has(&output, Role::SpinButton, "Fixed volume (dB)"));
+        assert!(!app.controller.draft_valid());
+        assert_eq!(app.controller.apply_draft()["succeeded"], false);
+        assert_eq!(document(&app), before);
+        app.controller.set_draft_sound_volume(-12.0);
+        let revision = app.controller.snapshot()["revision"].clone();
+        app.command(json!({"op":"live2d.animation.scene.set","sceneGuid":"scene-guid",
+            "name":"Concurrent","expectedRevision":revision}));
+        let changed = document(&app);
+        assert!(app.controller.draft_stale());
+        assert_eq!(app.controller.apply_draft()["succeeded"], false);
+        assert_eq!(document(&app), changed);
+        harness.click(Role::Button, "Discard", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        assert!(app.controller.draft_view().is_none());
+        assert_eq!(document(&app), changed);
+    }
+
+    #[test]
+    fn can3_sound_fixed_volume_gui_retains_a_readable_but_unowned_edit() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let xml = include_str!("../tests/fixtures/can3-sound-volume.xml")
+            .replace("</shared>", "<CMvAttrF xs.ref=\"volume-0\"/></shared>");
+        let mut app = can3_app_with_xml("sound-volume-unowned", &xml);
+        let before = document(&app);
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1600.0, 4000.0);
+        harness.click(Role::Button, "Scene", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        harness.click(Role::Button, "Sound: Sound 0", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        harness.click(Role::Button, "Edit fixed volume...", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        set_can3_scalar_number(&mut app, &mut harness, "Fixed volume (dB)", -12.0);
+        harness.click(Role::Button, "Apply", |ctx| draw_can3_scalar_gui(&mut app, ctx));
+        assert_eq!(document(&app), before);
+        assert!(app.controller.draft_dirty());
+        assert!(matches!(app.controller.draft_view(), Some(DraftView::Can3SoundVolume { value:-12.0, .. })));
     }
 
     #[test]

@@ -97,6 +97,20 @@ and parent group, preserving its timing, keys and caches while allocating privat
 both distinct image-number attributes and the linked directory resource without opening the directory.
 Sound copies require one SoundDefault effect with fixed volume and clone four private definitions, preserving
 speed, default volume and volume caches without opening audio paths.
+`fixedVolumeDb` is a bounded locally readable Sound volume. Presence does not
+guarantee editability; the setter also checks complete source ownership.
+`live2d_animation_sound_volume_set {sceneGuid, trackGuid, value, expectedRevision}`
+changes its frame-independent volume from -48 to 6 dB. Omission means unsupported
+local storage, not zero.
+Only explicit standard limits, equal inline double caches and complete owned
+SoundDefault storage are supported. No frame/curve selector or missing-limit
+repair is accepted. The three numeric payloads change together; defaultVolume,
+timing, resources and unrelated bytes remain. Invalid/stale/unsupported requests
+refuse atomically, including equal-value requests; supported current equality is
+a no-op after proof against the encoded current document, including pending copies.
+Unsaved-copy composition, Undo/Redo and save/reopen use the same Session
+operation as the native Fixed volume (dB) draft. Audio is never opened; Sound
+keys, LipSync keys, playback equivalence and Cubism acceptance are not established.
 Copies of unsaved copies work, and deleting a donor does not remove its copies. Other effects, shared mutable
 storage and unknown references are refused. Read back the new `trackGuid`, then undo/redo or save/reopen.
 
@@ -178,6 +192,7 @@ other open creation drafts remain intact and become stale when the document revi
 | `live2d_animation_advance` | `{dt, loop}` looping uses the scene frame duration. |
 | `live2d_animation_reset` | `{}` clears only the session preview values. |
 | `live2d_animation_key_set` / `Live2DCommand_AnimationKeySet` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, value, expectedRevision}` |
+| `live2d_animation_sound_volume_set` | `{sceneGuid, trackGuid, value, expectedRevision}` changes supported `soundTracks[].fixedVolumeDb` in -48..6 dB, with explicit standard native limits and owned equal inline Fixed caches. No key/frame/curve selector or audio loading. |
 | `live2d_animation_point_set` | `{sceneGuid, trackGuid, curveId, anchorFrame, x, y, expectedRevision}` edits existing Image or supported Guide `xy` or `anchor` points. |
 | `live2d_animation_point_delete` | `{sceneGuid, trackGuid, curveId, anchorFrame, expectedRevision}` deletes one existing Image or supported Guide `xy` or `anchor` point; preserves an empty channel. |
 | `live2d_animation_point_add` | `{sceneGuid, trackGuid, curveId, anchorFrame, x, y, corner, expectedRevision}` adds an explicit point to a supported Image/Guide channel with increasing frames. |
@@ -190,7 +205,7 @@ other open creation drafts remain intact and become stale when the document revi
 | `live2d_animation_image_resource_relink` | `{resourceGuid, imagePath, expectedRevision}` validates a static PNG/JPEG and changes only an existing Image resource's stored path. Every track sharing the resource uses the link. Keeps name, keys and transforms; one undo step, matching path is a no-op. Requires a plain unshared stored path. Does not resize or recenter. |
 | `live2d_animation_track_add` | `{sceneGuid, resourceGuid, name, expectedRevision}` adds an empty model track. |
 | `live2d_animation_track_duplicate` | `{sceneGuid, trackGuid, name, expectedRevision}` copies an owned Image, supported Guide or supported Sound track, preserving its stored keys, caches and linked resource. Returns the new `trackGuid`. |
-| `live2d_animation_track_delete` | `{sceneGuid, trackGuid, expectedRevision}` deletes an owned Model, Image, supported Sound or supported GuideImage track, retaining linked resources and shared identities. Read IDs from `tracks`, `imageTracks`, `soundTracks` or `guideTracks`. Local FormEdit data supports distinct shared keyforms and frames with matching time-remapping links and caches; empty inline keyforms with exclusively owned dummy remapping attributes and sparse maps are also supported. Foreign parameter-group frame-step attributes are preserved; same-owner attributes use ordinary ownership checks. Global maps, nonempty inline keyforms and outside references into deleted storage are refused. Sound requires one SoundDefault effect and one fixed volume attribute. GuideImage requires VisualDefault and GuideImageDefault with eleven owned attributes, including separate list and named image-number attributes. Guide directories are never opened. Sound/Guide creation and playback, Sound key/volume edits remain unsupported. |
+| `live2d_animation_track_delete` | `{sceneGuid, trackGuid, expectedRevision}` deletes an owned Model, Image, supported Sound or supported GuideImage track, retaining linked resources and shared identities. Read IDs from `tracks`, `imageTracks`, `soundTracks` or `guideTracks`. Local FormEdit data supports distinct shared keyforms and frames with matching time-remapping links and caches; empty inline keyforms with exclusively owned dummy remapping attributes and sparse maps are also supported. Foreign parameter-group frame-step attributes are preserved; same-owner attributes use ordinary ownership checks. Global maps, nonempty inline keyforms and outside references into deleted storage are refused. Sound requires one SoundDefault effect and one fixed volume attribute. GuideImage requires VisualDefault and GuideImageDefault with eleven owned attributes, including separate list and named image-number attributes. Guide directories are never opened. Sound/Guide creation and playback, and Sound key edits remain unsupported. |
 | `live2d_animation_handle_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, side, expectedRevision}` plus at least one of `frame`, `value`; Model or supported Image/Guide scalar. Image/Guide reject the Part selector. |
 | `live2d_animation_curve_type_set` | `{sceneGuid, trackGuid, curveId, partOpacityMapKey?, anchorFrame, type, expectedRevision}`; Model or supported Image/Guide scalar. Image/Guide reject the Part selector. |
 | `live2d_animation_scene_set` | `{sceneGuid, expectedRevision}` plus at least one of `name`, `fps`, `durationFrames`, `loop`, `tag` |

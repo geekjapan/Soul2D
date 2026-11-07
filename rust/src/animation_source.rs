@@ -16,6 +16,35 @@ pub(crate) fn set_key(model: &Value, request: &Value) -> Result<Value, String> {
     })
 }
 
+pub(crate) struct SoundVolumeDb(f64);
+
+impl SoundVolumeDb {
+    pub(crate) fn parse(value: f64) -> Result<Self, String> {
+        if !value.is_finite() || !(-48.0..=6.0).contains(&value) {
+            return Err("Sound fixed volume must be finite and between -48 and 6 dB".into());
+        }
+        Ok(Self(value))
+    }
+}
+
+pub(crate) fn set_sound_volume(model: &Value, request: &Value) -> Result<Value, String> {
+    let allowed = ["op", "sceneGuid", "trackGuid", "value", "expectedRevision"];
+    let fields = request.as_object().ok_or("Sound volume edit must be an object")?;
+    if fields.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("Sound volume edit carries an unknown field".into());
+    }
+    if model["format"] != "live2d.animation.source.v1" {
+        return Err("Sound volume editing requires a CAN3 source model".into());
+    }
+    let value = SoundVolumeDb::parse(finite(&request["value"])?)?;
+    let mut candidate = model.clone();
+    let scene = select_json(&mut candidate["scenes"], "guid", request, "sceneGuid")?;
+    let track = select_json(&mut scene["soundTracks"], "guid", request, "trackGuid")?;
+    SoundVolumeDb::parse(finite(track.get("fixedVolumeDb").ok_or("Sound fixed volume is unsupported")?)?)?;
+    track["fixedVolumeDb"] = json!(value.0);
+    Ok(candidate)
+}
+
 pub(crate) fn set_point(model: &Value, request: &Value) -> Result<Value, String> {
     edit_visual_point(model, request, VisualPointEdit::Set)
 }
@@ -1306,6 +1335,12 @@ pub(crate) fn rewrite_with_copies(
         if matches!(copy.family, CopyFamily::Image | CopyFamily::Guide) {
             metadata["pointChannels"] = current["pointChannels"].clone();
         }
+        if copy.family == CopyFamily::Sound
+            && metadata.get("fixedVolumeDb").is_some() && current.get("fixedVolumeDb").is_some()
+        {
+            SoundVolumeDb::parse(finite(&current["fixedVolumeDb"])?)?;
+            metadata["fixedVolumeDb"] = current["fixedVolumeDb"].clone();
+        }
         if metadata != *current { return Err("Image copy metadata changed".into()); }
         let original_scene = initial["scenes"].as_array().into_iter().flatten()
             .find(|scene| scene["guid"] == copy.scene_guid).ok_or("Image donor scene is missing")?;
@@ -1505,7 +1540,13 @@ pub(crate) fn rewrite(
             let set = track_set_plan(old, new)?;
             for slot in &set.ordered {
                 match slot {
-                    TrackSlot::Kept { original, candidate } if old[*original] == new[*candidate] => {}
+                    TrackSlot::Kept { original, candidate } => {
+                        let old = &old[*original];
+                        let new = &new[*candidate];
+                        if old != new {
+                            sound_volume_changes(text, &graph, scene_node, old, new, &mut patches, &mut budget)?;
+                        }
+                    }
                     _ => return Err(format!("animation {field} only support deletion")),
                 }
             }
@@ -3368,9 +3409,15 @@ fn read_xml(text: &str) -> Result<Value, String> {
                 let resource = required(&graph, track, "_resourceGuid")?.attribute("uuid")
                     .ok_or("animation track lacks resource UUID")?;
                 if !sound_resource_ids.contains(resource) { return Err("animation track sound resource was not found".into()); }
-                sound_tracks.push(json!({"guid":track_guid,"name":string(&graph, track, "name", &mut budget)?,
+                let mut entry = json!({"guid":track_guid,"name":string(&graph, track, "name", &mut budget)?,
                     "resourceGuid":budget.text(resource)?,"start":integer(&graph, track, "start")?,
-                    "internalOffset":integer(&graph, track, "internalOffset")?,"duration":integer(&graph, track, "duration")?}));
+                    "internalOffset":integer(&graph, track, "internalOffset")?,"duration":integer(&graph, track, "duration")?});
+                match read_sound_fixed_volume(text, &graph, scene, track, &entry, &mut budget) {
+                    Ok(storage) => entry["fixedVolumeDb"] = json!(storage.value.0),
+                    Err(error) if budget.exhausted() => return Err(error),
+                    Err(_) => {}
+                }
+                sound_tracks.push(entry);
                 continue;
             }
             if track.has_tag_name("CMvTrack_Image_Source") {
@@ -4756,7 +4803,7 @@ fn raw_inherited_field<'d, 'i>(owner: Node<'d, 'i>, name: &str) -> Result<Node<'
     Err("animation inheritance exceeds 64 nodes".into())
 }
 
-fn exclusive_references(id: &str, allowed: &[Node<'_, '_>], label: &str, budget: &mut Budget) -> Result<(), String> {
+fn reference_shapes(id: &str, allowed: &[Node<'_, '_>], label: &str) -> Result<(), String> {
     for node in allowed {
         if node.attribute("xs.ref") != Some(id) || node.has_children()
             || node.attributes().any(|a| !matches!(a.name(), "xs.n" | "xs.ref"))
@@ -4764,6 +4811,11 @@ fn exclusive_references(id: &str, allowed: &[Node<'_, '_>], label: &str, budget:
             return Err(format!("animation {label} storage has an aliased reference"));
         }
     }
+    Ok(())
+}
+
+fn exclusive_references(id: &str, allowed: &[Node<'_, '_>], label: &str, budget: &mut Budget) -> Result<(), String> {
+    reference_shapes(id, allowed, label)?;
     let mut count = 0;
     for node in allowed[0].document().descendants().filter(Node::is_element) {
         budget.consume(1)?;
@@ -4869,6 +4921,21 @@ fn unmapped_part_storage<'d, 'i>(
 fn track_effect<'d, 'i>(
     graph: &Graph<'d, 'i>, track: Node<'d, 'i>, field: &str, tag: &str, label: &str, budget: &mut Budget,
 ) -> Result<Option<Node<'d, 'i>>, String> {
+    let Some(storage) = track_effect_fields(graph, track, field, tag, label, budget)? else { return Ok(None) };
+    if let Some(id) = storage.effect.attribute("xs.id") {
+        exclusive_references(id, &storage.references, label, budget)?;
+    }
+    Ok(Some(storage.effect))
+}
+
+struct TrackEffectFields<'d, 'i> {
+    effect: Node<'d, 'i>,
+    references: Vec<Node<'d, 'i>>,
+}
+
+fn track_effect_fields<'d, 'i>(
+    graph: &Graph<'d, 'i>, track: Node<'d, 'i>, field: &str, tag: &str, label: &str, budget: &mut Budget,
+) -> Result<Option<TrackEffectFields<'d, 'i>>, String> {
     if graph.field(track, field)?.is_none() {
         return Ok(None);
     }
@@ -4877,11 +4944,12 @@ fn track_effect<'d, 'i>(
     if effect.has_tag_name("null") {
         return Ok(None);
     }
+    let mut references = Vec::new();
     if let Some(id) = effect.attribute("xs.id") {
         if effect.parent().is_none_or(|parent| !parent.has_tag_name("shared")) {
             return Err(format!("animation {label} effect is not a direct shared entry"));
         }
-        let mut references = vec![field];
+        references.push(field);
         if graph.field(track, "effectManager")?.is_some() {
             let manager = raw_inherited_field(track, "effectManager")?;
             if !manager.has_tag_name("CMvEffectManager") || manager.attribute("xs.id").is_some()
@@ -4909,11 +4977,11 @@ fn track_effect<'d, 'i>(
                 }
             }
         }
-        exclusive_references(id, &references, label, budget)?;
+        reference_shapes(id, &references, label)?;
     } else if effect.id() != field.id() {
         return Err(format!("animation {label} effect is aliased"));
     }
-    Ok(Some(effect))
+    Ok(Some(TrackEffectFields { effect, references }))
 }
 
 fn part_effect<'d, 'i>(
@@ -5470,10 +5538,143 @@ fn parent_attribute_storage(
     Ok(())
 }
 
+struct SoundFixedVolume<'d, 'i> {
+    value: SoundVolumeDb,
+    fields: [Node<'d, 'i>; 3],
+}
+
+fn sound_volume_number<'d, 'i>(
+    text: &str, owner: Node<'d, 'i>, name: &str,
+) -> Result<(Node<'d, 'i>, f64), String> {
+    let field = raw_inherited_field(owner, name)?;
+    if field.parent() != Some(owner) || field.attributes().count() != 1 {
+        return Err("Sound volume requires direct inline numeric storage".into());
+    }
+    let value = values::finite(field.text().ok_or("Sound volume lacks numeric text")?)?;
+    native_scalar_patch(text, field, field, NativeScalar::Double(value), NativeScalar::Double(value))?;
+    Ok((field, value))
+}
+
+fn read_sound_fixed_volume<'d, 'i>(
+    text: &str, graph: &Graph<'d, 'i>, scene: Node<'d, 'i>, track: Node<'d, 'i>,
+    row: &Value, budget: &mut Budget,
+) -> Result<SoundFixedVolume<'d, 'i>, String> {
+    let shared = scene.document().root_element().children().find(|node| node.has_tag_name("shared"))
+        .ok_or("animation XML lacks a shared section")?;
+    track_storage(graph, track, scene, row, shared, budget)?;
+    let attribute = sound_track_fields(graph, track, shared, budget)?.attribute;
+    for name in ["isReadOnly", "guideRangeMin", "guideRangeMax", "paramRangeMin", "paramRangeMax"] {
+        if graph.field(attribute, name)?.is_some() {
+            return Err("Sound volume has unsupported constraint metadata".into());
+        }
+    }
+    if let Some(linked) = graph.field(attribute, "linked_keyFormsForObject")? {
+        if !linked.has_tag_name("null") || linked.attributes().count() != 1 || linked.has_children() {
+            return Err("Sound volume has unsupported key-form linkage".into());
+        }
+    }
+    for (name, expected) in [("rangeMin", -48.0), ("rangeMax", 6.0),
+        ("repeatMin", -f64::MAX), ("repeatMax", f64::MAX)]
+    {
+        if sound_volume_number(text, attribute, name)?.1 != expected {
+            return Err("Sound volume requires its explicit standard limits".into());
+        }
+    }
+    let repeat = raw_inherited_field(attribute, "isRepeat")?;
+    if repeat.parent() != Some(attribute) || repeat.attributes().count() != 1 {
+        return Err("Sound volume repeat flag requires direct inline storage".into());
+    }
+    native_scalar_patch(text, repeat, repeat, NativeScalar::Boolean(false), NativeScalar::Boolean(false))?;
+    let sequence = raw_inherited_field(attribute, "valueData")?;
+    let (base, value) = sound_volume_number(text, sequence, "baseValue")?;
+    let (minimum, cur_min) = sound_volume_number(text, sequence, "curMin")?;
+    let (maximum, cur_max) = sound_volume_number(text, sequence, "curMax")?;
+    let value = SoundVolumeDb::parse(value)?;
+    if cur_min != value.0 || cur_max != value.0 {
+        return Err("Sound fixed volume caches differ from its value".into());
+    }
+    Ok(SoundFixedVolume { value, fields: [base, minimum, maximum] })
+}
+
+fn sound_fixed_volume<'d, 'i>(
+    text: &str, graph: &Graph<'d, 'i>, scene: Node<'d, 'i>, track: Node<'d, 'i>,
+    row: &Value, budget: &mut Budget,
+) -> Result<SoundFixedVolume<'d, 'i>, String> {
+    let storage = read_sound_fixed_volume(text, graph, scene, track, row, budget)?;
+    let shared = scene.document().root_element().children().find(|node| node.has_tag_name("shared"))
+        .ok_or("animation XML lacks a shared section")?;
+    let sources = raw_inherited_field(required(graph, scene, "trackSourceSet")?, "_sources")?;
+    let id = track.attribute("xs.id").ok_or("Sound track lacks its storage identity")?;
+    let mut members = sources.children().filter(|node| node.is_element() && node.attribute("xs.ref") == Some(id));
+    let member = members.next().ok_or("Sound track lacks direct source membership")?;
+    if members.next().is_some() { return Err("Sound track source membership is ambiguous".into()); }
+    track_definition_ownership(graph, member, scene, shared, row, budget)?;
+    Ok(storage)
+}
+
+pub(crate) fn validate_sound_volume_target(container: &CaffDocument, model: &Value, request: &Value) -> Result<(), String> {
+    let xml = container.main_xml();
+    let text = std::str::from_utf8(&xml).map_err(|_| "animation XML is not UTF-8")?;
+    validate_sound_volume_xml(text, model, request, &mut Budget::new(5_000_000))
+}
+
+fn validate_sound_volume_xml(text: &str, model: &Value, request: &Value, budget: &mut Budget) -> Result<(), String> {
+    let document = xml_document(text)?;
+    let graph = Graph::new(&document)?;
+    let animation = graph.resolve(document.root_element().children().find(|node| node.has_tag_name("main"))
+        .and_then(|node| node.children().find(Node::is_element)).ok_or("animation main is missing")?)?;
+    let scene = select_guid(&graph, list(&graph, animation, "_scenes", budget)?, &request["sceneGuid"])?;
+    let sources = required(&graph, scene, "trackSourceSet")?;
+    let track = select_guid(&graph, list(&graph, sources, "_sources", budget)?, &request["trackGuid"])?;
+    let mut model = model.clone();
+    let row = select_json(&mut model["scenes"], "guid", request, "sceneGuid")?;
+    let row = select_json(&mut row["soundTracks"], "guid", request, "trackGuid")?;
+    let storage = sound_fixed_volume(text, &graph, scene, track, row, budget)?;
+    if storage.value.0 != finite(&row["fixedVolumeDb"])? {
+        return Err("Sound fixed volume differs from the current document".into());
+    }
+    Ok(())
+}
+
+fn sound_volume_changes(
+    text: &str, graph: &Graph<'_, '_>, scene: Node<'_, '_>, old: &Value, new: &Value,
+    patches: &mut Vec<(Range<usize>, String)>, budget: &mut Budget,
+) -> Result<(), String> {
+    let old_value = SoundVolumeDb::parse(finite(old.get("fixedVolumeDb").ok_or("Sound fixed volume is unsupported")?)?)?;
+    let value = SoundVolumeDb::parse(finite(new.get("fixedVolumeDb").ok_or("Sound fixed volume is unsupported")?)?)?;
+    let mut metadata = old.clone();
+    metadata["fixedVolumeDb"] = new["fixedVolumeDb"].clone();
+    if metadata != *new { return Err("Sound edits only support fixed volume".into()); }
+    let sources = required(graph, scene, "trackSourceSet")?;
+    let track = select_guid(graph, list(graph, sources, "_sources", budget)?, &old["guid"])?;
+    let storage = sound_fixed_volume(text, graph, scene, track, old, budget)?;
+    if storage.value.0 != old_value.0 { return Err("Sound fixed volume differs from source".into()); }
+    for field in storage.fields {
+        patches.push(native_scalar_patch(text, field, field.parent().unwrap(),
+            NativeScalar::Double(old_value.0), NativeScalar::Double(value.0))?);
+    }
+    Ok(())
+}
+
+struct SoundTrackFields<'d, 'i> {
+    effect: TrackEffectFields<'d, 'i>,
+    attribute: Node<'d, 'i>,
+    references: [Node<'d, 'i>; 4],
+}
+
 fn sound_track_storage(graph: &Graph<'_, '_>, track: Node<'_, '_>, shared: Node<'_, '_>, budget: &mut Budget) -> Result<(), String> {
-    let effect = track_effect(graph, track, "soundEffect", "CMvEffect_SoundDefault", "Sound", budget)?
+    let storage = sound_track_fields(graph, track, shared, budget)?;
+    exclusive_references(storage.effect.effect.attribute("xs.id").unwrap(), &storage.effect.references, "Sound", budget)?;
+    exclusive_references(storage.attribute.attribute("xs.id").unwrap(), &storage.references, "Sound volume", budget)
+}
+
+fn sound_track_fields<'d, 'i>(
+    graph: &Graph<'d, 'i>, track: Node<'d, 'i>, shared: Node<'d, 'i>, budget: &mut Budget,
+) -> Result<SoundTrackFields<'d, 'i>, String> {
+    let effect_fields = track_effect_fields(graph, track, "soundEffect", "CMvEffect_SoundDefault", "Sound", budget)?
         .ok_or("Sound track lacks its effect")?;
-    if !effect.has_tag_name("CMvEffect_SoundDefault") || effect.parent() != Some(shared) {
+    let effect = effect_fields.effect;
+    if !effect.has_tag_name("CMvEffect_SoundDefault") || effect.parent() != Some(shared) || effect.attribute("xs.id").is_none() {
         return Err("Sound effect must be a shared definition".into());
     }
     for field in ["keyParamEffect", "partsVisibleEffect", "visualEffect", "lipSyncEffect", "eyeBlinkEffect",
@@ -5510,7 +5711,6 @@ fn sound_track_storage(graph: &Graph<'_, '_>, track: Node<'_, '_>, shared: Node<
     if !sequence.has_tag_name("CFixedSequence") { return Err("Sound volume requires a fixed sequence".into()); }
     let backlink = raw_inherited_field(sequence, "attr")?;
     direct_reference(graph, backlink, attribute)?;
-    exclusive_references(attribute.attribute("xs.id").unwrap(), &[member, value, named, backlink], "Sound volume", budget)?;
     let id = required(graph, effect, "id")?;
     if !id.has_tag_name("CEffectId") || id.attribute("idstr") != Some("SoundDefault") {
         return Err("Sound effect identity differs from SoundDefault".into());
@@ -5551,7 +5751,7 @@ fn sound_track_storage(graph: &Graph<'_, '_>, track: Node<'_, '_>, shared: Node<
     for reference in track.descendants().filter(|node| node.attribute("xs.ref").is_some()) {
         if !track_refs.contains(&reference) { return Err("Sound track contains an unclassified reference".into()); }
     }
-    Ok(())
+    Ok(SoundTrackFields { effect: effect_fields, attribute, references: [member, value, named, backlink] })
 }
 
 fn guide_track_storage(graph: &Graph<'_, '_>, track: Node<'_, '_>, shared: Node<'_, '_>, budget: &mut Budget) -> Result<(), String> {
@@ -6847,6 +7047,41 @@ fn serialize_track(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sound_fixed_volume_local_read_ignores_unrelated_nodes_but_noop_proof_keeps_its_budget() {
+        use super::*;
+        let text = include_str!("../tests/fixtures/can3-sound-volume.xml")
+            .replace("</shared>", &format!("{}</shared>", "<Opaque/>".repeat(2000)));
+        let model = read_xml(&text).unwrap();
+        let document = xml_document(&text).unwrap();
+        let graph = Graph::new(&document).unwrap();
+        let scene = document.descendants().find(|node| node.attribute("xs.id") == Some("scene")).unwrap();
+        let track = document.descendants().find(|node| node.attribute("xs.id") == Some("sound-0")).unwrap();
+        let row = &model["scenes"][0]["soundTracks"][0];
+        assert!(read_sound_fixed_volume(&text, &graph, scene, track, row, &mut Budget::new(256)).is_ok());
+        let request = json!({"sceneGuid":"scene-guid","trackGuid":"sound-guid-0"});
+        validate_sound_volume_xml(&text, &model, &request, &mut Budget::new(50_000)).unwrap();
+        let mut budget = Budget::new(256);
+        assert!(validate_sound_volume_xml(&text, &model, &request, &mut budget).is_err());
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn sound_fixed_volume_proof_propagates_exhausted_ownership_budget() {
+        use super::*;
+        let text = include_str!("../tests/fixtures/can3-sound-volume.xml");
+        let model = read_xml(text).unwrap();
+        let document = xml_document(text).unwrap();
+        let graph = Graph::new(&document).unwrap();
+        let scene = document.descendants().find(|node| node.attribute("xs.id") == Some("scene")).unwrap();
+        let track = document.descendants().find(|node| node.attribute("xs.id") == Some("sound-0")).unwrap();
+        let row = &model["scenes"][0]["soundTracks"][0];
+        assert!(sound_fixed_volume(text, &graph, scene, track, row, &mut Budget::new(10_000)).is_ok());
+        let mut budget = Budget::new(0);
+        assert!(sound_fixed_volume(text, &graph, scene, track, row, &mut budget).is_err());
+        assert!(budget.exhausted());
+    }
+
     #[test]
     fn visual_control_policy_protects_metadata_and_keeps_recreated_keys_editable() {
         use super::*;

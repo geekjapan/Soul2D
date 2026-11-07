@@ -7,6 +7,10 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::thread::{self, JoinHandle};
 
+#[allow(dead_code)]
+#[path = "common/authoring_fixture.rs"]
+mod authoring_fixture;
+
 /// Serve exactly `connections` connections with a fresh session, then hand back its final snapshot (Session is not Send).
 fn start(bearer: Option<&str>, connections: usize) -> (u16, JoinHandle<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -121,6 +125,66 @@ fn deferred_transport_keeps_auth_parse_notification_and_panic_behavior() {
     let pending = handle_connection_deferred(stream, None, std::time::Duration::from_millis(500), &mut |_| HttpDispatch::Defer).unwrap().unwrap();
     pending.finish(&mut |_| panic!("completion panic stays a transport error")).unwrap();
     assert_eq!(split(&client.join().unwrap()).0, "HTTP/1.1 500 Internal Server Error");
+}
+
+#[test]
+fn sound_fixed_volume_edits_over_http_preserve_refusals_history_and_reopen() {
+    let directory = std::env::temp_dir().join(format!("soul2d-sound-http-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("source.can3");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])))
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let original = authoring_fixture::authoring_bytes_with_pngs(
+        include_str!("fixtures/can3-sound-volume.xml"), &[png.into_inner()]);
+    std::fs::write(&source, &original).unwrap();
+    let (port, server) = start(None, 13);
+    let rpc = |method: &str, params: Value| {
+        let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let response = raw(port, &post(&body));
+        let (status, body) = split(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let reply: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply.get("error").is_none(), "{reply}");
+        reply
+    };
+    let call = |name: &str, arguments: Value| {
+        let reply = rpc("tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        serde_json::from_str::<Value>(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let snapshot = || {
+        let reply = rpc("resources/read", json!({"uri":"resource://vsoul/snapshot"}));
+        serde_json::from_str::<Value>(reply["result"]["contents"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    call("open", json!({"path":source}));
+    let baseline = snapshot();
+    let listed = rpc("tools/list", json!({}));
+    assert!(listed["result"]["tools"].as_array().unwrap().iter()
+        .any(|tool| tool["name"] == "live2d_animation_sound_volume_set"));
+    let changed = call("live2d_animation_sound_volume_set", json!({"sceneGuid":"scene-guid",
+        "trackGuid":"sound-guid-0","value":-12.125,"expectedRevision":baseline["revision"]}));
+    let mut expected = baseline["model"].clone();
+    expected["scenes"][0]["soundTracks"][0]["fixedVolumeDb"] = json!(-12.125);
+    assert_eq!(changed["model"], expected);
+    let before_refusal = snapshot();
+    let refused = rpc("tools/call", json!({"name":"live2d_animation_sound_volume_set","arguments":{
+        "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":-12.125,"anchorFrame":0,
+        "expectedRevision":before_refusal["revision"]}}));
+    assert_eq!(refused["result"]["isError"], true);
+    assert_eq!(snapshot(), before_refusal);
+    call("undo", json!({}));
+    assert_eq!(snapshot()["model"], baseline["model"]);
+    call("redo", json!({}));
+    let saved = directory.join("saved.can3");
+    call("save", json!({"path":saved}));
+    call("open", json!({"path":saved}));
+    assert_eq!(snapshot()["model"], expected);
+    assert_eq!(server.join().unwrap()["model"], expected);
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

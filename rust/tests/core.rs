@@ -14542,6 +14542,298 @@ fn can3_sound_track_xml(count: usize) -> String {
         .replace("</shared>", &format!("{definitions}</shared>"))
 }
 
+fn can3_sound_volume_xml() -> String {
+    include_str!("fixtures/can3-sound-volume.xml").to_owned()
+}
+
+fn assert_sound_volume_noop(session: &mut Session, track_guid: &str) {
+    let before = session.snapshot();
+    let track = before["model"]["scenes"][0]["soundTracks"].as_array().unwrap().iter()
+        .find(|track| track["guid"] == track_guid).unwrap();
+    let history = result(&request(session, json!({"op":"history.summary"}))).clone();
+    result(&request(session, json!({"op":"live2d.animation.sound_volume.set","sceneGuid":"scene-guid",
+        "trackGuid":track_guid,"value":track["fixedVolumeDb"],"expectedRevision":before["revision"]})));
+    assert_eq!(session.snapshot(), before);
+    assert_eq!(*result(&request(session, json!({"op":"history.summary"}))), history);
+}
+
+#[test]
+fn can3_sound_fixed_volume_reads_many_tracks_without_repeating_document_proofs() {
+    let base = can3_sound_volume_xml();
+    let parsed = roxmltree::Document::parse(&base).unwrap();
+    let template: String = ["sound-guid-storage-1", "sound-1", "sound-effect-1", "volume-1"].into_iter()
+        .map(|id| &base[parsed.descendants().find(|node| node.attribute("xs.id") == Some(id)).unwrap().range()])
+        .collect();
+    let mut definitions = String::new();
+    let mut members = String::new();
+    let mut children = String::new();
+    for index in 2..200 {
+        definitions.push_str(&template.replace("-1\"", &format!("-{index}\"")));
+        members.push_str(&format!("<CMvTrack_JavaSoundTrack_Source xs.ref=\"sound-{index}\"/>"));
+        children.push_str(&format!("<CTrackGuid xs.ref=\"sound-guid-storage-{index}\"/>"));
+    }
+    let xml = base.replace("<carray_list xs.n=\"_sources\" count=\"3\">",
+            &format!("<carray_list xs.n=\"_sources\" count=\"201\">{members}"))
+        .replace("<carray_list xs.n=\"_childTrackGuids\" count=\"2\">",
+            &format!("<carray_list xs.n=\"_childTrackGuids\" count=\"200\">{children}"))
+        .replace("</shared>", &format!("{definitions}</shared>"));
+    let directory = temp_dir();
+    let (mut session, source) = can3_key_fixture_session(&directory, &xml);
+    let original = fs::read(&source).unwrap();
+    let baseline = session.snapshot();
+    let tracks = baseline["model"]["scenes"][0]["soundTracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 200);
+    assert!(tracks.iter().all(|track| track["fixedVolumeDb"] == 0.0));
+    let unchanged = directory.join("unchanged.can3");
+    result(&request(&mut session, json!({"op":"save","path":unchanged,"mark_saved":false})));
+    assert_eq!(fs::read(unchanged).unwrap(), original);
+    let mut expected = baseline["model"].clone();
+    expected["scenes"][0]["soundTracks"].as_array_mut().unwrap().iter_mut()
+        .find(|track| track["guid"] == "sound-guid-0").unwrap()["fixedVolumeDb"] = json!(-12.0);
+    for _ in 0..2 {
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+            "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":-12,"expectedRevision":revision})));
+        assert_eq!(session.snapshot()["model"], expected);
+    }
+    assert_sound_volume_noop(&mut session, "sound-guid-0");
+    let saved = directory.join("changed.can3");
+    result(&request(&mut session, json!({"op":"save","path":saved})));
+    result(&request(&mut session, json!({"op":"open","path":saved})));
+    assert_eq!(session.snapshot()["model"], expected);
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn can3_sound_fixed_volume_edits_preserve_xml_and_history() {
+    let directory = temp_dir();
+    let xml = can3_sound_volume_xml();
+    let (mut session, source) = can3_key_fixture_session(&directory, &xml);
+    let original = fs::read(&source).unwrap();
+    assert_eq!(session.snapshot()["model"]["scenes"][0]["soundTracks"][0]["fixedVolumeDb"], json!(0.0));
+    let baseline = session.snapshot();
+    let revision = baseline["revision"].clone();
+    result(&request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+        "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":-12.125,"expectedRevision":revision})));
+    let changed = session.snapshot();
+    let mut expected = baseline["model"].clone();
+    expected["scenes"][0]["soundTracks"][0]["fixedVolumeDb"] = json!(-12.125);
+    assert_eq!(changed["model"], expected);
+    let saved = directory.join("volume.can3");
+    result(&request(&mut session, json!({"op":"save","path":saved,"mark_saved":false})));
+    let current = saved_main_xml(&saved);
+    let start = xml.find("<CMvAttrF xs.id=\"volume-0\">").unwrap();
+    let end = start + xml[start..].find("</CFixedSequence>").unwrap();
+    let mut expected_xml = xml.clone();
+    let value = xml[start..end].replace("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\">-12.125</d>")
+        .replace("<d xs.n=\"curMin\">0</d>", "<d xs.n=\"curMin\">-12.125</d>")
+        .replace("<d xs.n=\"curMax\">0</d>", "<d xs.n=\"curMax\">-12.125</d>");
+    expected_xml.replace_range(start..end, &value);
+    assert_eq!(current, expected_xml);
+    let revision = session.snapshot()["revision"].clone();
+    result(&request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+        "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":-12.125,"expectedRevision":revision})));
+    assert_eq!(session.snapshot(), changed);
+    result(&request(&mut session, json!({"op":"undo"})));
+    assert_eq!(session.snapshot()["model"], baseline["model"]);
+    result(&request(&mut session, json!({"op":"redo"})));
+    assert_eq!(session.snapshot()["model"], expected);
+    result(&request(&mut session, json!({"op":"open","path":saved})));
+    assert_eq!(session.snapshot()["model"], expected);
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn can3_sound_fixed_volume_mcp_schema_and_dispatch_share_the_transaction() {
+    let directory = temp_dir();
+    let (mut session, _) = can3_key_fixture_session(&directory, &can3_sound_volume_xml());
+    let listed = session.handle_mcp(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();
+    let tool = listed["result"]["tools"].as_array().unwrap().iter()
+        .find(|tool| tool["name"] == "live2d_animation_sound_volume_set").unwrap();
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 4);
+    assert_eq!(schema["properties"]["value"]["minimum"], -48);
+    assert_eq!(schema["properties"]["value"]["maximum"], 6);
+    assert_eq!(schema["required"], json!(["sceneGuid","trackGuid","value","expectedRevision"]));
+    let revision = session.snapshot()["revision"].clone();
+    let reply = session.handle_mcp(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"live2d_animation_sound_volume_set","arguments":{"sceneGuid":"scene-guid",
+            "trackGuid":"sound-guid-0","value":-12,"expectedRevision":revision}}})).unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(session.snapshot()["model"]["scenes"][0]["soundTracks"][0]["fixedVolumeDb"], json!(-12.0));
+    let before = session.snapshot();
+    let reply = session.handle_mcp(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"live2d_animation_sound_volume_set","arguments":{"sceneGuid":"scene-guid",
+            "trackGuid":"sound-guid-0","value":-12,"anchorFrame":0,"expectedRevision":before["revision"]}}})).unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(session.snapshot(), before);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn can3_sound_fixed_volume_bounds_and_request_refusals_are_atomic() {
+    let directory = temp_dir();
+    let (mut session, source) = can3_key_fixture_session(&directory, &can3_sound_volume_xml());
+    let original = fs::read(&source).unwrap();
+    let initial_revision = session.snapshot()["revision"].clone();
+    for value in [-48.0, 6.0, -12.125] {
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+            "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":value,"expectedRevision":revision})));
+        assert_eq!(session.snapshot()["model"]["scenes"][0]["soundTracks"][0]["fixedVolumeDb"], json!(value));
+    }
+    let before = session.snapshot();
+    let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+    for (field, value) in [
+        ("value", json!(-48.001)), ("value", json!(6.001)), ("value", json!(1e300)),
+        ("value", Value::Null), ("value", json!("0")), ("value", json!(false)),
+        ("expectedRevision", initial_revision), ("expectedRevision", json!(-1)),
+        ("expectedRevision", json!(1.5)), ("expectedRevision", Value::Null),
+        ("sceneGuid", json!("missing")), ("sceneGuid", json!("")),
+        ("trackGuid", json!("missing")), ("trackGuid", json!("")),
+        ("anchorFrame", json!(0)), ("curveId", json!("volume")),
+    ] {
+        let mut body = json!({"op":"live2d.animation.sound_volume.set","sceneGuid":"scene-guid",
+            "trackGuid":"sound-guid-0","value":-12.125,"expectedRevision":before["revision"]});
+        body[field] = value;
+        assert_eq!(request(&mut session, body)["succeeded"], false, "{field}");
+        assert_eq!(session.snapshot(), before);
+        assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
+    }
+    let mut other = Session::new();
+    assert_eq!(request(&mut other, json!({"op":"live2d.animation.sound_volume.set","sceneGuid":"scene-guid",
+        "trackGuid":"sound-guid-0","value":0,"expectedRevision":0}))["succeeded"], false);
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn can3_sound_fixed_volume_unsupported_storage_refuses_even_equal_values() {
+    let xml = can3_sound_volume_xml();
+    let start = xml.find("<CMvAttrF xs.id=\"volume-0\">").unwrap();
+    let end = start + xml[start..].find("</CMvAttrF>").unwrap() + "</CMvAttrF>".len();
+    let attribute = &xml[start..end];
+    let mut cases = Vec::new();
+    for (from, to) in [
+        ("<d xs.n=\"rangeMin\">-48</d>", ""),
+        ("<d xs.n=\"rangeMin\">-48</d>", "<d xs.n=\"rangeMin\">-47</d>"),
+        ("<d xs.n=\"rangeMax\">6</d>", "<d xs.n=\"rangeMax\">6</d><d xs.n=\"rangeMax\">6</d>"),
+        ("<d xs.n=\"rangeMax\">6</d>", "<f xs.n=\"rangeMax\">6</f>"),
+        ("<d xs.n=\"repeatMin\">-1.7976931348623157E308</d>", "<d xs.n=\"repeatMin\">-48</d>"),
+        ("<b xs.n=\"isRepeat\">false</b>", "<b xs.n=\"isRepeat\">true</b>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\">NaN</d>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\">7</d>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\">0</d><d xs.n=\"baseValue\">0</d>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<f xs.n=\"baseValue\">0</f>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\">&#48;</d>"),
+        ("<d xs.n=\"baseValue\">0</d>", "<d xs.n=\"baseValue\" xs.id=\"aliased-volume\">0</d>"),
+        ("<d xs.n=\"curMin\">0</d>", "<d xs.n=\"curMin\">-1</d>"),
+        ("<d xs.n=\"curMax\">0</d>", "<d xs.n=\"curMax\">Infinity</d>"),
+        ("<d xs.n=\"curMax\">0</d>", ""),
+        ("<CFixedSequence xs.n=\"valueData\">", "<CFixedSequence xs.n=\"valueData\" xs.id=\"shared-fixed\">"),
+        ("<null xs.n=\"linked_keyFormsForObject\"/>", "<array xs.n=\"linked_keyFormsForObject\" count=\"0\"/>"),
+        ("<null xs.n=\"linked_keyFormsForObject\"/>", "<b xs.n=\"isReadOnly\">true</b>"),
+        ("<null xs.n=\"linked_keyFormsForObject\"/>", "<null xs.n=\"guideRangeMin\"/>"),
+    ] {
+        assert!(attribute.contains(from));
+        let mut broken = xml.clone();
+        broken.replace_range(start..end, &attribute.replace(from, to));
+        cases.push((broken, false));
+    }
+    for reference in ["<CMvAttrF xs.ref=\"volume-0\"/>",
+        "<CMvEffect_SoundDefault xs.ref=\"sound-effect-0\"/>",
+        "<CMvTrack_JavaSoundTrack_Source xs.ref=\"sound-0\"/>",
+        "<CTrackGuid xs.ref=\"sound-guid-storage-0\"/>"]
+    {
+        cases.push((xml.replace("</shared>", &format!("{reference}</shared>")), true));
+    }
+    for (index, (broken, readable)) in cases.into_iter().enumerate() {
+        let directory = temp_dir();
+        let (mut session, source) = can3_key_fixture_session(&directory, &broken);
+        let original = fs::read(&source).unwrap();
+        let before = session.snapshot();
+        assert_eq!(before["model"]["scenes"][0]["soundTracks"][0].get("fixedVolumeDb").is_some(), readable, "case {index}");
+        assert_eq!(before["model"]["scenes"][0]["soundTracks"][1]["fixedVolumeDb"], json!(0.0));
+        let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+        for value in [0.0, -12.0] {
+            assert_eq!(request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+                "sceneGuid":"scene-guid","trackGuid":"sound-guid-0","value":value,
+                "expectedRevision":before["revision"]}))["succeeded"], false, "case {index}");
+            assert_eq!(session.snapshot(), before);
+            assert_eq!(*result(&request(&mut session, json!({"op":"history.summary"}))), history);
+        }
+        let saved = directory.join("unchanged.can3");
+        result(&request(&mut session, json!({"op":"save","path":saved,"mark_saved":false})));
+        assert_eq!(fs::read(saved).unwrap(), original);
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(&mut session, json!({"op":"live2d.animation.sound_volume.set",
+            "sceneGuid":"scene-guid","trackGuid":"sound-guid-1","value":-3,"expectedRevision":revision})));
+        assert_eq!(fs::read(source).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn can3_sound_fixed_volume_composes_with_pending_copies_and_donor_deletion() {
+    let directory = temp_dir();
+    let (mut session, source) = can3_key_fixture_session(&directory, &can3_sound_volume_xml());
+    let original = fs::read(&source).unwrap();
+    let baseline = session.snapshot()["model"].clone();
+    let edit = |session: &mut Session, track: &str, value: f64| {
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(session, json!({"op":"live2d.animation.sound_volume.set","sceneGuid":"scene-guid",
+            "trackGuid":track,"value":value,"expectedRevision":revision}))).clone()
+    };
+    let copy = |session: &mut Session, donor: &str| {
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(session, json!({"op":"live2d.animation.track.duplicate","sceneGuid":"scene-guid",
+            "trackGuid":donor,"name":"Volume copy","expectedRevision":revision})))["trackGuid"]
+            .as_str().unwrap().to_owned()
+    };
+    edit(&mut session, "sound-guid-0", -12.0);
+    assert_sound_volume_noop(&mut session, "sound-guid-0");
+    let first = copy(&mut session, "sound-guid-0");
+    assert_sound_volume_noop(&mut session, &first);
+    edit(&mut session, &first, -6.0);
+    assert_sound_volume_noop(&mut session, &first);
+    let second = copy(&mut session, &first);
+    assert_sound_volume_noop(&mut session, &second);
+    edit(&mut session, "sound-guid-0", 3.0);
+    edit(&mut session, &second, -24.0);
+    assert_sound_volume_noop(&mut session, &second);
+    let cancelled = copy(&mut session, &second);
+    for target in [&first, "sound-guid-0", &cancelled] {
+        let revision = session.snapshot()["revision"].clone();
+        result(&request(&mut session, json!({"op":"live2d.animation.track.delete","sceneGuid":"scene-guid",
+            "trackGuid":target,"expectedRevision":revision})));
+    }
+    assert_sound_volume_noop(&mut session, &second);
+    let revision = session.snapshot()["revision"].clone();
+    result(&request(&mut session, json!({"op":"live2d.animation.scene.set","sceneGuid":"scene-guid",
+        "name":"Volume and scene edit","expectedRevision":revision})));
+    let expected = session.snapshot()["model"].clone();
+    let tracks = expected["scenes"][0]["soundTracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks.iter().find(|t| t["guid"] == second).unwrap()["fixedVolumeDb"], json!(-24.0));
+    assert_eq!(tracks.iter().find(|t| t["guid"] == "sound-guid-1").unwrap(), &baseline["scenes"][0]["soundTracks"][1]);
+    for _ in 0..11 { result(&request(&mut session, json!({"op":"undo"}))); }
+    assert_eq!(session.snapshot()["model"], baseline);
+    let restored = directory.join("restored.can3");
+    result(&request(&mut session, json!({"op":"save","path":restored,"mark_saved":false})));
+    assert_eq!(fs::read(restored).unwrap(), original);
+    for _ in 0..11 { result(&request(&mut session, json!({"op":"redo"}))); }
+    assert_sound_volume_noop(&mut session, &second);
+    let saved = directory.join("copies.can3");
+    result(&request(&mut session, json!({"op":"save","path":saved,"mark_saved":false})));
+    result(&request(&mut session, json!({"op":"open","path":saved})));
+    assert_eq!(session.snapshot()["model"], expected);
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn can3_sound_deletion_combines_with_model_and_image_changes() {
     let directory = temp_dir();

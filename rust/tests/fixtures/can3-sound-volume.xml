@@ -1,0 +1,87 @@
+<root fileFormatVersion="503040001">
+  <main><CAnimation xs.ref="animation"/></main>
+  <shared>
+    <CAnimation xs.id="animation">
+      <s xs.n="name">OwnedSoundVolumeFixture</s>
+      <ResourceManager xs.n="resourceManager"><carray_list xs.n="_resourceRefList" count="1">
+        <ResourceEntry><CResource_Linked_Sound xs.n="resourceRef" xs.ref="sound-resource"/></ResourceEntry>
+      </carray_list></ResourceManager>
+      <carray_list xs.n="_scenes" count="1"><CSceneSource xs.ref="scene"/></carray_list>
+      <s xs.n="futureRootData">preserve &amp; 0.1234500</s>
+    </CAnimation>
+    <CSceneSource xs.id="scene">
+      <CGuid xs.n="guid" uuid="scene-guid"/><CAnimation xs.n="_animation" xs.ref="animation"/>
+      <s xs.n="sceneName">Scene</s><CMovieInfo xs.n="movieInfo"><f xs.n="fps">60</f>
+        <i xs.n="duration">120</i><b xs.n="isLoopMotion">false</b></CMovieInfo>
+      <CTrackSourceSet xs.n="trackSourceSet"><carray_list xs.n="_sources" count="3">
+        <CMvTrack_Group_Source xs.ref="group"/><CMvTrack_JavaSoundTrack_Source xs.ref="sound-0"/>
+        <CMvTrack_JavaSoundTrack_Source xs.ref="sound-1"/>
+      </carray_list></CTrackSourceSet><CMvTrack_Group_Source xs.n="rootTrack" xs.ref="group"/>
+    </CSceneSource>
+    <CTrackGuid xs.id="group-guid-storage" uuid="group-guid"/>
+    <CMvTrack_Group_Source xs.id="group"><ICMvTrack_Source xs.n="super">
+      <CTrackGuid xs.n="guid" xs.ref="group-guid-storage"/><CSceneSource xs.n="_sceneSource" xs.ref="scene"/>
+    </ICMvTrack_Source><carray_list xs.n="_childTrackGuids" count="2">
+      <CTrackGuid xs.ref="sound-guid-storage-0"/><CTrackGuid xs.ref="sound-guid-storage-1"/>
+    </carray_list></CMvTrack_Group_Source>
+    <CResourceGuid xs.id="sound-resource-storage" uuid="sound-resource-guid"/>
+    <CResource_Linked_Sound xs.id="sound-resource"><CResourceGuid xs.n="guid" xs.ref="sound-resource-storage"/>
+      <s xs.n="name">Unopened audio</s><s xs.n="srcFile">audio-not-read.wav</s></CResource_Linked_Sound>
+    <CAttrId xs.id="shared-volume-id" idstr="volume"/><CEffectId xs.id="shared-sound-effect-id" idstr="SoundDefault"/>
+    <AdaptType xs.id="sound-adapt"/>
+    <CTrackGuid xs.id="sound-guid-storage-0" uuid="sound-guid-0"/>
+    <CMvTrack_JavaSoundTrack_Source xs.id="sound-0"><ICMvTrack_Linked xs.n="super"><ICMvTrack_Source xs.n="super">
+      <CTrackGuid xs.n="guid" xs.ref="sound-guid-storage-0"/><s xs.n="name">Sound 0</s>
+      <i xs.n="start">0</i><i xs.n="internalOffset">0</i><i xs.n="duration">120</i>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene"/><CTrackGuid xs.n="parentGuid" xs.ref="group-guid-storage"/>
+      <CVisualHandler xs.n="visualHandler"><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-0"/></CVisualHandler>
+      <CSoundHandler xs.n="soundHandler"><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-0"/></CSoundHandler>
+      <CMvEffect_SoundDefault xs.n="soundEffect" xs.ref="sound-effect-0"/>
+      <CMvEffectManager xs.n="effectManager"><array xs.n="effectList" count="1" type="ICMvEffect">
+        <CMvEffect_SoundDefault xs.ref="sound-effect-0"/></array></CMvEffectManager>
+    </ICMvTrack_Source><CResourceGuid xs.n="_resourceGuid" xs.ref="sound-resource-storage"/></ICMvTrack_Linked>
+      <i xs.n="speed">100</i><i xs.n="startFrame">0</i><d xs.n="defaultVolume">1</d>
+    </CMvTrack_JavaSoundTrack_Source>
+    <CMvEffect_SoundDefault xs.id="sound-effect-0"><ICMvEffect xs.n="super">
+      <CEffectId xs.n="id" xs.ref="shared-sound-effect-id"/><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-0"/>
+      <array xs.n="attrList" count="1" type="ICMvAttr"><CMvAttrF xs.ref="volume-0"/></array>
+      <hash_map xs.n="attrMap" count="1"><entry><CAttrId xs.n="key" xs.ref="shared-volume-id"/>
+        <CMvAttrF xs.n="value" xs.ref="volume-0"/></entry></hash_map>
+    </ICMvEffect><CMvAttrF xs.n="attrVolume" xs.ref="volume-0"/></CMvEffect_SoundDefault>
+    <CMvAttrF xs.id="volume-0"><ICMvAttr xs.n="super"><CAttrId xs.n="id" xs.ref="shared-volume-id"/>
+      <AdaptType xs.n="adaptType" xs.ref="sound-adapt"/><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-0"/>
+    </ICMvAttr><CFixedSequence xs.n="valueData"><d xs.n="baseValue">0</d><d xs.n="curMin">0</d><d xs.n="curMax">0</d>
+      <CMvAttrF xs.n="attr" xs.ref="volume-0"/></CFixedSequence>
+      <d xs.n="rangeMin">-48</d><d xs.n="rangeMax">6</d><b xs.n="isRepeat">false</b>
+      <d xs.n="repeatMin">-1.7976931348623157E308</d><d xs.n="repeatMax">1.7976931348623157E308</d>
+      <null xs.n="linked_keyFormsForObject"/><s xs.n="futureVolumeData">preserve-volume &amp; 0.1234500</s>
+    </CMvAttrF>
+    <CTrackGuid xs.id="sound-guid-storage-1" uuid="sound-guid-1"/>
+    <CMvTrack_JavaSoundTrack_Source xs.id="sound-1"><ICMvTrack_Linked xs.n="super"><ICMvTrack_Source xs.n="super">
+      <CTrackGuid xs.n="guid" xs.ref="sound-guid-storage-1"/><s xs.n="name">Sound 1</s>
+      <i xs.n="start">10</i><i xs.n="internalOffset">2</i><i xs.n="duration">100</i>
+      <CSceneSource xs.n="_sceneSource" xs.ref="scene"/><CTrackGuid xs.n="parentGuid" xs.ref="group-guid-storage"/>
+      <CVisualHandler xs.n="visualHandler"><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-1"/></CVisualHandler>
+      <CSoundHandler xs.n="soundHandler"><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-1"/></CSoundHandler>
+      <CMvEffect_SoundDefault xs.n="soundEffect" xs.ref="sound-effect-1"/>
+      <CMvEffectManager xs.n="effectManager"><array xs.n="effectList" count="1" type="ICMvEffect">
+        <CMvEffect_SoundDefault xs.ref="sound-effect-1"/></array></CMvEffectManager>
+    </ICMvTrack_Source><CResourceGuid xs.n="_resourceGuid" xs.ref="sound-resource-storage"/></ICMvTrack_Linked>
+      <i xs.n="speed">90</i><i xs.n="startFrame">3</i><d xs.n="defaultVolume">0.5</d>
+    </CMvTrack_JavaSoundTrack_Source>
+    <CMvEffect_SoundDefault xs.id="sound-effect-1"><ICMvEffect xs.n="super">
+      <CEffectId xs.n="id" xs.ref="shared-sound-effect-id"/><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-1"/>
+      <array xs.n="attrList" count="1" type="ICMvAttr"><CMvAttrF xs.ref="volume-1"/></array>
+      <hash_map xs.n="attrMap" count="1"><entry><CAttrId xs.n="key" xs.ref="shared-volume-id"/>
+        <CMvAttrF xs.n="value" xs.ref="volume-1"/></entry></hash_map>
+    </ICMvEffect><CMvAttrF xs.n="attrVolume" xs.ref="volume-1"/></CMvEffect_SoundDefault>
+    <CMvAttrF xs.id="volume-1"><ICMvAttr xs.n="super"><CAttrId xs.n="id" xs.ref="shared-volume-id"/>
+      <AdaptType xs.n="adaptType" xs.ref="sound-adapt"/><CMvTrack_JavaSoundTrack_Source xs.n="track" xs.ref="sound-1"/>
+    </ICMvAttr><CFixedSequence xs.n="valueData"><d xs.n="baseValue">0</d><d xs.n="curMin">0</d><d xs.n="curMax">0</d>
+      <CMvAttrF xs.n="attr" xs.ref="volume-1"/></CFixedSequence>
+      <d xs.n="rangeMin">-48</d><d xs.n="rangeMax">6</d><b xs.n="isRepeat">false</b>
+      <d xs.n="repeatMin">-1.7976931348623157E308</d><d xs.n="repeatMax">1.7976931348623157E308</d>
+      <null xs.n="linked_keyFormsForObject"/>
+    </CMvAttrF>
+  </shared>
+</root>

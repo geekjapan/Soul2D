@@ -34,6 +34,117 @@ fn first_node_id(snapshot: &Value) -> u64 {
 }
 
 #[test]
+fn sound_fixed_volume_drafts_apply_noop_and_reopen_with_shared_history() {
+    let directory = temp_dir();
+    let source = directory.join("sound.can3");
+    fs::write(&source, authoring_bytes(include_str!("fixtures/can3-sound-volume.xml"))).unwrap();
+    let original = fs::read(&source).unwrap();
+    let mut controller = EditorController::new();
+    assert_eq!(controller.core_request(&json!({"op":"open","path":source}))["succeeded"], true);
+    let before = controller.snapshot().clone();
+    controller.select_can3_sound_volume("scene-guid", "sound-guid-0").unwrap();
+    assert!(controller.draft_valid() && !controller.draft_dirty());
+    assert_eq!(controller.apply_draft()["succeeded"], true);
+    assert_eq!(controller.snapshot(), &before);
+    controller.select_can3_sound_volume("scene-guid", "sound-guid-0").unwrap();
+    controller.set_draft_sound_volume(-12.125);
+    assert!(controller.draft_valid() && controller.draft_dirty());
+    assert_eq!(controller.apply_draft()["succeeded"], true);
+    let mut expected = before["model"].clone();
+    expected["scenes"][0]["soundTracks"][0]["fixedVolumeDb"] = json!(-12.125);
+    assert_eq!(controller.snapshot()["model"], expected);
+    assert!(controller.draft_view().is_none());
+    assert_eq!(controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+    assert_eq!(controller.snapshot()["model"], before["model"]);
+    assert_eq!(controller.core_request(&json!({"op":"redo"}))["succeeded"], true);
+    let saved = directory.join("saved.can3");
+    assert_eq!(controller.core_request(&json!({"op":"save","path":saved}))["succeeded"], true);
+    assert_eq!(controller.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+    assert_eq!(controller.snapshot()["model"], expected);
+    let revision = controller.snapshot()["revision"].clone();
+    let copied = controller.core_request(&json!({"op":"live2d.animation.track.duplicate","sceneGuid":"scene-guid",
+        "trackGuid":"sound-guid-0","name":"Unsaved copy","expectedRevision":revision}));
+    let guid = copied["result"]["trackGuid"].as_str().unwrap();
+    controller.select_can3_sound_volume("scene-guid", guid).unwrap();
+    controller.set_draft_sound_volume(-6.0);
+    assert_eq!(controller.apply_draft()["succeeded"], true);
+    let tracks = controller.snapshot()["model"]["scenes"][0]["soundTracks"].as_array().unwrap();
+    assert_eq!(tracks.iter().find(|t| t["guid"] == "sound-guid-0").unwrap()["fixedVolumeDb"], json!(-12.125));
+    assert_eq!(tracks.iter().find(|t| t["guid"] == guid).unwrap()["fixedVolumeDb"], json!(-6.0));
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sound_fixed_volume_drafts_retain_invalid_stale_and_failed_selections() {
+    let directory = temp_dir();
+    let source = directory.join("sound.can3");
+    let xml = include_str!("fixtures/can3-sound-volume.xml").replacen("<d xs.n=\"rangeMin\">-48</d>", "", 1);
+    fs::write(&source, authoring_bytes(&xml)).unwrap();
+    let mut controller = EditorController::new();
+    assert_eq!(controller.core_request(&json!({"op":"open","path":source}))["succeeded"], true);
+    controller.select_can3_sound_volume("scene-guid", "sound-guid-1").unwrap();
+    for (scene, track) in [("scene-guid", "sound-guid-0"), ("missing", "sound-guid-1"), ("scene-guid", "missing")] {
+        assert!(controller.select_can3_sound_volume(scene, track).is_err());
+        assert!(matches!(controller.draft_view(), Some(DraftView::Can3SoundVolume { track_guid:"sound-guid-1", value:0.0, .. })));
+    }
+    let before = controller.snapshot().clone();
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -48.001, 6.001] {
+        controller.set_draft_sound_volume(value);
+        assert!(controller.draft_dirty() && !controller.draft_valid());
+        assert_eq!(controller.apply_draft()["succeeded"], false);
+        assert_eq!(controller.snapshot(), &before);
+        assert!(!controller.can_close());
+        assert_eq!(controller.select_can3_sound_volume("scene-guid", "sound-guid-0").unwrap_err(), RESELECT_BLOCKED_MESSAGE);
+        assert_eq!(controller.core_request(&json!({"op":"save","path":directory.join("blocked.can3")}))["message"], FILE_OP_BLOCKED_MESSAGE);
+        assert_eq!(controller.core_request(&json!({"op":"new"}))["message"], FILE_OP_BLOCKED_MESSAGE);
+        assert!(controller.draft_view().is_some());
+    }
+    controller.set_draft_sound_volume(-12.0);
+    let revision = controller.snapshot()["revision"].clone();
+    assert_eq!(controller.core_request(&json!({"op":"live2d.animation.scene.set","sceneGuid":"scene-guid",
+        "name":"Concurrent","expectedRevision":revision}))["succeeded"], true);
+    let changed = controller.snapshot().clone();
+    assert!(controller.draft_stale());
+    for value in [-12.0, 0.0] {
+        controller.set_draft_sound_volume(value);
+        assert_eq!(controller.apply_draft()["succeeded"], false);
+        assert_eq!(controller.snapshot(), &changed);
+        assert!(controller.draft_view().is_some());
+    }
+    controller.discard_draft();
+    assert!(controller.draft_view().is_none());
+    assert_eq!(controller.snapshot(), &changed);
+    assert!(!controller.can_close());
+    assert_eq!(controller.core_request(&json!({"op":"save","path":directory.join("changed.can3")}))["succeeded"], true);
+    assert!(controller.can_close());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sound_fixed_volume_readable_unowned_drafts_refuse_equal_and_changed_values() {
+    let directory = temp_dir();
+    let source = directory.join("referenced.can3");
+    let xml = include_str!("fixtures/can3-sound-volume.xml")
+        .replace("</shared>", "<CMvAttrF xs.ref=\"volume-0\"/></shared>");
+    fs::write(&source, authoring_bytes(&xml)).unwrap();
+    let original = fs::read(&source).unwrap();
+    let mut controller = EditorController::new();
+    assert_eq!(controller.core_request(&json!({"op":"open","path":source}))["succeeded"], true);
+    let before = controller.snapshot().clone();
+    assert_eq!(before["model"]["scenes"][0]["soundTracks"][0]["fixedVolumeDb"], 0.0);
+    controller.select_can3_sound_volume("scene-guid", "sound-guid-0").unwrap();
+    for value in [0.0, -12.0] {
+        controller.set_draft_sound_volume(value);
+        assert_eq!(controller.apply_draft()["succeeded"], false);
+        assert_eq!(controller.snapshot(), &before);
+        assert!(matches!(controller.draft_view(), Some(DraftView::Can3SoundVolume { value: kept, .. }) if kept == value));
+    }
+    assert_eq!(fs::read(source).unwrap(), original);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn image_anchor_draft_applies_undoes_and_reopens() {
     let directory = temp_dir();
     let source = directory.join("image.can3");

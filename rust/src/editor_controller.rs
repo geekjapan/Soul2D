@@ -176,12 +176,32 @@ enum EditDraft {
         revision: u64,
         edit: Can3ScalarDraft,
     },
+    Can3SoundVolume {
+        scene_guid: String,
+        track_guid: String,
+        revision: u64,
+        original: f64,
+        value: f64,
+    },
 }
 
 impl EditDraft {
     fn revision(&self) -> u64 {
         match self {
-            Self::NodeName { revision, .. } | Self::Can3 { revision, .. } => *revision,
+            Self::NodeName { revision, .. } | Self::Can3 { revision, .. }
+                | Self::Can3SoundVolume { revision, .. } => *revision,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Can3 { edit: Can3ScalarDraft::Anchor { value, .. }, .. } if !value.is_finite() =>
+                Err("animation anchor value must be finite".into()),
+            Self::Can3 { edit: Can3ScalarDraft::Handle { value, .. }, .. } if !value.is_finite() =>
+                Err("animation handle frame and value must be finite".into()),
+            Self::Can3SoundVolume { value, .. } =>
+                crate::animation_source::SoundVolumeDb::parse(*value).map(|_| ()),
+            _ => Ok(()),
         }
     }
 }
@@ -211,6 +231,12 @@ pub enum DraftView<'a> {
         target: &'a Can3KeyTarget,
         original: Can3CurveType,
         value: Can3CurveType,
+    },
+    Can3SoundVolume {
+        scene_guid: &'a str,
+        track_guid: &'a str,
+        original: f64,
+        value: f64,
     },
 }
 
@@ -793,6 +819,32 @@ impl EditorController {
         Ok(())
     }
 
+    pub fn select_can3_sound_volume(&mut self, scene_guid: &str, track_guid: &str) -> Result<(), String> {
+        if self.draft_dirty() { return Err(RESELECT_BLOCKED_MESSAGE.to_owned()); }
+        if self.snapshot["documentFormat"].as_str() != Some("live2d.can3") {
+            return Err("Sound volume drafts require a CAN3 document".into());
+        }
+        let scenes = self.snapshot["model"]["scenes"].as_array().ok_or("CAN3 model lacks scenes")?;
+        let mut scenes = scenes.iter().filter(|scene| scene["guid"].as_str() == Some(scene_guid));
+        let scene = scenes.next().ok_or("animation sceneGuid was not found")?;
+        if scenes.next().is_some() { return Err("animation sceneGuid is ambiguous".into()); }
+        let tracks = scene["soundTracks"].as_array().ok_or("CAN3 scene lacks Sound tracks")?;
+        let mut tracks = tracks.iter().filter(|track| track["guid"].as_str() == Some(track_guid));
+        let track = tracks.next().ok_or("animation trackGuid was not found")?;
+        if tracks.next().is_some() { return Err("animation trackGuid is ambiguous".into()); }
+        let value = track["fixedVolumeDb"].as_f64().ok_or("Sound fixed volume is unsupported")?;
+        crate::animation_source::SoundVolumeDb::parse(value)?;
+        self.draft = Some(EditDraft::Can3SoundVolume {
+            scene_guid: scene_guid.to_owned(), track_guid: track_guid.to_owned(),
+            revision: self.revision(), original: value, value,
+        });
+        Ok(())
+    }
+
+    pub fn set_draft_sound_volume(&mut self, value: f64) {
+        if let Some(EditDraft::Can3SoundVolume { value: current, .. }) = &mut self.draft { *current = value; }
+    }
+
     pub fn set_draft_name(&mut self, value: String) {
         if let Some(EditDraft::NodeName { value: current, .. }) = &mut self.draft {
             *current = value;
@@ -842,6 +894,10 @@ impl EditorController {
                     target, original: *original, value: *value,
                 },
             }),
+            Some(EditDraft::Can3SoundVolume { scene_guid, track_guid, original, value, .. }) =>
+                Some(DraftView::Can3SoundVolume {
+                    scene_guid, track_guid, original: *original, value: *value,
+                }),
             None => None,
         }
     }
@@ -852,6 +908,7 @@ impl EditorController {
                 original, value, ..
             }) => original != value,
             Some(EditDraft::Can3 { edit, .. }) => edit.dirty(),
+            Some(EditDraft::Can3SoundVolume { original, value, .. }) => original != value,
             None => false,
         }
     }
@@ -861,6 +918,10 @@ impl EditorController {
             Some(draft) => draft.revision() != self.revision(),
             None => false,
         }
+    }
+
+    pub fn draft_valid(&self) -> bool {
+        self.draft.as_ref().is_some_and(|draft| draft.validate().is_ok())
     }
 
     pub fn discard_draft(&mut self) {
@@ -875,6 +936,10 @@ impl EditorController {
             self.status = "draft is stale; discard it and reselect".into();
             return failure("draft is stale; discard it and reselect");
         }
+        if let Err(message) = draft.validate() {
+            self.status = message.clone();
+            return failure(&message);
+        }
         let request = match draft {
             EditDraft::NodeName { id, value, .. } => {
                 json!({"op":"node.rename", "id":id, "name":value})
@@ -884,18 +949,10 @@ impl EditorController {
                 request["expectedRevision"] = json!(revision);
                 match edit {
                     Can3ScalarDraft::Anchor { value, .. } => {
-                        if !value.is_finite() {
-                            self.status = "animation anchor value must be finite".into();
-                            return failure("animation anchor value must be finite");
-                        }
                         request["op"] = json!("live2d.animation.key.set");
                         request["value"] = json!(value);
                     }
                     Can3ScalarDraft::Handle { side, value, .. } => {
-                        if !value.is_finite() {
-                            self.status = "animation handle frame and value must be finite".into();
-                            return failure("animation handle frame and value must be finite");
-                        }
                         request["op"] = json!("live2d.animation.handle.set");
                         request["side"] = json!(side.as_str());
                         request["frame"] = json!(value.frame);
@@ -908,6 +965,9 @@ impl EditorController {
                 }
                 request
             }
+            EditDraft::Can3SoundVolume { scene_guid, track_guid, revision, value, .. } =>
+                json!({"op":"live2d.animation.sound_volume.set","sceneGuid":scene_guid,
+                    "trackGuid":track_guid,"value":value,"expectedRevision":revision}),
         };
         let response = self.session.handle_request(&request);
         if response["succeeded"].as_bool() == Some(true) {

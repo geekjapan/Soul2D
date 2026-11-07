@@ -240,6 +240,7 @@ pub const DOCUMENT_EDIT: &[&str] = &[
     "live2d_animation_scene_add",
     "live2d_animation_scene_delete",
     "live2d_animation_scene_set",
+    "live2d_animation_sound_volume_set",
     "live2d_animation_track_add",
     "live2d_animation_track_delete",
     "live2d_animation_track_duplicate",

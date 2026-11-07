@@ -175,6 +175,12 @@ impl Document {
         Ok(bytes)
     }
 
+    pub(crate) fn validate_sound_volume_target(&self, request: &Value) -> Result<(), String> {
+        let bytes = self.encode()?;
+        let current = crate::caff::CaffDocument::parse(&bytes)?;
+        crate::animation_source::validate_sound_volume_target(&current, &self.model, request)
+    }
+
     /// The sources this session copied in a CMO3 document.
     pub fn copies(&self) -> &[crate::authoring_copy::Copy] {
         match &self.storage {
