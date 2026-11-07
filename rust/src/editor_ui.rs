@@ -17236,6 +17236,34 @@ mod shell_flow_tests {
     }
 
     #[test]
+    fn frame_close_native_and_eof_do_not_override_a_completed_replacement_confirmation() {
+        let (mut app,_)=app("frame-close-replacement-confirmation");
+        edit(&mut app,"Modified");
+        app.command(json!({"op":"new"}));
+        assert!(app.unsaved.is_some());
+        let mut harness=Harness::new();
+        let mut frame=eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        let at=crate::editor_test_support::center(&output,Role::Button,"Don't Save");
+        let press=|pressed|egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed,
+            modifiers:egui::Modifiers::NONE};
+        let (sender,receiver)=std::sync::mpsc::channel(); app.host_rx=Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap();
+        harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close)));
+        let mut cancelled=false;
+        harness.frame(vec![egui::Event::PointerMoved(at),press(true),press(false)],|ctx| {
+            app.update(ctx,&mut frame);
+            cancelled=ctx.viewport(|viewport|viewport.commands.contains(&egui::ViewportCommand::CancelClose));
+        });
+        assert!(names(&app).is_empty() && !modified(&app),"the replacement confirmation must complete");
+        assert!(cancelled && app.stdin_closed && !app.closing && app.unsaved.is_none() && harness.close_requests==0);
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert!(!app.closing && harness.close_requests==0,"consumed EOF cannot retry after replacement");
+    }
+
+    #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
         app.window.observe(Some((900.0, 700.0)), Some(false));
