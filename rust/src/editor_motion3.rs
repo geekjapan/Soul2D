@@ -1124,6 +1124,23 @@ mod tests {
             })
         }
 
+        fn frame(&mut self, events: Vec<egui::Event>) -> crate::editor_test_support::Out {
+            let (panel, controller, looping) = (&mut self.panel, &mut self.controller, &mut self.looping);
+            self.harness.frame(events, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| { panel.show(ui, controller, looping); });
+                });
+            })
+        }
+
+        fn number_text(&mut self, label: &str, raw: &str) -> crate::editor_test_support::Out {
+            self.click(Role::SpinButton, label);
+            let key = |pressed| egui::Event::Key { key:egui::Key::A, physical_key:None, pressed,
+                repeat:false, modifiers:egui::Modifiers::COMMAND };
+            self.frame(vec![key(true),key(false),egui::Event::Text(raw.into())]);
+            self.frame(Vec::new())
+        }
+
         fn click(&mut self, role: Role, label: &str) -> crate::editor_test_support::Out {
             let (panel, controller, looping) = (&mut self.panel, &mut self.controller, &mut self.looping);
             self.harness.click(role, label, |ctx| {
@@ -1198,6 +1215,126 @@ mod tests {
         // Importing the same name again is refused by the session.
         rig.click(Role::Button, "Import Motion3");
         assert!(rig.panel.error.contains("already exists"), "{}", rig.panel.error);
+    }
+
+    #[test]
+    fn motion3_raw_apply_validates_both_fields_and_retains_unfinished_input() {
+        for invalid in ["Time (seconds)", "Value"] {
+            let mut rig = Rig::new(&format!("motion3-raw-partial-{invalid}"));
+            rig.import(); rig.draw();
+            let valid = if invalid == "Time (seconds)" { "Value" } else { "Time (seconds)" };
+            let value = if valid == "Value" { "5.25" } else { "0.25" };
+            rig.number_text(valid, value);
+            let shown = rig.number_text(invalid, "unfinished-motion3-number");
+            assert!(texts(&shown).iter().any(|text|text=="unfinished-motion3-number"));
+            assert!(rig.panel.has_draft());
+            let before = rig.snapshot();
+            rig.click(Role::Button, "Apply point");
+            assert_eq!(rig.snapshot(), before, "{invalid}: no partial commit may ignore the other input");
+            assert!(rig.panel.has_draft() && !rig.panel.error.is_empty());
+            assert!(texts(&rig.draw()).iter().any(|text|text=="unfinished-motion3-number"));
+        }
+    }
+
+    #[test]
+    fn motion3_raw_clean_refresh_replaces_the_previous_editing_text() {
+        let mut rig = Rig::new("motion3-raw-clean-refresh"); rig.import(); rig.draw();
+        let shown = rig.number_text("Value", "2.0000000000000");
+        assert!(texts(&shown).iter().any(|text|text=="2.0000000000000"));
+        assert!(!rig.panel.has_draft());
+        assert_eq!(rig.controller.core_request(&json!({"op":"motion3.point.set", "name":"Wave",
+            "curve":0,"point":0,"value":9.5}))["succeeded"], true);
+        let before = rig.snapshot(); let output = rig.draw();
+        assert_eq!(rig.panel.point.as_ref().unwrap().value, 9.5);
+        assert!(!rig.panel.has_draft());
+        assert!(!texts(&output).iter().any(|text|text=="2.0000000000000"));
+        rig.click(Role::SpinButton, "Value");
+        let key = |pressed|egui::Event::Key {key:egui::Key::End,physical_key:None,pressed,repeat:false,
+            modifiers:egui::Modifiers::NONE};
+        rig.frame(vec![key(true),key(false),egui::Event::Text("0".into())]); rig.frame(Vec::new());
+        assert_eq!(rig.panel.point.as_ref().unwrap().value, 9.5);
+        assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_raw_numbers_keep_finite_grammar_and_refuse_nonfinite_input() {
+        for (field, raw, expected) in [("Time (seconds)"," 0 . 0 ",Some(0.0)),("Time (seconds)","−0.5",Some(-0.5)),
+            ("Time (seconds)","1e2",Some(100.0)),("Time (seconds)","NaN",None),("Time (seconds)","inf",None),
+            ("Value","2.0000000000000",Some(2.0)),("Value","0.1234567890123456",Some(0.1234567890123456)),
+            ("Value","1e-7",Some(1e-7)),("Value","1e308",Some(1e308)),("Value","NaN",None),("Value","inf",None)] {
+            let mut rig = Rig::new(&format!("motion3-raw-grammar-{field}-{raw}")); rig.import(); rig.draw();
+            let before = rig.snapshot(); rig.number_text(field, raw);
+            assert_eq!(rig.snapshot(), before);
+            if let Some(expected) = expected {
+                let point = rig.panel.point.as_ref().unwrap();
+                assert_eq!(if field=="Value" {point.value} else {point.time}, expected, "{field} {raw}");
+                assert_eq!(rig.panel.has_draft(), expected != if field=="Value" {2.0} else {0.0});
+            } else {
+                rig.click(Role::Button,"Apply point");
+                assert_eq!(rig.snapshot(), before);
+                assert!(rig.panel.has_draft() && !rig.panel.error.is_empty());
+                assert!(texts(&rig.draw()).iter().any(|text|text==raw), "{field} {raw}: preserve the actual nonfinite input");
+            }
+        }
+    }
+
+    #[test]
+    fn motion3_raw_keyboard_keeps_focus_when_a_draft_notice_appears() {
+        for (field, initial, suffix) in [("Time (seconds)","0.2","5"),("Value","3","4")] {
+            let mut rig = Rig::new(&format!("motion3-raw-incremental-{field}")); rig.import(); rig.draw();
+            let before = rig.snapshot(); rig.click(Role::SpinButton, field);
+            let focus = rig.harness.ctx.memory(|memory|memory.focused()).unwrap();
+            let key = |key, pressed, modifiers|egui::Event::Key {key,physical_key:None,pressed,repeat:false,modifiers};
+            rig.frame(vec![key(egui::Key::A,true,egui::Modifiers::COMMAND),key(egui::Key::A,false,egui::Modifiers::COMMAND),
+                egui::Event::Text(initial.into())]); rig.frame(Vec::new());
+            assert_eq!(rig.harness.ctx.memory(|memory|memory.focused()), Some(focus), "{field}: keep the active editor after its first change");
+            rig.frame(vec![key(egui::Key::End,true,egui::Modifiers::NONE),key(egui::Key::End,false,egui::Modifiers::NONE),
+                egui::Event::Text(suffix.into())]); rig.frame(Vec::new());
+            let expected = format!("{initial}{suffix}").parse::<f64>().unwrap();
+            let point = rig.panel.point.as_ref().unwrap();
+            assert_eq!(if field=="Value" {point.value} else {point.time}, expected);
+            assert_eq!(rig.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_focus_alone_preserves_loaded_precision_and_clean_state() {
+        for (field, slot) in [("Time (seconds)",0),("Value",1)] {
+            let mut rig = Rig::new(&format!("motion3-raw-precise-focus-{field}"));
+            let mut motion = fixture(); motion["Curves"][0]["Segments"][slot] = json!(0.1234567890123456);
+            std::fs::write(rig.dir.join("wave.motion3.json"), motion.to_string()).unwrap();
+            rig.import(); rig.draw(); let before = rig.snapshot();
+            rig.click(Role::SpinButton, field);
+            let key = |pressed|egui::Event::Key {key:egui::Key::Tab,physical_key:None,pressed,repeat:false,
+                modifiers:egui::Modifiers::NONE};
+            rig.frame(vec![key(true),key(false)]); rig.frame(Vec::new()); rig.frame(Vec::new());
+            let point = rig.panel.point.as_ref().unwrap();
+            assert_eq!(if field=="Value" {point.value} else {point.time}, 0.1234567890123456);
+            assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_export_and_selection_controls_protect_unfinished_point_input() {
+        let mut observed = Vec::new();
+        for field in ["Time (seconds)", "Value"] {
+            let mut rig = Rig::new(&format!("motion3-raw-export-{field}")); rig.import();
+            let path = rig.dir.join("exported.motion3.json");
+            rig.panel.export_path = path.to_string_lossy().into_owned(); rig.draw();
+            let original = std::fs::read(rig.dir.join("wave.motion3.json")).unwrap();
+            let output = rig.number_text(field, "unfinished-export-input");
+            assert!(texts(&output).iter().any(|text|text=="unfinished-export-input"));
+            let disabled = [(Role::ComboBox,"Motion3"),(Role::ComboBox,"Curve"),(Role::ComboBox,"Logical point"),
+                (Role::Button,"Export Motion3"),(Role::Button,"Reload Motion3")].into_iter().all(|(role,label)|
+                    crate::editor_test_support::find(&output,role,label).unwrap().is_disabled());
+            let before = rig.snapshot(); rig.click(Role::Button, "Export Motion3");
+            assert_eq!(rig.snapshot(), before);
+            assert_eq!(std::fs::read(rig.dir.join("wave.motion3.json")).unwrap(), original);
+            observed.push(json!({"field":field,"fileWritten":path.exists(),"controlsDisabled":disabled,
+                "rawAfter":texts(&rig.draw()).iter().any(|text|text=="unfinished-export-input"),"draft":rig.panel.has_draft()}));
+        }
+        assert!(observed.iter().all(|row|row["fileWritten"]==false && row["controlsDisabled"]==true
+            && row["rawAfter"]==true && row["draft"]==true), "{observed:?}");
     }
 
     #[test]

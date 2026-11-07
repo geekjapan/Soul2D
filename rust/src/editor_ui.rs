@@ -16892,6 +16892,160 @@ mod shell_flow_tests {
         }
     }
 
+    fn motion3_raw_full_app_case(field: &str, action: &str, input: &str) -> Value {
+        let (mut app, dir) = app(&format!("motion3-raw-{field}-{action}-{input}"));
+        let source_json = dir.join("wave.motion3.json");
+        let motion = json!({"Version":3,"Meta":{"Duration":2,"Fps":30,"Loop":true,
+            "AreBeziersRestricted":false,"CurveCount":1,"TotalSegmentCount":1,"TotalPointCount":2},
+            "Curves":[{"Target":"Parameter","Id":"Linear","Segments":[0,2,0,1,6]}]});
+        let json_bytes = motion.to_string().into_bytes();
+        std::fs::write(&source_json, &json_bytes).unwrap();
+        app.command(json!({"op":"motion3.import", "name":"Wave", "path":source_json}));
+        let source = dir.join("model.inx");
+        app.command(json!({"op":"save", "path":source}));
+        app.command(json!({"op":"open", "path":source}));
+        assert_eq!(app.controller.snapshot()["documentFormat"], "inx");
+        assert_eq!(app.controller.core_request(&json!({"op":"motion3.read", "name":"Wave"}))["succeeded"], true);
+        assert_eq!(app.controller.snapshot()["modified"], false);
+        assert_eq!(app.controller.project_path(), Some(source.as_path()));
+        let original = std::fs::read(&source).unwrap();
+        let target = dir.join("output.inx");
+        app.file_path = target.to_string_lossy().into_owned();
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1800.0, 5000.0);
+        let mut frame = eframe::Frame::_new_kittest();
+        let popup = harness.click(Role::ComboBox, "Motion3", |ctx| app.update(ctx, &mut frame));
+        let wave = popup.iter().find(|(_, node)| crate::editor_test_support::name_of(&popup, node).as_deref() == Some("Wave"))
+            .expect("the actual Motion3 popup lists the saved Wave motion").1.role();
+        harness.click(wave, "Wave", |ctx| app.update(ctx, &mut frame));
+        let valid = if field == "Time (seconds)" { "0.25" } else { "5.25" };
+        if input != "clean" {
+            object_number_text(&mut harness, field, if input == "valid" { valid } else { "motion3-unparsed-probe" },
+                |ctx| app.update(ctx, &mut frame));
+        }
+        let shown = harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+        let raw_before = texts(&shown).iter().any(|text| text == "motion3-unparsed-probe");
+        let numeric = crate::editor_test_support::find(&shown, Role::SpinButton, field).unwrap().numeric_value();
+        assert_eq!(numeric, Some(if input == "valid" { valid.parse::<f64>().unwrap() }
+            else if field == "Time (seconds)" { 0.0 } else { 2.0 }));
+        let before = app.controller.snapshot().clone();
+        let draft_before = app.motion3.has_draft();
+        let panel_before = app.controller.panel_drafts;
+        let can_close_before = app.controller.can_close();
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let mut response = None;
+        let after = match action {
+            "save_as" => harness.click(Role::Button, "Save As", |ctx| app.update(ctx, &mut frame)),
+            "native_save" => {
+                app.run_action(EditorAction::Save);
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame))
+            }
+            "new" => harness.click(Role::Button, "New", |ctx| app.update(ctx, &mut frame)),
+            "mcp_save" => {
+                let (sender, receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
+                let (reply, written) = sync_channel(1);
+                sender.send(HostMessage::Rpc { request:json!({"jsonrpc":"2.0", "id":"motion3-raw-save", "method":"tools/call",
+                    "params":{"name":"save", "arguments":{"path":target}}}), reply }).unwrap();
+                let output = harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
+                response = written.try_recv().unwrap().into_message(); output
+            }
+            "blur" => {
+                if let Some(focus) = harness.ctx.memory(|memory| memory.focused()) {
+                    harness.ctx.memory_mut(|memory| memory.surrender_focus(focus));
+                }
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame))
+            }
+            "native_close" | "eof" => {
+                if action == "native_close" {
+                    harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                        .events.push(egui::ViewportEvent::Close)));
+                } else {
+                    let (sender, receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
+                    sender.send(HostMessage::StdinClosed).unwrap();
+                }
+                harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame))
+            }
+            _ => panic!("unknown Motion3 raw-input action"),
+        };
+        assert_eq!(std::fs::read(&source_json).unwrap(), json_bytes);
+        let source_bytes_same = std::fs::read(&source).unwrap() == original;
+        if action != "native_save" { assert!(source_bytes_same); }
+        json!({"field":field,"action":action,"input":input,"rawBefore":raw_before,"numeric":numeric,
+            "draftBefore":draft_before,"panelBefore":panel_before,"canCloseBefore":can_close_before,
+            "rawAfter":texts(&after).iter().any(|text|text=="motion3-unparsed-probe"),
+            "fileWritten":target.exists(),"sourceBytesSame":source_bytes_same,
+            "sourceMtimeChanged":std::fs::metadata(&source).unwrap().modified().unwrap()!=mtime,
+            "snapshotSame":app.controller.snapshot()==&before,"formatAfter":app.controller.snapshot()["documentFormat"],
+            "draftAfter":app.motion3.has_draft(),"panelAfter":app.controller.panel_drafts,
+            "closeCommands":harness.close_requests,"closing":app.closing,"notice":app.notice,
+            "mcpError":response.as_ref().map(|reply|reply["result"]["isError"].clone())})
+    }
+
+    fn assert_motion3_raw_full_app_preserved(action: &str) {
+        for field in ["Time (seconds)", "Value"] {
+            let observed = motion3_raw_full_app_case(field, action, "invalid");
+            assert_eq!(observed["rawBefore"], true, "{observed}");
+            assert_eq!(observed["fileWritten"], false, "{observed}");
+            assert_eq!(observed["sourceMtimeChanged"], false, "{observed}");
+            assert_eq!(observed["sourceBytesSame"], true, "{observed}");
+            assert_eq!(observed["snapshotSame"], true, "{observed}");
+            assert_eq!(observed["closeCommands"], 0, "{observed}");
+            assert_eq!(observed["rawAfter"], true, "{observed}");
+            assert_eq!(observed["draftBefore"], true, "{observed}");
+            assert_eq!(observed["panelBefore"], true, "{observed}");
+            assert_eq!(observed["canCloseBefore"], false, "{observed}");
+            assert_eq!(observed["draftAfter"], true, "{observed}");
+            if action == "mcp_save" { assert_eq!(observed["mcpError"], true); }
+        }
+    }
+
+    #[test]
+    fn motion3_raw_full_app_save_as_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("save_as"); }
+    #[test]
+    fn motion3_raw_full_app_native_overwrite_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("native_save"); }
+    #[test]
+    fn motion3_raw_full_app_replacement_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("new"); }
+    #[test]
+    fn motion3_raw_full_app_mcp_save_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("mcp_save"); }
+    #[test]
+    fn motion3_raw_full_app_native_close_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("native_close"); }
+    #[test]
+    fn motion3_raw_full_app_eof_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("eof"); }
+    #[test]
+    fn motion3_raw_full_app_blur_preserves_unfinished_input() { assert_motion3_raw_full_app_preserved("blur"); }
+
+    #[test]
+    fn motion3_raw_full_app_clean_controls_keep_save_replace_and_close_available() {
+        for field in ["Time (seconds)", "Value"] {
+            for action in ["save_as", "native_save", "new", "mcp_save", "native_close", "eof", "blur"] {
+                let observed = motion3_raw_full_app_case(field, action, "clean");
+                assert_eq!(observed["fileWritten"], matches!(action,"save_as"|"mcp_save"), "{observed}");
+                assert_eq!(observed["sourceMtimeChanged"], action == "native_save", "{observed}");
+                assert_eq!(observed["snapshotSame"], action != "new", "{observed}");
+                assert_eq!(observed["closeCommands"], usize::from(matches!(action,"native_close"|"eof")), "{observed}");
+                assert_eq!(observed["closing"], action == "native_close", "{observed}");
+                assert_eq!(observed["draftAfter"], false, "{observed}");
+                if action == "mcp_save" { assert_eq!(observed["mcpError"], false); }
+            }
+        }
+    }
+
+    #[test]
+    fn motion3_raw_full_app_valid_controls_keep_existing_draft_guards() {
+        for field in ["Time (seconds)", "Value"] {
+            for action in ["save_as", "native_save", "new", "mcp_save", "native_close", "eof", "blur"] {
+                let observed = motion3_raw_full_app_case(field, action, "valid");
+                assert_eq!(observed["fileWritten"], false, "{observed}");
+                assert_eq!(observed["sourceMtimeChanged"], false, "{observed}");
+                assert_eq!(observed["snapshotSame"], true, "{observed}");
+                assert_eq!(observed["closeCommands"], 0, "{observed}");
+                assert_eq!(observed["closing"], false, "{observed}");
+                assert_eq!(observed["draftBefore"], true, "{observed}");
+                assert_eq!(observed["draftAfter"], true, "{observed}");
+                if action == "mcp_save" { assert_eq!(observed["mcpError"], true); }
+            }
+        }
+    }
+
     fn object_draft_app(name: &str) -> (EditorApp, PathBuf, Harness) {
         let (mut app, dir) = app(name);
         let source = dir.join("object.cmo3");
