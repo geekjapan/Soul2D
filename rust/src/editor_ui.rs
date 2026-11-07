@@ -17216,6 +17216,26 @@ mod shell_flow_tests {
     }
 
     #[test]
+    fn frame_close_does_not_reopen_a_confirmation_cancelled_in_the_same_frame() {
+        let (mut app,_)=app("frame-close-cancel-same-frame");
+        edit(&mut app,"Modified");
+        let mut harness=Harness::new();
+        let mut frame=eframe::Frame::_new_kittest();
+        let close=|input:&mut egui::RawInput|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close);
+        harness.next_input=Some(Box::new(close));
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert!(app.unsaved.is_some());
+        let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        let at=crate::editor_test_support::center(&output,Role::Button,"Cancel");
+        let press=|pressed|egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed,
+            modifiers:egui::Modifiers::NONE};
+        harness.next_input=Some(Box::new(close));
+        harness.frame(vec![egui::Event::PointerMoved(at),press(true),press(false)],|ctx|app.update(ctx,&mut frame));
+        assert!(!app.closing && app.unsaved.is_none() && harness.close_requests==0);
+    }
+
+    #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
         app.window.observe(Some((900.0, 700.0)), Some(false));
