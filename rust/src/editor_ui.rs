@@ -17120,6 +17120,54 @@ mod shell_flow_tests {
     }
 
     #[test]
+    fn frame_close_eof_is_one_shot_and_transport_failures_never_request_close() {
+        for event in ["eof","failed","disconnected"] {
+            let (mut app,_,mut harness)=object_range_app(&format!("frame-close-{event}"));
+            let (sender,receiver)=std::sync::mpsc::channel(); app.host_rx=Some(receiver);
+            match event {
+                "eof" => sender.send(HostMessage::StdinClosed).unwrap(),
+                "failed" => sender.send(HostMessage::Failed).unwrap(),
+                _ => {},
+            }
+            drop(sender);
+            let before=app.controller.snapshot().clone();
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert!(app.stdin_closed && app.host_rx.is_none());
+            assert_eq!(harness.close_requests,usize::from(event=="eof"),"{event}");
+            assert!(!app.closing);
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(harness.close_requests,usize::from(event=="eof"),"no transport retry for {event}");
+            assert_eq!(app.controller.snapshot(),&before);
+        }
+    }
+
+    #[test]
+    fn frame_close_native_preserves_human_ask_and_discard_policies() {
+        for discard in [false,true] {
+            let (mut app,_)=app(&format!("frame-close-human-{discard}"));
+            edit(&mut app,"Modified");
+            if discard {
+                window_shell::set_close_setting(&mut app.tools.store,window_shell::CloseSetting::DontSave).unwrap();
+            }
+            let before=app.controller.snapshot().clone();
+            let mut harness=Harness::new();
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                .events.push(egui::ViewportEvent::Close)));
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(app.closing,discard);
+            assert_eq!(app.unsaved.is_some(),!discard);
+            assert_eq!(harness.close_requests,usize::from(discard));
+            if !discard {
+                harness.click(Role::Button,"Cancel",|ctx|app.update(ctx,&mut frame));
+                assert!(!app.closing && app.unsaved.is_none() && harness.close_requests==0);
+            }
+            assert_eq!(app.controller.snapshot(),&before);
+        }
+    }
+
+    #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
         app.window.observe(Some((900.0, 700.0)), Some(false));
