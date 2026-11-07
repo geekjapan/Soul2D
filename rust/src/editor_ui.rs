@@ -16903,6 +16903,22 @@ mod shell_flow_tests {
     }
 
     #[test]
+    fn object_raw_range_clean_external_refresh_replaces_old_keyboard_text() {
+        let (mut app,_,mut harness) = object_range_app("objects-range-clean-refresh-text");
+        object_range_text(&mut app,&mut harness,"Minimum","-1.0");
+        assert!(!app.objects.has_draft(),"same numeric value keeps the existing semantic-clean behavior");
+        let response = app.controller.core_request(&json!({"op":"live2d.parameter.edit","guid":"parameter-guid",
+            "minimum":-2.0,"expectedRevision":app.controller.snapshot()["revision"]}));
+        assert_eq!(response["succeeded"],true,"{response}");
+        let output = harness.frame(Vec::new(),|ctx| object_range_draw(&mut app,ctx));
+        let value = crate::editor_test_support::find(&output,Role::SpinButton,"Minimum").unwrap().numeric_value();
+        assert_eq!(value,Some(-2.0));
+        assert!(!crate::editor_test_support::texts(&output).iter().any(|text|text=="-1.0"),
+            "clean model refresh must not leave the prior owner's keyboard text visible");
+        assert!(!app.objects.has_draft());
+    }
+
+    #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
         app.window.observe(Some((900.0, 700.0)), Some(false));
