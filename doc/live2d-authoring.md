@@ -1525,6 +1525,24 @@ mode, clipping inversion, offscreen drawing and clipping masks of the source.
 `expectedRevision` the draft was loaded at, name only the settings that changed,
 and show the refusal text when the file cannot store a setting.
 
+All authored numeric fields in this panel retain incomplete or nonfinite text
+when focus moves. Such text counts as a pending edit. Each Apply validates its
+whole group before sending a request; a valid sibling field cannot cause a
+partial commit. Applying another group retains the pending text and its original
+values. Dirty input blocks Save, document replacement, Close and EOF shutdown
+through the existing panel-draft checks. **Discard main edit** clears only the
+main input; **Reload form** clears all three groups. A clean refresh replaces
+the editing text along with the loaded values.
+
+Finite keyboard input keeps the existing whitespace, Unicode minus and exponent
+grammar, range clamps and integer casts. Unfinished text and nonfinite results
+are refused before a clamp or cast can turn them into a value. Numeric-equivalent
+spellings remain clean. Untouched loaded integers, precise floats and legacy
+out-of-range values are preserved. Main form opacity remains an unbounded finite
+number, independently of the control-point opacity range. The `forms_raw_`
+tests exercise these controls and the full CPU editor frame; physical native
+input and vendor acceptance remain separate.
+
 For an existing ArtPath, this panel offers **Closed**, **Division count**
 (`0..4294967295`), **Brush**, **Invert clipping mask**, and **Clipping masks**.
 Brush choices come from the document's existing list and include their GUIDs.

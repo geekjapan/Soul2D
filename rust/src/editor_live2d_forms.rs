@@ -4,6 +4,128 @@ use eframe::egui;
 use serde_json::{json, Map, Value};
 use soul2d_core::editor_controller::EditorController;
 
+mod number_input {
+    use eframe::egui;
+    use std::{cell::{Cell, RefCell}, ops::RangeInclusive, sync::atomic::{AtomicU64, Ordering}};
+
+    enum Content<T> { Value(T), Text(String) }
+    enum Change { Text(String), Number(f64) }
+
+    pub(super) struct NumberInput<T> {
+        content: Content<T>,
+        seed: f64,
+        label: &'static str,
+        speed: f64,
+        range: RangeInclusive<f64>,
+        max_decimals: usize,
+        view_id: egui::Id,
+    }
+
+    fn finite(raw: &str) -> Option<f64> {
+        raw.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '−' { '-' } else { c })
+            .collect::<String>().parse::<f64>().ok().filter(|value| value.is_finite())
+    }
+
+    impl<T: egui::emath::Numeric + ToString> NumberInput<T> {
+        pub(super) fn new(value: T, label: &'static str, speed: f64, range: RangeInclusive<f64>, max_decimals: usize) -> Self {
+            static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+            let id = NEXT_VIEW.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("Forms numeric view identity exhausted");
+            Self { content: Content::Value(value), seed: value.to_f64(), label, speed, range, max_decimals,
+                view_id: egui::Id::new(("forms-number", id)) }
+        }
+
+        pub(super) fn value(&self) -> Result<T, String> {
+            match &self.content {
+                Content::Value(value) => Ok(*value),
+                Content::Text(raw) => {
+                    let value = finite(raw).ok_or_else(|| format!("{} must be a finite number", self.label))?;
+                    let (min, max) = (*self.range.start(), *self.range.end());
+                    let value = if value.total_cmp(&min).is_le() { min }
+                        else if value.total_cmp(&max).is_ge() { max } else { value };
+                    Ok(T::from_f64(value))
+                }
+            }
+        }
+
+        fn number(&mut self, number: f64) {
+            if number.is_finite() {
+                let value = T::from_f64(number);
+                self.seed = value.to_f64();
+                self.content = Content::Value(value);
+            } else {
+                self.content = Content::Text(number.to_string());
+            }
+        }
+
+        fn text(&mut self, raw: String) {
+            self.content = Content::Text(raw);
+            if let Ok(value) = self.value() { self.seed = value.to_f64(); }
+        }
+
+        fn format_number(value: T, formatter: &egui::style::NumberFormatter, decimals: RangeInclusive<usize>) -> String {
+            if T::INTEGRAL { value.to_string() } else { formatter.format(value.to_f64(), decimals) }
+        }
+
+        fn format(&self, formatter: &egui::style::NumberFormatter, decimals: RangeInclusive<usize>) -> String {
+            match &self.content {
+                Content::Value(value) => Self::format_number(*value, formatter, decimals),
+                Content::Text(raw) => raw.clone(),
+            }
+        }
+
+        pub(super) fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
+            let (label, speed, range, max_decimals, view_id) =
+                (self.label, self.speed, self.range.clone(), self.max_decimals, self.view_id);
+            let formatter = ui.style().number_formatter.clone();
+            // A stable bridge keeps egui's blur parser echo from becoming a text-change signal.
+            let seed = self.seed;
+            let field = RefCell::new(self);
+            let changes = RefCell::new(Vec::new());
+            let parser_set = Cell::new(false);
+            let mut response = ui.push_id(view_id, |ui| ui.horizontal(|ui| {
+                let caption = ui.label(label);
+                ui.add(egui::DragValue::from_get_set(|number| {
+                    if let Some(number) = number {
+                        if !parser_set.replace(false) { changes.borrow_mut().push(Change::Number(number)); }
+                    }
+                    seed
+                }).custom_parser(|raw| {
+                    let parsed = finite(raw);
+                    changes.borrow_mut().push(Change::Text(raw.to_owned()));
+                    parser_set.set(parsed.is_some());
+                    parsed
+                }).custom_formatter(|_, decimals| {
+                    match changes.borrow().last() {
+                        Some(Change::Number(number)) if number.is_finite() =>
+                            Self::format_number(T::from_f64(*number), &formatter, decimals),
+                        Some(Change::Number(number)) => number.to_string(),
+                        _ => field.borrow().format(&formatter, decimals),
+                    }
+                }).speed(speed).range(range).max_decimals(max_decimals).clamp_existing_to_range(false))
+                    .labelled_by(caption.id)
+            }).inner).inner;
+            let text_changed = response.changed();
+            for change in changes.into_inner() {
+                match change {
+                    Change::Text(raw) if text_changed => field.borrow_mut().text(raw),
+                    Change::Number(number) => { field.borrow_mut().number(number); response.mark_changed(); }
+                    Change::Text(_) => {}
+                }
+            }
+            response
+        }
+    }
+}
+
+use number_input::NumberInput;
+
+fn number_values<const N: usize>(input: &[NumberInput<f64>; N]) -> Result<[f64; N], String> {
+    let mut values = [0.0; N];
+    for (value, input) in values.iter_mut().zip(input) { *value = input.value()?; }
+    Ok(values)
+}
+
 /// The colorComposition and alphaComposition names `live2d.source.set` accepts (`native_blend::Mode::parse`).
 const COLOR_COMPOSITIONS: [&str; 17] = [
     "NORMAL", "ADD", "ADD_R2", "ADD_GLOW", "DARKEN", "MULTIPLY_R2", "COLOR_BURN", "LINEAR_BURN", "LIGHTEN", "SCREEN",
@@ -153,6 +275,79 @@ impl SourceSettings {
             brush_guid: data["brushGuid"].as_str().unwrap_or_default().to_owned(),
         }
     }
+}
+
+struct FormInputs {
+    draw_order: NumberInput<i64>,
+    multiply: [NumberInput<f64>; 4],
+    screen: [NumberInput<f64>; 4],
+    angle: NumberInput<f64>,
+    origin: [NumberInput<f64>; 2],
+    scale: NumberInput<f64>,
+    reflect_x: bool,
+    reflect_y: bool,
+    intensity: NumberInput<f64>,
+}
+
+impl FormInputs {
+    fn new(settings: &FormSettings) -> Self {
+        let colors = |values: [f64; 4], labels: [&'static str; 4]| std::array::from_fn(|at|
+            NumberInput::new(values[at], labels[at], 0.01, 0.0..=1.0, 6));
+        Self {
+            draw_order: NumberInput::new(settings.draw_order, "Draw order", 1.0, 0.0..=1000.0, 6),
+            multiply: colors(settings.multiply, ["Multiply color R", "Multiply color G", "Multiply color B", "Multiply color A"]),
+            screen: colors(settings.screen, ["Screen color R", "Screen color G", "Screen color B", "Screen color A"]),
+            angle: NumberInput::new(settings.angle, "Angle", 0.1, -1.0e6..=1.0e6, 6),
+            origin: [NumberInput::new(settings.origin[0], "Origin X", 0.1, -1.0e6..=1.0e6, 6),
+                NumberInput::new(settings.origin[1], "Origin Y", 0.1, -1.0e6..=1.0e6, 6)],
+            scale: NumberInput::new(settings.scale, "Scale", 0.01, 1.0e-6..=1.0e6, 6),
+            reflect_x: settings.reflect_x,
+            reflect_y: settings.reflect_y,
+            intensity: NumberInput::new(settings.intensity, "Intensity", 0.01, 0.0..=1.0, 6),
+        }
+    }
+
+    fn values(&self) -> Result<FormSettings, String> {
+        Ok(FormSettings { draw_order: self.draw_order.value()?, multiply: number_values(&self.multiply)?,
+            screen: number_values(&self.screen)?, angle: self.angle.value()?, origin: number_values(&self.origin)?,
+            scale: self.scale.value()?, reflect_x: self.reflect_x, reflect_y: self.reflect_y, intensity: self.intensity.value()? })
+    }
+}
+
+impl Default for FormInputs {
+    fn default() -> Self { Self::new(&FormSettings::default()) }
+}
+
+struct SourceInputs {
+    color_composition: String,
+    alpha_composition: String,
+    invert_clipping_mask: bool,
+    use_offscreen: bool,
+    clip_guids: Vec<String>,
+    closed: bool,
+    division_count: NumberInput<u32>,
+    brush_guid: String,
+}
+
+impl SourceInputs {
+    fn new(settings: &SourceSettings) -> Self {
+        Self { color_composition: settings.color_composition.clone(), alpha_composition: settings.alpha_composition.clone(),
+            invert_clipping_mask: settings.invert_clipping_mask, use_offscreen: settings.use_offscreen,
+            clip_guids: settings.clip_guids.clone(), closed: settings.closed,
+            division_count: NumberInput::new(settings.division_count, "Division count", 1.0, 0.0..=u32::MAX as f64, 6),
+            brush_guid: settings.brush_guid.clone() }
+    }
+
+    fn values(&self) -> Result<SourceSettings, String> {
+        Ok(SourceSettings { color_composition: self.color_composition.clone(), alpha_composition: self.alpha_composition.clone(),
+            invert_clipping_mask: self.invert_clipping_mask, use_offscreen: self.use_offscreen,
+            clip_guids: self.clip_guids.clone(), closed: self.closed, division_count: self.division_count.value()?,
+            brush_guid: self.brush_guid.clone() })
+    }
+}
+
+impl Default for SourceInputs {
+    fn default() -> Self { Self::new(&SourceSettings::default()) }
 }
 
 /// One `live2d.form.set` request with the settings of `draft` that differ from `original`. `coordinate` is empty for
@@ -436,8 +631,8 @@ impl PointInput {
 }
 
 enum MainValues {
-    Vertex { index: usize, original: [f64; 2], draft: [f64; 2] },
-    FormOpacity { original: f64, draft: f64 },
+    Vertex { index: usize, original: [f64; 2], draft: [NumberInput<f64>; 2] },
+    FormOpacity { original: f64, draft: NumberInput<f64> },
     ArtPathPoint { index: usize, original: PointValues, input: PointInput },
 }
 
@@ -475,8 +670,8 @@ impl MainDraft {
 
     fn is_dirty(&self) -> bool {
         matches!(self, Self::Loaded(edit) if match &edit.values {
-            MainValues::Vertex { original, draft, .. } => draft != original,
-            MainValues::FormOpacity { original, draft } => draft != original,
+            MainValues::Vertex { original, draft, .. } => number_values(draft).map_or(true, |values| values != *original),
+            MainValues::FormOpacity { original, draft } => draft.value().map_or(true, |value| value != *original),
             MainValues::ArtPathPoint { original, input, .. } => input.values().map_or(true, |values| values != *original),
         })
     }
@@ -487,13 +682,18 @@ impl MainDraft {
 
     fn request(&self) -> Result<Option<Value>, String> {
         let Self::Loaded(edit) = self else { return Err("No editable form value is loaded".into()) };
-        if !self.is_dirty() { return Ok(None) }
         let key = &edit.key;
         match &edit.values {
-            MainValues::Vertex { index, draft, .. } =>
-                vertex_request(&key.source, &key.form, &key.coordinate, *index, *draft, edit.revision).map(Some),
-            MainValues::FormOpacity { draft, .. } =>
-                opacity_request(&key.source, &key.form, &key.coordinate, *draft, edit.revision).map(Some),
+            MainValues::Vertex { index, original, draft } => {
+                let values = number_values(draft)?;
+                if values == *original { return Ok(None) }
+                vertex_request(&key.source, &key.form, &key.coordinate, *index, values, edit.revision).map(Some)
+            }
+            MainValues::FormOpacity { original, draft } => {
+                let value = draft.value()?;
+                if value == *original { return Ok(None) }
+                opacity_request(&key.source, &key.form, &key.coordinate, value, edit.revision).map(Some)
+            }
             MainValues::ArtPathPoint { index, original, input } => {
                 check_identity(&key.source, &key.form, &key.coordinate)?;
                 let changes = input.values()?.changes(original)?;
@@ -515,25 +715,28 @@ struct Stored {
     key: FormKey,
     loaded: bool,
     revision: u64,
-    form: FormSettings,
+    form: FormInputs,
     form_original: FormSettings,
-    source: SourceSettings,
+    source: SourceInputs,
     source_original: SourceSettings,
 }
 
 impl Stored {
     fn is_dirty(&self) -> bool {
-        self.form != self.form_original || self.source != self.source_original
+        self.form_dirty() || self.source_dirty()
     }
 
+    fn form_dirty(&self) -> bool { self.form.values().map_or(true, |values| values != self.form_original) }
+    fn source_dirty(&self) -> bool { self.source.values().map_or(true, |values| values != self.source_original) }
+
     fn load_form(&mut self, form: Option<&Value>) {
-        self.form = form.map(FormSettings::from_form).unwrap_or_default();
-        self.form_original = self.form.clone();
+        self.form_original = form.map(FormSettings::from_form).unwrap_or_default();
+        self.form = FormInputs::new(&self.form_original);
     }
 
     fn load_source(&mut self, source: &Value) {
-        self.source = SourceSettings::from_source(source);
-        self.source_original = self.source.clone();
+        self.source_original = SourceSettings::from_source(source);
+        self.source = SourceInputs::new(&self.source_original);
     }
 }
 
@@ -594,11 +797,14 @@ impl FormEditor {
                     let x = positions[at].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid vertex coordinates")?;
                     let y = positions[at + 1].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid vertex coordinates")?;
                     self.last_vertex = index;
-                    Ok(MainValues::Vertex { index, original: [x, y], draft: [x, y] })
+                    Ok(MainValues::Vertex { index, original: [x, y], draft: [
+                        NumberInput::new(x, "Source X", 0.01, f64::NEG_INFINITY..=f64::INFINITY, 4),
+                        NumberInput::new(y, "Source Y", 0.01, f64::NEG_INFINITY..=f64::INFINITY, 4)] })
                 }
                 MainChoice::FormOpacity => {
                     let opacity = form["opacity"].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid opacity")?;
-                    Ok(MainValues::FormOpacity { original: opacity, draft: opacity })
+                    Ok(MainValues::FormOpacity { original: opacity,
+                        draft: NumberInput::new(opacity, "Opacity", 0.01, f64::NEG_INFINITY..=f64::INFINITY, 6) })
                 }
                 MainChoice::ArtPathPoint(index) => {
                     if form["data"]["type"] != "ArtPath" {
@@ -848,27 +1054,9 @@ impl FormEditor {
             if let MainDraft::Loaded(edit) = &mut self.main {
                 ui.add_enabled_ui(!self.conflict, |ui| {
                     match &mut edit.values {
-                        MainValues::FormOpacity { draft, .. } => {
-                            ui.horizontal(|ui| {
-                                let caption = ui.label("Opacity");
-                                let mut value = *draft;
-                                if ui.add(egui::DragValue::new(&mut value).speed(0.01).max_decimals(6)).labelled_by(caption.id).changed() {
-                                    *draft = value;
-                                    input_changed = true;
-                                }
-                            });
-                        }
+                        MainValues::FormOpacity { draft, .. } => input_changed = draft.show(ui).changed(),
                         MainValues::Vertex { draft, .. } => {
-                            for (axis, label) in [(0, "Source X"), (1, "Source Y")] {
-                                ui.horizontal(|ui| {
-                                    let caption = ui.label(label);
-                                    let mut value = draft[axis];
-                                    if ui.add(egui::DragValue::new(&mut value).speed(0.01).max_decimals(4)).labelled_by(caption.id).changed() {
-                                        draft[axis] = value;
-                                        input_changed = true;
-                                    }
-                                });
-                            }
+                            for field in draft { input_changed |= field.show(ui).changed(); }
                         }
                         MainValues::ArtPathPoint { input, .. } => input_changed = input.show(ui),
                     }
@@ -978,13 +1166,13 @@ impl FormEditor {
             let stored = &mut self.stored;
             if form_settings {
                 form_fields(ui, kind, &mut stored.form);
-                if ui.add_enabled(stored.form != stored.form_original, egui::Button::new("Apply form settings")).clicked() {
+                if ui.add_enabled(stored.form_dirty(), egui::Button::new("Apply form settings")).clicked() {
                     apply = Some(Half::Form);
                 }
             }
             if source_settings {
                 source_fields(ui, kind, &mut stored.source, masks, &own, brushes);
-                if ui.add_enabled(stored.source != stored.source_original, egui::Button::new("Apply source settings")).clicked() {
+                if ui.add_enabled(stored.source_dirty(), egui::Button::new("Apply source settings")).clicked() {
                     apply = Some(Half::Source);
                 }
             }
@@ -995,8 +1183,10 @@ impl FormEditor {
     fn apply_stored(&mut self, controller: &mut EditorController, half: Half, kind: &str) -> bool {
         let stored = &self.stored;
         let request = match half {
-            Half::Form => form_set_request(&self.source, &self.form, &self.coordinate, kind, &stored.form, &stored.form_original, stored.revision),
-            Half::Source => source_set_request(&self.source, kind, &stored.source, &stored.source_original, stored.revision),
+            Half::Form => stored.form.values().and_then(|draft| form_set_request(&stored.key.source, &stored.key.form,
+                &stored.key.coordinate, kind, &draft, &stored.form_original, stored.revision)),
+            Half::Source => stored.source.values().and_then(|draft|
+                source_set_request(&stored.key.source, kind, &draft, &stored.source_original, stored.revision)),
         };
         match send(controller, request) {
             Ok(()) => {
@@ -1075,46 +1265,31 @@ fn send(controller: &mut EditorController, request: Result<Value, String>) -> Re
     })
 }
 
-/// A labelled drag value; the caller compares the draft with the loaded one to see an edit.
-fn drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N, speed: f64, range: std::ops::RangeInclusive<N>) {
-    ui.horizontal(|ui| {
-        let caption = ui.label(label);
-        let drag = egui::DragValue::new(value).speed(speed).range(range).max_decimals(6).clamp_existing_to_range(false);
-        ui.add(drag).labelled_by(caption.id);
-    });
-}
-
-fn channels(ui: &mut egui::Ui, name: &str, values: &mut [f64; 4]) {
-    for (value, channel) in values.iter_mut().zip(["R", "G", "B", "A"]) {
-        drag(ui, &format!("{name} {channel}"), value, 0.01, 0.0..=1.0);
-    }
-}
-
-fn form_fields(ui: &mut egui::Ui, kind: &str, draft: &mut FormSettings) {
+fn form_fields(ui: &mut egui::Ui, kind: &str, draft: &mut FormInputs) {
     if matches!(kind, "ArtMesh" | "ArtPath") {
-        drag(ui, "Draw order", &mut draft.draw_order, 1.0, 0..=1000);
+        draft.draw_order.show(ui);
     }
     if matches!(kind, "ArtMesh" | "Part") {
-        channels(ui, "Multiply color", &mut draft.multiply);
-        channels(ui, "Screen color", &mut draft.screen);
+        for field in &mut draft.multiply { field.show(ui); }
+        for field in &mut draft.screen { field.show(ui); }
     }
     if kind == "Rotation" {
-        drag(ui, "Angle", &mut draft.angle, 0.1, -1.0e6..=1.0e6);
-        drag(ui, "Origin X", &mut draft.origin[0], 0.1, -1.0e6..=1.0e6);
-        drag(ui, "Origin Y", &mut draft.origin[1], 0.1, -1.0e6..=1.0e6);
-        drag(ui, "Scale", &mut draft.scale, 0.01, 1.0e-6..=1.0e6);
+        draft.angle.show(ui);
+        draft.origin[0].show(ui);
+        draft.origin[1].show(ui);
+        draft.scale.show(ui);
         ui.checkbox(&mut draft.reflect_x, "Reflect X");
         ui.checkbox(&mut draft.reflect_y, "Reflect Y");
     }
     if kind == "Glue" {
-        drag(ui, "Intensity", &mut draft.intensity, 0.01, 0.0..=1.0);
+        draft.intensity.show(ui);
     }
 }
 
-fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceSettings, masks: &[(String, String)], own: &str, brushes: &[Value]) {
+fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks: &[(String, String)], own: &str, brushes: &[Value]) {
     if kind == "ArtPath" {
         ui.checkbox(&mut draft.closed, "Closed");
-        drag(ui, "Division count", &mut draft.division_count, 1.0, 0..=u32::MAX);
+        draft.division_count.show(ui);
         let label = |brush: &Value| format!("{} [{}]", brush["name"].as_str().filter(|name| !name.is_empty())
             .or_else(|| brush["id"].as_str()).unwrap_or("Brush"), brush["guid"].as_str().unwrap_or_default());
         let selected = brushes.iter().find(|brush| brush["guid"] == draft.brush_guid)
@@ -1336,9 +1511,9 @@ mod tests {
     fn the_rotation_and_glue_fields_are_named_controls() {
         let mut harness = Harness::new();
         harness.screen = egui::vec2(900.0, 1500.0);
-        let mut rotation = FormSettings::from_form(&rotation_form());
-        let mut glue = FormSettings::from_form(&json!({"guid": "g", "data": {"type": "Glue", "intensity": 0.5}}));
-        let mut draw = |kind: &str, draft: &mut FormSettings| {
+        let mut rotation = FormInputs::new(&FormSettings::from_form(&rotation_form()));
+        let mut glue = FormInputs::new(&FormSettings::from_form(&json!({"guid": "g", "data": {"type": "Glue", "intensity": 0.5}})));
+        let mut draw = |kind: &str, draft: &mut FormInputs| {
             for _ in 0..2 {
                 harness.frame(Vec::new(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, kind, draft));
@@ -1356,11 +1531,11 @@ mod tests {
             assert!(has(&output, Role::CheckBox, label), "{label}");
         }
         assert!(assert_all_named(&output, "rotation settings") >= 6);
-        assert_eq!((rotation.angle, rotation.origin, rotation.scale), (15.0, [10.0, 20.0], 1.0), "drawing leaves the draft alone");
+        assert_eq!((rotation.angle.value().unwrap(), number_values(&rotation.origin).unwrap(), rotation.scale.value().unwrap()), (15.0, [10.0, 20.0], 1.0), "drawing leaves the draft alone");
         let output = draw("Glue", &mut glue);
         assert!(texts(&output).iter().any(|t| t == "Intensity"));
         assert!(assert_all_named(&output, "glue settings") >= 1);
-        assert_eq!(glue.intensity, 0.5);
+        assert_eq!(glue.intensity.value().unwrap(), 0.5);
     }
 
     #[test]
@@ -1394,15 +1569,15 @@ mod tests {
             assert!(texts(&blurred).iter().any(|text|text.contains("unfinished-forms-number")),"{kind} {label}: blur preserves raw input");
             assert_eq!(rig.controller.snapshot(),&snapshot);
         }
-        let mut stored=Stored::default();stored.form=FormSettings::from_form(&json!({"data":{"type":"Glue","intensity":1.5}}));
-        stored.form_original=stored.form.clone();let mut harness=Harness::new();
+        let mut stored=Stored::default();stored.form_original=FormSettings::from_form(&json!({"data":{"type":"Glue","intensity":1.5}}));
+        stored.form=FormInputs::new(&stored.form_original);let mut harness=Harness::new();
         let mut draw=|ctx:&egui::Context| {egui::CentralPanel::default().show(ctx,|ui|form_fields(ui,"Glue",&mut stored.form));};
         harness.click(Role::SpinButton,"Intensity",&mut draw);
         let key=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
         harness.frame(vec![key(true),key(false),egui::Event::Text("unfinished-forms-number".into())],&mut draw);
         let output=harness.frame(Vec::new(),&mut draw);
         assert!(texts(&output).iter().any(|text|text.contains("unfinished-forms-number")));
-        assert_eq!(stored.form.intensity,1.5);
+        assert_eq!(crate::editor_test_support::find(&output,Role::SpinButton,"Intensity").unwrap().numeric_value(),Some(1.5));
         assert!(stored.is_dirty(),"Glue intensity: actual field input participates in Stored draft detection");
     }
 
@@ -1480,9 +1655,9 @@ mod tests {
     fn forms_raw_loaded_legacy_numbers_keep_precision_and_unchanged_members() {
         let mut settings=FormSettings::from_form(&mesh_form());
         settings.draw_order=9_007_199_254_740_993;settings.multiply[0]=0.1234567890123456;settings.multiply[3]=2.25;
-        let original=settings.clone();let mut harness=Harness::new();harness.screen=egui::vec2(1200.0,1800.0);
-        for _ in 0..3 {harness.frame(Vec::new(),|ctx| {egui::CentralPanel::default().show(ctx,|ui|form_fields(ui,"ArtMesh",&mut settings));});}
-        assert!(settings==original,"rendering must not round i64, precision or legacy alpha through the widget f64 bridge");
+        let original=settings.clone();let mut input=FormInputs::new(&settings);let mut harness=Harness::new();harness.screen=egui::vec2(1200.0,1800.0);
+        for _ in 0..3 {harness.frame(Vec::new(),|ctx| {egui::CentralPanel::default().show(ctx,|ui|form_fields(ui,"ArtMesh",&mut input));});}
+        assert!(input.values().unwrap()==original,"rendering must not round i64, precision or legacy alpha through the widget f64 bridge");
         settings.multiply[1]=0.75;
         let request=form_set_request("mesh-guid","form-guid","Canvas","ArtMesh",&settings,&original,1).unwrap();
         assert_eq!(request["multiplyColor"],json!([0.1234567890123456,0.75,0.25]));
@@ -1497,16 +1672,17 @@ mod tests {
             settings.multiply[0] = 0.1234567890123456;
             settings.multiply[3] = 2.25;
             let original = settings.clone();
+            let mut input = FormInputs::new(&settings);
             let mut harness = Harness::new();
             harness.screen = egui::vec2(1200.0, 1800.0);
             let mut draw = |ctx: &egui::Context| {
-                egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut settings));
+                egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut input));
             };
             harness.click(Role::SpinButton, label, &mut draw);
             let focus = harness.ctx.memory(|memory| memory.focused()).unwrap();
             harness.ctx.memory_mut(|memory| memory.surrender_focus(focus));
             harness.frame(Vec::new(), &mut draw);
-            assert!(settings == original, "{label}: focus alone must not round or clamp a loaded value");
+            assert!(input.values().unwrap() == original, "{label}: focus alone must not round or clamp a loaded value");
         }
     }
 
@@ -1514,22 +1690,221 @@ mod tests {
     fn forms_raw_identical_legacy_text_is_an_authored_clamped_edit() {
         let mut settings = FormSettings::from_form(&mesh_form());
         settings.multiply[3] = 2.25;
+        let mut input = FormInputs::new(&settings);
         let mut harness = Harness::new();
         harness.screen = egui::vec2(1200.0, 1800.0);
         let mut draw = |ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut settings));
+            egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut input));
         };
         harness.click(Role::SpinButton, "Multiply color A", &mut draw);
         let key = |pressed| egui::Event::Key { key: egui::Key::A, physical_key: None, pressed, repeat: false,
             modifiers: egui::Modifiers::COMMAND };
         harness.frame(vec![key(true), key(false), egui::Event::Text("2.25".into())], &mut draw);
         harness.frame(Vec::new(), &mut draw);
-        assert_eq!(settings.multiply[3], 1.0, "authored input follows the native clamp even when its bytes match the loaded value");
+        assert_eq!(input.values().unwrap().multiply[3], 1.0, "authored input follows the native clamp even when its bytes match the loaded value");
+    }
+
+    #[test]
+    fn forms_raw_invalid_siblings_survive_each_successful_apply_invocation() {
+        for first in ["Apply opacity", "Apply form settings", "Apply source settings"] {
+            let mut rig = Rig::artpath(&format!("forms-raw-siblings-{first}"), &crate::editor_test_support::artpath_cmo3_xml());
+            rig.harness.screen = egui::vec2(1300.0, 2600.0);
+            rig.draw();
+            for (label, raw) in [("Opacity", "pending-main"), ("Draw order", "pending-form"), ("Division count", "pending-source")] {
+                rig.number_text(label, raw);
+            }
+            let (label, value) = match first {
+                "Apply opacity" => ("Opacity", "0.5"),
+                "Apply form settings" => ("Draw order", "900"),
+                _ => ("Division count", "21"),
+            };
+            rig.number_text(label, value);
+            let form_original = rig.editor.stored.form_original.clone();
+            let source_original = rig.editor.stored.source_original.clone();
+            let start = rig.revision();
+            let mut applied = 0;
+            rig.click_observing(first, |editor, controller| {
+                let revision = controller.snapshot()["revision"].as_u64().unwrap();
+                if revision > start {
+                    applied += 1;
+                    assert!(!editor.conflict && editor.error.is_empty());
+                    assert_eq!(editor.main.revision(), Some(revision));
+                    assert_eq!(editor.stored.revision, revision);
+                    assert_eq!(editor.main.is_dirty(), first != "Apply opacity");
+                    assert_eq!(editor.stored.form.values().is_err(), first != "Apply form settings");
+                    assert_eq!(editor.stored.source.values().is_err(), first != "Apply source settings");
+                    if first != "Apply form settings" { assert!(editor.stored.form_original == form_original); }
+                    if first != "Apply source settings" { assert!(editor.stored.source_original == source_original); }
+                }
+            });
+            assert!(applied > 0);
+            assert_eq!(rig.revision(), start + 1);
+            let output = rig.draw();
+            for (button, raw) in [("Apply opacity", "pending-main"), ("Apply form settings", "pending-form"), ("Apply source settings", "pending-source")] {
+                assert_eq!(texts(&output).iter().any(|text| text == raw), button != first);
+            }
+        }
+    }
+
+    #[test]
+    fn forms_raw_stale_inputs_and_discard_reload_reset_keep_their_scopes() {
+        let mut rig = Rig::new("forms-raw-stale-discard");
+        rig.draw();
+        rig.number_text("Source X", "pending-main");
+        rig.number_text("Draw order", "pending-form");
+        rig.click(Role::CheckBox, "Invert clipping mask");
+        let loaded = rig.revision();
+        assert_eq!(rig.controller.core_request(&json!({"op":"live2d.form.set_vertex", "sourceGuid":"mesh-guid",
+            "formGuid":"form-guid", "coordinateType":"Canvas", "vertexIndex":0, "position":[7.0,8.0],
+            "expectedRevision":loaded}))["succeeded"], true);
+        let before = rig.controller.snapshot().clone();
+        let stale = rig.draw();
+        assert!(rig.editor.conflict && rig.editor.has_draft());
+        assert_eq!(rig.editor.main.revision(), Some(loaded));
+        assert_eq!(rig.editor.stored.revision, loaded);
+        assert!(texts(&stale).iter().any(|text| text == "pending-main"));
+        assert!(texts(&stale).iter().any(|text| text == "pending-form"));
+        rig.click(Role::Button, "Discard main edit");
+        let output = rig.draw();
+        assert_eq!(rig.vertex(), [7.0, 8.0]);
+        assert!(rig.editor.conflict && rig.editor.stored.form.values().is_err());
+        assert!(rig.editor.stored.source.invert_clipping_mask);
+        assert!(!texts(&output).iter().any(|text| text == "pending-main"));
+        rig.click(Role::Button, "Reload form");
+        assert!(!rig.editor.has_draft() && !rig.editor.conflict);
+        assert_eq!(rig.controller.snapshot(), &before);
+        for _ in 0..2 {
+            rig.number_text("Source X", "pending-reset");
+            rig.editor.reset();
+            let output = rig.draw();
+            assert!(!rig.editor.has_draft());
+            assert!(!texts(&output).iter().any(|text| text == "pending-reset"));
+            assert_eq!(rig.vertex(), [7.0, 8.0]);
+            assert_eq!(rig.controller.snapshot(), &before);
+        }
+    }
+
+    #[test]
+    fn forms_raw_unfinished_and_overflow_inputs_refuse_without_using_the_old_number() {
+        for raw in ["", "-", "1e", "Infinity", "1e999"] {
+            let mut rig = Rig::new(&format!("forms-raw-boundary-{raw}"));
+            rig.draw();
+            rig.number_text("Source Y", "9.5");
+            rig.number_text("Source X", raw);
+            let before = rig.controller.snapshot().clone();
+            rig.click(Role::Button, "Apply vertex");
+            assert!(rig.editor.main.is_dirty() && !rig.editor.error.is_empty());
+            assert!(rig.editor.main.request().is_err());
+            assert_eq!(rig.controller.snapshot(), &before);
+            rig.number_text("Source X", "3");
+            assert_eq!(rig.editor.main.request().unwrap().unwrap()["position"], json!([3.0,9.5]));
+        }
+    }
+
+    #[test]
+    fn forms_raw_keyboard_and_accessibility_recover_from_the_last_valid_input() {
+        let mut rig = Rig::new("forms-raw-keyboard-accessibility");
+        rig.draw();
+        let before = rig.controller.snapshot().clone();
+        for (action, data, expected) in [
+            (egui::accesskit::Action::SetValue, Some(egui::accesskit::ActionData::NumericValue(2.5)), 2.5),
+            (egui::accesskit::Action::Increment, None, 2.51),
+            (egui::accesskit::Action::Decrement, None, 2.5),
+        ] {
+            let output = rig.draw();
+            let target = output.iter().find(|(_, node)| node.role() == Role::SpinButton &&
+                crate::editor_test_support::name_of(&output, node).as_deref() == Some("Source Y")).unwrap().0;
+            rig.frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest { action, target, data })]);
+            assert_eq!(rig.vertex()[1], expected);
+        }
+        rig.number_text("Source X", "5.25");
+        rig.number_text("Source X", "-");
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        rig.frame(vec![key(egui::Key::ArrowUp, true), key(egui::Key::ArrowUp, false)]);
+        assert_eq!(rig.vertex()[0], 5.26);
+        rig.frame(vec![key(egui::Key::ArrowDown, true), key(egui::Key::ArrowDown, false)]);
+        assert_eq!(rig.vertex()[0], 5.25);
+        rig.frame(vec![key(egui::Key::Tab, true), key(egui::Key::Tab, false)]);
+        let select = |pressed| egui::Event::Key { key:egui::Key::A, physical_key:None, pressed, repeat:false,
+            modifiers:egui::Modifiers::COMMAND };
+        rig.frame(vec![select(true), select(false), egui::Event::Text("6.5".into())]);
+        assert_eq!(rig.vertex()[1], 6.5);
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_raw_lost_focus_during_a_drag_keeps_the_numeric_gesture() {
+        let mut rig = Rig::new("forms-raw-blur-drag");
+        let output = rig.draw();
+        let before = rig.controller.snapshot().clone();
+        let from = crate::editor_test_support::center(&output, Role::SpinButton, "Source X");
+        let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+            pressed, modifiers: egui::Modifiers::NONE };
+        rig.frame(vec![egui::Event::PointerMoved(from), press(from, true)]);
+        rig.frame(vec![egui::Event::PointerMoved(from + egui::vec2(20.0, 0.0))]);
+        let id = rig.harness.ctx.dragged_id().expect("the numeric widget is being dragged");
+        rig.harness.ctx.memory_mut(|memory| memory.request_focus(id));
+        rig.frame(Vec::new());
+        let select = |pressed| egui::Event::Key { key:egui::Key::A, physical_key:None, pressed, repeat:false,
+            modifiers:egui::Modifiers::COMMAND };
+        rig.frame(vec![select(true), select(false), egui::Event::Text("1.2500".into())]);
+        assert!(texts(&rig.frame(Vec::new())).iter().any(|text| text == "1.2500"));
+        let previous = rig.vertex()[0];
+        let tab = |pressed| egui::Event::Key { key:egui::Key::Tab, physical_key:None, pressed,
+            repeat:false, modifiers:egui::Modifiers::NONE };
+        rig.frame(vec![tab(true), tab(false), egui::Event::PointerMoved(from + egui::vec2(30.0, 0.0))]);
+        assert_ne!(rig.harness.ctx.memory(|memory| memory.focused()), Some(id));
+        rig.frame(vec![egui::Event::PointerMoved(from + egui::vec2(40.0, 0.0))]);
+        assert!(rig.vertex()[0] > previous, "a blur parser must not swallow the subsequent drag setter");
+        rig.frame(vec![press(from + egui::vec2(40.0, 0.0), false)]);
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_raw_shift_drag_retains_fine_control_without_applying() {
+        let mut deltas = Vec::new();
+        for shift in [false, true] {
+            let mut rig = Rig::new(&format!("forms-raw-fine-drag-{shift}"));
+            let output = rig.draw();
+            let before = rig.controller.snapshot().clone();
+            let from = crate::editor_test_support::center(&output, Role::SpinButton, "Source X");
+            let modifiers = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+            let press = |pos, pressed| egui::Event::PointerButton { pos, button:egui::PointerButton::Primary, pressed, modifiers };
+            for events in [vec![egui::Event::PointerMoved(from), press(from, true)],
+                vec![egui::Event::PointerMoved(from + egui::vec2(10.0,0.0))],
+                vec![egui::Event::PointerMoved(from + egui::vec2(20.0,0.0))],
+                vec![press(from + egui::vec2(20.0,0.0), false)], Vec::new()] {
+                rig.harness.next_input = Some(Box::new(move |input| input.modifiers = modifiers));
+                rig.frame(events);
+            }
+            deltas.push(rig.vertex()[0] - 1.0);
+            assert_eq!(rig.controller.snapshot(), &before);
+        }
+        assert!(deltas[0] > deltas[1] && deltas[1] > 0.0, "Shift retains finer control: {deltas:?}");
+    }
+
+    #[test]
+    fn forms_raw_partial_apply_refusal_preserves_the_existing_redo_branch() {
+        let mut rig = Rig::new("forms-raw-refusal-redo");
+        rig.draw();
+        rig.edit_vertex([7.0, 8.0]);
+        rig.click(Role::Button, "Apply vertex");
+        let committed = rig.controller.snapshot()["model"].clone();
+        assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+        rig.draw();
+        rig.number_text("Source X", "pending-redo");
+        rig.number_text("Source Y", "9.5");
+        let before = rig.controller.snapshot().clone();
+        rig.click(Role::Button, "Apply vertex");
+        assert_eq!(rig.controller.snapshot(), &before);
+        assert!(rig.editor.main.is_dirty() && !rig.editor.error.is_empty());
+        assert_eq!(rig.controller.core_request(&json!({"op":"redo"}))["succeeded"], true);
+        assert_eq!(rig.controller.snapshot()["model"], committed);
     }
 
     fn form_opacity(editor: &FormEditor) -> f64 {
         match &editor.main {
-            MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft,
+            MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => draft.value().unwrap(),
             _ => panic!("expected a loaded opacity draft"),
         }
     }
@@ -1543,16 +1918,14 @@ mod tests {
     impl Rig {
         fn vertex(&self) -> [f64; 2] {
             match &self.editor.main {
-                MainDraft::Loaded(MainEdit { values: MainValues::Vertex { draft, .. }, .. }) => *draft,
+                MainDraft::Loaded(MainEdit { values: MainValues::Vertex { draft, .. }, .. }) => number_values(draft).unwrap(),
                 _ => panic!("expected a loaded vertex draft"),
             }
         }
 
         fn edit_vertex(&mut self, value: [f64; 2]) {
-            match &mut self.editor.main {
-                MainDraft::Loaded(MainEdit { values: MainValues::Vertex { draft, .. }, .. }) => *draft = value,
-                _ => panic!("expected a loaded vertex draft"),
-            }
+            self.number_text("Source X", &value[0].to_string());
+            self.number_text("Source Y", &value[1].to_string());
         }
 
         fn opacity(&self) -> f64 { form_opacity(&self.editor) }
@@ -1567,7 +1940,14 @@ mod tests {
         fn number_text(&mut self, label: &str, value: &str) -> crate::editor_test_support::Out {
             self.click(Role::SpinButton,label);
             let key=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
-            self.frame(vec![key(true),key(false),egui::Event::Text(value.to_owned())]);
+            let mut events = vec![key(true),key(false)];
+            if value.is_empty() {
+                for pressed in [true, false] {
+                    events.push(egui::Event::Key { key:egui::Key::Backspace, physical_key:None, pressed,
+                        repeat:false, modifiers:egui::Modifiers::NONE });
+                }
+            } else { events.push(egui::Event::Text(value.to_owned())); }
+            self.frame(events);
             self.frame(Vec::new())
         }
 
@@ -1579,10 +1959,7 @@ mod tests {
         }
 
         fn edit_opacity(&mut self, value: f64) {
-            match &mut self.editor.main {
-                MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft = value,
-                _ => panic!("expected a loaded opacity draft"),
-            }
+            self.number_text("Opacity", &value.to_string());
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) -> crate::editor_test_support::Out {
@@ -1870,11 +2247,11 @@ mod tests {
         rig.draw(); rig.click(Role::RadioButton,"Control point");
         rig.text("Point width","4.25"); rig.drag("Draw order",-10.0); rig.click(Role::CheckBox,"Closed");
         let before = rig.controller.snapshot().clone();
-        let form = rig.editor.stored.form.clone(); let source = rig.editor.stored.source.clone();
+        let form = rig.editor.stored.form.values().unwrap(); let source = rig.editor.stored.source.values().unwrap();
         assert!(texts(&rig.draw()).contains(&"Reload discards the main edit, form settings and source settings.".into()));
         rig.click(Role::Button,"Discard main edit"); rig.draw();
         assert!(!rig.editor.main.is_dirty() && rig.editor.stored.is_dirty());
-        assert!(rig.editor.stored.form == form && rig.editor.stored.source == source);
+        assert!(rig.editor.stored.form.values().unwrap() == form && rig.editor.stored.source.values().unwrap() == source);
         rig.text("Point width","5.25");
         let changed = rig.controller.core_request(&json!({"op":"live2d.source.set","guid":"path-guid",
             "closed":true,"expectedRevision":rig.revision()}));
@@ -1882,12 +2259,12 @@ mod tests {
         assert!(rig.editor.conflict);
         rig.click(Role::Button,"Discard main edit"); rig.draw();
         assert!(rig.editor.conflict && rig.editor.stored.is_dirty(),"main-only discard must not clear a sibling conflict");
-        assert!(rig.editor.stored.form == form && rig.editor.stored.source == source);
+        assert!(rig.editor.stored.form.values().unwrap() == form && rig.editor.stored.source.values().unwrap() == source);
         let after_external = rig.controller.snapshot().clone();
         rig.click(Role::Button,"Reload form"); rig.draw();
         assert!(!rig.editor.has_draft() && !rig.editor.conflict);
         assert_eq!(rig.point_input().width,"3");
-        assert_eq!(rig.editor.stored.form.draw_order,950);
+        assert_eq!(rig.editor.stored.form.draw_order.value().unwrap(),950);
         assert!(rig.editor.stored.source.closed);
         assert_eq!(rig.controller.snapshot(),&after_external);
         assert_ne!(after_external["model"],before["model"]);
@@ -2071,11 +2448,13 @@ mod tests {
         }
         assert_all_named(&output, "stored settings");
         assert!(crate::editor_test_support::find(&output, Role::Button, "Apply form settings").unwrap().is_disabled());
-        assert_eq!(rig.editor.stored.form.multiply, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(number_values(&rig.editor.stored.form.multiply).unwrap(), [1.0, 1.0, 1.0, 1.0]);
         assert!(!rig.editor.has_draft());
 
         let start = rig.revision();
-        rig.editor.stored.form.multiply = [0.5, 0.25, 0.0, 1.0];
+        rig.number_text("Multiply color R", "0.5");
+        rig.number_text("Multiply color G", "0.25");
+        rig.number_text("Multiply color B", "0");
         assert!(rig.editor.has_draft());
         rig.click(Role::Button, "Apply form settings");
         assert_eq!(rig.editor.status, "Live2D settings updated", "{}", rig.editor.error);
@@ -2088,12 +2467,12 @@ mod tests {
         // The fixture stores no draw order, so the file refuses it; the draft stays and the refusal text is shown.
         rig.draw();
         let revision = rig.revision();
-        rig.editor.stored.form.draw_order = 640;
+        rig.number_text("Draw order", "640");
         rig.click(Role::Button, "Apply form settings");
         assert!(!rig.editor.error.is_empty());
         assert!(rig.editor.status.is_empty());
         assert_eq!(rig.revision(), revision);
-        assert_eq!(rig.editor.stored.form.draw_order, 640);
+        assert_eq!(rig.editor.stored.form.draw_order.value().unwrap(), 640);
         assert!(!rig.editor.state().1, "a refusal that is not a revision conflict is not a conflict");
         let message = rig.editor.error.clone();
         assert!(texts(&rig.draw()).contains(&message));
@@ -2103,7 +2482,7 @@ mod tests {
     fn a_stale_settings_draft_is_a_conflict_and_the_other_half_keeps_its_draft_after_an_apply() {
         let mut rig = Rig::new("forms-stored-conflict");
         rig.draw();
-        rig.editor.stored.form.multiply[0] = 0.5;
+        rig.number_text("Multiply color R", "0.5");
         let loaded_at = rig.revision();
         let changed = rig.controller.core_request(&json!({"op": "live2d.form.set_vertex", "sourceGuid": "mesh-guid",
             "formGuid": "form-guid", "coordinateType": "Canvas", "vertexIndex": 0, "position": [7.0, 7.0], "expectedRevision": loaded_at}));
@@ -2111,13 +2490,13 @@ mod tests {
         rig.draw();
         let (_, conflict, error) = rig.editor.state();
         assert!(conflict, "{error}");
-        assert_eq!(rig.editor.stored.form.multiply[0], 0.5, "the draft is preserved");
+        assert_eq!(rig.editor.stored.form.multiply[0].value().unwrap(), 0.5, "the draft is preserved");
         rig.click(Role::Button, "Reload form");
-        assert_eq!(rig.editor.stored.form.multiply[0], 1.0);
+        assert_eq!(rig.editor.stored.form.multiply[0].value().unwrap(), 1.0);
         assert!(!rig.editor.has_draft() && !rig.editor.state().1);
 
         // Applying one half rebases the other half's draft on the new revision instead of dropping it.
-        rig.editor.stored.form.multiply[0] = 0.5;
+        rig.number_text("Multiply color R", "0.5");
         rig.editor.stored.source.invert_clipping_mask = true;
         rig.click(Role::Button, "Apply form settings");
         assert_eq!(rig.editor.status, "Live2D settings updated", "{}", rig.editor.error);
@@ -2126,24 +2505,24 @@ mod tests {
         assert!(!rig.editor.state().1);
 
         // The reverse: a vertex apply must not make a dirty settings draft look stale.
-        rig.editor.stored.form.multiply[0] = 0.25;
+        rig.number_text("Multiply color R", "0.25");
         rig.edit_vertex([9.0, 9.0]);
         rig.click(Role::Button, "Apply vertex");
         assert_eq!(rig.editor.status, "Live2D form updated", "{}", rig.editor.error);
         rig.draw();
         assert!(!rig.editor.state().1, "{}", rig.editor.error);
-        assert_eq!(rig.editor.stored.form.multiply[0], 0.25);
+        assert_eq!(rig.editor.stored.form.multiply[0].value().unwrap(), 0.25);
     }
 
     #[test]
     fn opacity_gui_main_apply_preserves_both_settings_drafts_in_the_event_invocation() {
         let mut rig = Rig::new("forms-opacity-event-rebase");
         rig.draw();
-        rig.editor.stored.form.multiply[0] = 0.25;
+        rig.number_text("Multiply color R", "0.25");
         rig.editor.stored.source.invert_clipping_mask = true;
         rig.edit_vertex([9.0, 9.0]);
-        let form_draft = rig.editor.stored.form.clone();
-        let source_draft = rig.editor.stored.source.clone();
+        let form_draft = rig.editor.stored.form.values().unwrap();
+        let source_draft = rig.editor.stored.source.values().unwrap();
         let form_original = rig.editor.stored.form_original.clone();
         let source_original = rig.editor.stored.source_original.clone();
         let mut applied_invocations = 0;
@@ -2159,7 +2538,7 @@ mod tests {
                     assert!(!editor.conflict, "event invocation: {}", editor.error);
                     assert_eq!(editor.stored.revision, after);
                 }
-                assert!(editor.stored.form == form_draft && editor.stored.source == source_draft);
+                assert!(editor.stored.form.values().unwrap() == form_draft && editor.stored.source.values().unwrap() == source_draft);
                 assert!(editor.stored.form_original == form_original && editor.stored.source_original == source_original);
             });
         });
@@ -2231,7 +2610,7 @@ mod tests {
             rig.drag("Opacity", -25.0);
             let opacity = rig.opacity();
             rig.drag("Draw order", -10.0);
-            let order = rig.editor.stored.form.draw_order;
+            let order = rig.editor.stored.form.draw_order.value().unwrap();
             rig.click(Role::CheckBox, "Closed");
             let start = rig.revision();
             let mut applied = 0;
@@ -2243,11 +2622,11 @@ mod tests {
                     assert_eq!(editor.main.revision(), Some(revision));
                     assert_eq!(editor.stored.revision, revision);
                     assert_eq!(form_opacity(editor), opacity);
-                    assert_eq!(editor.stored.form.draw_order, order);
+                    assert_eq!(editor.stored.form.draw_order.value().unwrap(), order);
                     assert!(editor.stored.source.closed);
                     assert_eq!(editor.main.is_dirty(), first != "Apply opacity");
-                    assert_eq!(editor.stored.form != editor.stored.form_original, first != "Apply form settings");
-                    assert_eq!(editor.stored.source != editor.stored.source_original, first != "Apply source settings");
+                    assert_eq!(editor.stored.form_dirty(), first != "Apply form settings");
+                    assert_eq!(editor.stored.source_dirty(), first != "Apply source settings");
                 }
             });
             assert!(applied > 0, "the actual button must apply");
@@ -2365,13 +2744,13 @@ mod tests {
         rig.choose("Source", "Path [ArtPath]");
         rig.click(Role::CheckBox, "Closed");
         rig.drag("Division count", 10.0);
-        let division = rig.editor.stored.source.division_count;
+        let division = rig.editor.stored.source.division_count.value().unwrap();
         assert_ne!(division, 20);
         rig.choose("Brush", "BrushB [brush-b]");
         rig.click(Role::CheckBox, "Invert clipping mask");
         rig.click(Role::CheckBox, "Mesh");
         rig.drag("Draw order", -10.0);
-        let order = rig.editor.stored.form.draw_order;
+        let order = rig.editor.stored.form.draw_order.value().unwrap();
         assert_ne!(order, 950);
         rig.click(Role::Button, "Apply source settings");
         let mut expected = before["model"].clone();
@@ -2383,7 +2762,7 @@ mod tests {
         path["data"]["clipGuids"] = json!(["mesh-guid"]);
         assert_eq!(rig.controller.snapshot()["model"], expected, "{}", rig.editor.error);
         assert_eq!(rig.revision(), before["revision"].as_u64().unwrap()+1);
-        assert_eq!(rig.editor.stored.form.draw_order, order, "other half draft survives");
+        assert_eq!(rig.editor.stored.form.draw_order.value().unwrap(), order, "other half draft survives");
         rig.click(Role::Button, "Apply form settings");
         expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap()["forms"][0]["drawOrder"] = json!(order);
         assert_eq!(rig.controller.snapshot()["model"], expected, "{}", rig.editor.error);
