@@ -16820,6 +16820,73 @@ mod shell_flow_tests {
         assert_eq!(std::fs::read(target).unwrap(),std::fs::read(dir.join("object.cmo3")).unwrap());
     }
 
+    fn object_range_app(name: &str) -> (EditorApp, PathBuf, Harness) {
+        let (mut app,dir) = app(name);
+        let source = dir.join("object.cmo3");
+        let xml = crate::editor_test_support::artpath_cmo3_xml();
+        let named = xml.replace("<CParameterSource>","<CParameterSource><s xs.n='name'>ParamTest</s>");
+        assert_ne!(xml,named);
+        std::fs::write(&source,crate::editor_test_support::caff_with_xml(&named)).unwrap();
+        app.command(json!({"op":"open","path":source}));
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1200.0,1800.0);
+        let output = harness.click(Role::ComboBox,"Object",|ctx| object_range_draw(&mut app,ctx));
+        let role = output.iter().find(|(_,node)| crate::editor_test_support::name_of(&output,node).as_deref()
+            == Some("ParamTest [Parameter]")).unwrap().1.role();
+        harness.click(role,"ParamTest [Parameter]",|ctx| object_range_draw(&mut app,ctx));
+        assert!(!app.objects.has_draft());
+        (app,dir,harness)
+    }
+
+    fn object_range_draw(app: &mut EditorApp,ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+    }
+
+    fn object_range_text(app: &mut EditorApp,harness: &mut Harness,label: &str,value: &str) {
+        harness.click(Role::SpinButton,label,|ctx| object_range_draw(app,ctx));
+        let key = |pressed| egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,
+            modifiers:egui::Modifiers::COMMAND};
+        harness.frame(vec![key(true),egui::Event::Text(value.to_owned()),key(false)],|ctx| object_range_draw(app,ctx));
+        let output = harness.frame(Vec::new(),|ctx| object_range_draw(app,ctx));
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains(value)),"the raw input must be visible");
+    }
+
+    #[test]
+    fn object_raw_range_blocks_native_save_over_visible_unparsed_input() {
+        let (mut app,dir,mut harness) = object_range_app("objects-raw-range-save");
+        let before = app.controller.snapshot().clone();
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        assert_eq!(app.controller.snapshot(),&before);
+        let target = dir.join("blocked.cmo3");
+        app.command(json!({"op":"save","path":target}));
+        assert!(!target.exists(),"Save must not silently omit visible authored range input");
+        assert!(app.objects.has_draft());
+        assert_eq!(app.controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn object_raw_range_survives_another_groups_apply() {
+        let (mut app,_,mut harness) = object_range_app("objects-raw-range-sibling");
+        harness.text("Name","Kept Parameter",|ctx| object_range_draw(&mut app,ctx));
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        let output = harness.click(Role::Button,"Apply name",|ctx| object_range_draw(&mut app,ctx));
+        assert!(app.controller.snapshot()["model"]["parameters"].as_array().unwrap().iter().any(|p|p["name"]=="Kept Parameter"));
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains("pending-invalid-range")),
+            "applying Name must preserve unparsed range input through the following frame");
+        assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_raw_range_refuses_the_whole_group_instead_of_committing_parsed_siblings() {
+        let (mut app,_,mut harness) = object_range_app("objects-raw-range-atomic");
+        let before = app.controller.snapshot().clone();
+        object_range_text(&mut app,&mut harness,"Maximum","2.5");
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        let output = harness.click(Role::Button,"Apply range",|ctx| object_range_draw(&mut app,ctx));
+        assert_eq!(app.controller.snapshot(),&before,"invalid input must refuse the entire group before Session dispatch");
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains("pending-invalid-range")));
+        assert!(app.objects.has_draft());
+    }
+
     #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
