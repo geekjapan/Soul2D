@@ -12177,6 +12177,33 @@
       ]
     },
     {
+      "description": "Action: admit native Reload and discard of all retained Live2D Object inputs. Read live2dObjectInputs.identity and supply expectedInputIdentity. Requires a CMO3 document and an already loaded buffer; reads do not initialize it. Includes clean, stale and missing retained inputs. Reload rebuilds Name, ID, Parent Part, Rotation destination and parameter range from the same object, the first available object, or none. Identified successful local reply delivery and matching input, document and authority precede one reload after current UI. Admission is not completion; read live2dObjectDiscard and match attempt. Every authenticated ACP occurrence needs original-call human Allow once, even clean inputs. Native edits, document changes, closing, failed/lost/expired delivery or invalid consent prevent execution. Never retry automatically. No Session, history, files, other drafts or dialog answers change. Input contents are not returned. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Live2D objects > Reload and discard all object edits",
+        "Live2D panels"
+      ],
+      "headless_ok": false,
+      "id": "editor_live2d_objects_discard",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedInputIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedInputIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: set the CMO3/CAN3 native parameter panel's case-insensitive name-or-ID substring filter. Empty clears it. Available without an attached model (no rows). Returns nativeParameterPanel in editor state. Retained across document replacement, reset on restart. Editor only. No document, settings, parameter value or playback change.",
       "effect": "editor-state",
       "guiEntry": [

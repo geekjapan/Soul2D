@@ -103,6 +103,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// Tools that set state only the editor window holds. Every other host refuses them, and the manifest
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
+    "editor_live2d_objects_discard",
     "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set", "editor_coding_agent_start", "editor_coding_agent_new_session", "editor_coding_agent_prompt_set", "editor_coding_agent_send",
     "editor_selection_set", "editor_armed_set", "editor_camera_set", "editor_camera_fit", "editor_camera_sync", "editor_tool_set", "editor_grid_set",
     "editor_guides_set", "editor_physics_preview_set", "editor_solo_set", "editor_onion_set", "editor_playback_set", "editor_timeline_zoom_set", "editor_viewport_set", "editor_address_dialog", "editor_about_set", "editor_welcome_set", "editor_command_browser_set", "editor_texture_viewer_set", "editor_parameters_set", "editor_panel_set", "editor_layout_reset", "editor_workspace_save",
@@ -215,6 +216,11 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         Ok(ids)
     };
     Ok(match name {
+        "editor_live2d_objects_discard" => {
+            let identity = arguments["expectedInputIdentity"].as_str().filter(|text| !text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            json!({"op":"editor.live2d.objects.discard", "expectedInputIdentity":identity})
+        },
         "editor_quit" => json!({"op":"editor.quit"}),
         "editor_coding_agent_cancel" => json!({"op":"editor.coding_agent.cancel"}),
         "editor_coding_agent_stop" => json!({"op":"editor.coding_agent.stop"}),
@@ -5429,6 +5435,16 @@ flip-pair partners. The clipboard is used up.",
              Original whitespace is preserved. First briefing uses current document context at execution. No launch, enable, \
              permission grant or document edit. Failed/lost/expired reply delivery never sends. Headless hosts refuse.",
             closed_schema(&[("expectedDraftIdentity", json!({"type":"string"}))], &["expectedDraftIdentity"])),
+        tool("editor_live2d_objects_discard", "Action: admit native Reload and discard of all retained Live2D Object inputs. \
+             Read live2dObjectInputs.identity and supply expectedInputIdentity. Requires a CMO3 document and an already loaded buffer; \
+             reads do not initialize it. Includes clean, stale and missing retained inputs. Reload rebuilds Name, ID, Parent Part, \
+             Rotation destination and parameter range from the same object, the first available object, or none. \
+             Identified successful local reply delivery and matching input, document and authority precede one reload after current UI. \
+             Admission is not completion; read live2dObjectDiscard and match attempt. Every authenticated ACP occurrence needs \
+             original-call human Allow once, even clean inputs. Native edits, document changes, closing, failed/lost/expired \
+             delivery or invalid consent prevent execution. Never retry automatically. No Session, history, files, other drafts \
+             or dialog answers change. Input contents are not returned. Headless, internal calls and notifications refuse.",
+            closed_schema(&[("expectedInputIdentity", json!({"type":"string", "minLength":1}))], &["expectedInputIdentity"])),
         tool("editor_coding_agent_prompt_set", "Action: replace or clear only the unsent User message field, preserving exact text. \
              Read codingAgentDraft.identity and supply it as expectedDraftIdentity. An identified successful local reply and matching \
              draft/opt-in identity precede one edit; admission is not execution. Read codingAgentDraftEdit and match attempt. \
@@ -6549,6 +6565,20 @@ mod tests {
             json!({"expectedDraftIdentity":"id","text":"bypass"})] {
             assert!(editor_request(&request(arguments)).unwrap().is_err());
         }
+    }
+
+    #[test]
+    fn object_discard_translation_is_closed_typed_and_opaque() {
+        let request = |arguments| json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"editor_live2d_objects_discard","arguments":arguments}});
+        assert_eq!(editor_request(&request(json!({"expectedInputIdentity":"  opaque 日本語  "}))).unwrap().unwrap(),
+            json!({"op":"editor.live2d.objects.discard","expectedInputIdentity":"  opaque 日本語  "}));
+        for arguments in [json!({}),json!({"expectedInputIdentity":null}),json!({"expectedInputIdentity":1}),
+            json!({"expectedInputIdentity":""}),json!({"expectedInputIdentity":true}),
+            json!({"expectedInputIdentity":"id","text":"bypass"})] {
+            assert!(editor_request(&request(arguments)).unwrap().is_err());
+        }
+        assert_eq!(crate::manifest::effect_of("editor_live2d_objects_discard"),Some("editor-state"));
     }
 
     #[test]

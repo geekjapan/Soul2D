@@ -54,13 +54,15 @@ impl RangeDraft {
         if applied || !self.dirty() { *self = Self::new(fresh); true } else { false }
     }
 
-    fn show(&mut self, ui: &mut egui::Ui) {
+    fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
         for ((_, caption), field) in RANGE_FIELDS.into_iter().zip(self.fields.iter_mut()) {
             ui.horizontal(|ui| {
                 let caption = ui.label(caption);
-                range_drag_value(ui, field).labelled_by(caption.id);
+                changed |= range_drag_value(ui, field).labelled_by(caption.id).changed();
             });
         }
+        changed
     }
 }
 
@@ -214,9 +216,22 @@ impl LoadedObject {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectInputIdentity(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectInputRefusal { Unavailable, IdentityUnavailable, StaleInput }
+
+impl ObjectInputRefusal {
+    pub(crate) fn state(self) -> &'static str {
+        match self { Self::Unavailable => "unavailable", Self::IdentityUnavailable => "identity_unavailable", Self::StaleInput => "stale_input" }
+    }
+}
+
 pub struct ObjectEditor {
     loaded: Option<LoadedObject>,
+    input_instance: Option<String>,
+    input_generation: u64,
     range_widget_epoch: u64,
     axis: String,
     key: f64,
@@ -224,14 +239,61 @@ pub struct ObjectEditor {
     error: String,
 }
 
+impl Default for ObjectEditor {
+    fn default() -> Self {
+        Self { loaded:None, input_instance:soul2d_core::mcp_http::random_token().ok(), input_generation:0,
+            range_widget_epoch:0, axis:String::new(), key:0.0, status:String::new(), error:String::new() }
+    }
+}
+
 impl ObjectEditor {
     pub fn new() -> Self { Self::default() }
     pub fn reset(&mut self) {
-        let range_widget_epoch = self.range_widget_epoch;
-        *self = Self { range_widget_epoch, ..Self::default() };
+        self.loaded = None;
+        self.axis.clear(); self.key = 0.0; self.status.clear(); self.error.clear();
+        self.advance_inputs();
         self.advance_range_widgets();
     }
     pub fn has_draft(&self) -> bool { self.loaded.as_ref().is_some_and(LoadedObject::has_draft) }
+
+    fn advance_inputs(&mut self) { self.input_generation = self.input_generation.saturating_add(1); }
+
+    fn input_identity(&self) -> Option<ObjectInputIdentity> {
+        self.input_instance.as_ref().filter(|_| self.input_generation != u64::MAX)
+            .map(|instance| ObjectInputIdentity(format!("{instance}:{}", self.input_generation)))
+    }
+
+    fn reload_available(&self, snapshot: &Value) -> bool {
+        snapshot["documentFormat"] == "live2d.cmo3" && self.loaded.is_some()
+    }
+
+    pub(crate) fn input_snapshot(&self, snapshot: &Value) -> Value {
+        let available = self.reload_available(snapshot);
+        let identity = self.input_identity().filter(|_| available);
+        let observation = match self.loaded.as_ref().map(|loaded| loaded.observe(snapshot)) {
+            None => "none", Some(Observation::Current(_)) => "current",
+            Some(Observation::Stale(_)) => "stale", Some(Observation::Missing) => "missing",
+        };
+        json!({"identity":identity.as_ref().map(|identity| &identity.0), "reloadAvailable":available,
+            "discardable":available && identity.is_some(), "dirty":self.has_draft(), "observation":observation})
+    }
+
+    pub(crate) fn capture_discard_target(&self, expected: &str, snapshot: &Value) -> Result<ObjectInputIdentity, ObjectInputRefusal> {
+        if !self.reload_available(snapshot) { return Err(ObjectInputRefusal::Unavailable); }
+        let identity = self.input_identity().ok_or(ObjectInputRefusal::IdentityUnavailable)?;
+        if identity.0 != expected { return Err(ObjectInputRefusal::StaleInput); }
+        Ok(identity)
+    }
+
+    pub(crate) fn check_discard_target(&self, expected: &ObjectInputIdentity, snapshot: &Value) -> Result<(), ObjectInputRefusal> {
+        self.capture_discard_target(&expected.0, snapshot).map(|_| ())
+    }
+
+    pub(crate) fn discard_if_current(&mut self, expected: &ObjectInputIdentity, snapshot: &Value) -> Result<(), ObjectInputRefusal> {
+        self.check_discard_target(expected, snapshot)?;
+        self.reload_discard(snapshot);
+        Ok(())
+    }
 
     fn advance_range_widgets(&mut self) {
         self.range_widget_epoch = self.range_widget_epoch.checked_add(1).expect("Object range widget identities exhausted");
@@ -245,6 +307,7 @@ impl ObjectEditor {
     }
 
     fn load(&mut self, entry: &Value, parameter: bool, revision: u64) {
+        self.advance_inputs();
         self.advance_range_widgets();
         self.loaded = Some(LoadedObject::from_entry(entry, parameter, revision));
         self.normalize_axis(entry);
@@ -261,12 +324,14 @@ impl ObjectEditor {
             if self.loaded.is_some() { self.error.clear(); self.status.clear(); }
             self.load(entry, parameter, snapshot["revision"].as_u64().unwrap_or(0));
         } else {
+            if self.loaded.is_some() { self.advance_inputs(); }
             self.loaded = None;
             self.axis.clear();
         }
     }
 
     fn reload_discard(&mut self, snapshot: &Value) {
+        self.advance_inputs();
         let entries = objects(&snapshot["model"]);
         let selected = self.loaded.as_ref().and_then(|loaded| entries.iter().copied()
             .find(|(entry, parameter)| loaded.matches(entry, *parameter))).or_else(|| entries.first().copied());
@@ -336,6 +401,7 @@ impl ObjectEditor {
         } else { "Live2D object updated" }.into();
         if matches!(action, ObjectAction::Delete) {
             self.loaded = None;
+            self.advance_inputs();
         } else {
             let snapshot = controller.snapshot().clone();
             let entry = self.loaded.as_ref().and_then(|loaded| loaded.find(&snapshot["model"]));
@@ -344,6 +410,7 @@ impl ObjectEditor {
                     self.advance_range_widgets();
                 }
                 self.normalize_axis(entry);
+                self.advance_inputs();
             } else {
                 self.error = "The action succeeded but its object is unavailable. Pending input is preserved.".into();
             }
@@ -393,20 +460,21 @@ impl ObjectEditor {
         }
         let guid = loaded.guid.clone();
         let mut action = None;
+        let mut inputs_changed = false;
         for (caption, field, button, apply) in [
             ("Name", &mut loaded.name.value, "Apply name", ObjectAction::ApplyName),
             ("ID", &mut loaded.id.value, "Apply ID", ObjectAction::ApplyId),
         ] {
             ui.horizontal(|ui| {
                 let text = ui.label(caption);
-                ui.text_edit_singleline(field).labelled_by(text.id);
+                inputs_changed |= ui.text_edit_singleline(field).labelled_by(text.id).changed();
                 if ui.add_enabled(current, egui::Button::new(button)).clicked() { action = Some(apply); }
             });
         }
         let sources = model["sources"].as_array().map(Vec::as_slice).unwrap_or_default();
         match &mut loaded.details {
             ObjectDetails::Parameter { range } => {
-                ui.push_id(("object_parameter_range", self.range_widget_epoch, &guid), |ui| range.show(ui));
+                inputs_changed |= ui.push_id(("object_parameter_range", self.range_widget_epoch, &guid), |ui| range.show(ui)).inner;
                 if ui.add_enabled(current, egui::Button::new("Apply range")).clicked() { action = Some(ObjectAction::ApplyRange); }
             }
             ObjectDetails::Source { parent, rotation, .. } => {
@@ -417,7 +485,7 @@ impl ObjectEditor {
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_label("Parent Part").selected_text(shown).show_ui(ui, |ui| {
                             for part in &parts {
-                                ui.selectable_value(&mut parent.value, part["guid"].as_str().unwrap_or_default().to_owned(), label(part, false));
+                                inputs_changed |= ui.selectable_value(&mut parent.value, part["guid"].as_str().unwrap_or_default().to_owned(), label(part, false)).changed();
                             }
                         });
                         if ui.add_enabled(current, egui::Button::new("Move")).clicked() { action = Some(ObjectAction::Move); }
@@ -445,8 +513,8 @@ impl ObjectEditor {
                     }).unwrap_or_else(|| "Choose a Rotation".into());
                     egui::ComboBox::from_label("Rotation destination").selected_text(shown).show_ui(ui, |ui| {
                         for source in &rotations {
-                            ui.selectable_value(&mut rotation.value, Some(source["guid"].as_str().unwrap().to_owned()), rotation_label(source))
-                                .on_hover_text(source["guid"].as_str().unwrap());
+                            inputs_changed |= ui.selectable_value(&mut rotation.value, Some(source["guid"].as_str().unwrap().to_owned()), rotation_label(source))
+                                .on_hover_text(source["guid"].as_str().unwrap()).changed();
                         }
                     });
                     let chosen = rotations.iter().any(|source| source["guid"].as_str() == rotation.value.as_deref());
@@ -484,7 +552,9 @@ impl ObjectEditor {
         if !self.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, self.error.as_str()); }
         if !self.status.is_empty() { ui.label(self.status.as_str()); }
         ui.label("Reload discards Name, ID, Parent Part, Rotation destination and parameter range edits.");
-        if ui.button("Reload and discard all object edits").clicked() {
+        let reload = ui.button("Reload and discard all object edits").clicked();
+        if inputs_changed { self.advance_inputs(); }
+        if reload {
             self.reload_discard(&snapshot);
             return false;
         }
@@ -494,6 +564,140 @@ impl ObjectEditor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_input_identity_reads_lifecycle_and_native_failures() {
+        let (mut controller, mut editor, mut harness) = open("object-identity-lifecycle");
+        let before = controller.snapshot().clone();
+        for _ in 0..2 {
+            assert_eq!(editor.input_snapshot(&before)["identity"], Value::Null);
+            assert!(!editor.reload_available(&before));
+        }
+        choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+        let initial = editor.input_identity().unwrap();
+        harness.frame(Vec::new(),|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); }); });
+        assert_eq!(editor.input_identity().as_ref(),Some(&initial));
+        assert_eq!(controller.snapshot(),&before);
+        click(&mut harness,&mut editor,&mut controller,"Apply name");
+        let incorporated = editor.input_identity().unwrap();
+        assert_ne!(incorporated,initial,"successful no-op Apply incorporates a fresh buffer");
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","1e");
+        let invalid = editor.input_identity().unwrap();
+        click(&mut harness,&mut editor,&mut controller,"Apply range");
+        assert_eq!(editor.input_identity().as_ref(),Some(&invalid));
+        let pending = pairs(&editor);
+        let mut stale = controller.snapshot().clone(); stale["revision"] = json!(999);
+        editor.reconcile(&stale);
+        assert_eq!(editor.input_identity().as_ref(),Some(&invalid));
+        assert_eq!(pairs(&editor),pending);
+        assert_eq!(editor.input_snapshot(&stale)["observation"],"stale");
+        editor.key = 0.75;
+        editor.discard_if_current(&invalid,&stale).unwrap();
+        assert!(!editor.has_draft()); assert_eq!(editor.key,0.75);
+        assert!(editor.status.is_empty() && editor.error.is_empty());
+        let reloaded = editor.input_identity().unwrap(); assert_ne!(reloaded,invalid);
+        editor.reset(); assert_ne!(editor.input_identity().as_ref(),Some(&reloaded));
+        assert!(editor.loaded.is_none());
+        assert_eq!(controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn object_input_identity_five_groups_and_equal_numeric_spelling() {
+        let xml = include_str!("../tests/fixtures/rotation-reparent.xml");
+        let (mut controller,mut editor,mut harness,_) = open_rotation("object-identity-groups",xml);
+        text(&mut harness,&mut editor,&mut controller,"Name","first");
+        let mut old = editor.input_identity();
+        for (kind,value) in [("ID","ArtMeshOther"),("Parent Part","Arm [Part]"),("Rotation destination","NewChild [Rotation]")] {
+            if kind == "ID" { text(&mut harness,&mut editor,&mut controller,kind,value); }
+            else { choose(&mut harness,&mut editor,&mut controller,kind,value); }
+            let fresh = editor.input_identity(); assert_ne!(fresh,old,"{kind}"); old=fresh;
+        }
+        let before = controller.snapshot().clone();
+        let target = editor.input_identity().unwrap();
+        editor.discard_if_current(&target,&before).unwrap();
+        assert!(!editor.has_draft()); assert_eq!(controller.snapshot(),&before);
+        let parameter = controller.snapshot()["model"]["parameters"].as_array().and_then(|entries|entries.first()).cloned();
+        if let Some(parameter) = parameter { editor.load(&parameter,true,controller.snapshot()["revision"].as_u64().unwrap()); }
+        else {
+            let (fresh,_,_) = open("object-identity-range-spelling"); controller=fresh;
+            editor.load(&controller.snapshot()["model"]["parameters"][0],true,controller.snapshot()["revision"].as_u64().unwrap());
+        }
+        for field in ["Minimum","Maximum","Default"] {
+            let initial = editor.input_identity();
+            let index = RANGE_FIELDS.iter().position(|(_,name)| *name==field).unwrap();
+            let spelling = if range(&editor).original[index] == 0.0 { "0.0".into() } else { format!("{}.0",range(&editor).original[index]) };
+            number_text(&mut harness,&mut editor,&mut controller,field,&spelling);
+            assert_ne!(editor.input_identity(),initial,"{field}");
+            assert!(!editor.has_draft(),"equal numeric spelling still invalidates delayed requests");
+        }
+    }
+
+    #[test]
+    fn object_input_identity_real_widget_aba_and_cancelled_ime() {
+        for field in ["Name","Default"] {
+            for ime in [false,true] {
+                let (mut controller,mut editor,mut harness) = open(&format!("object-identity-aba-{field}-{ime}"));
+                choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+                if field == "Name" { text(&mut harness,&mut editor,&mut controller,field,if ime { "" } else { "Name" }); }
+                let role = if field == "Name" { Role::TextInput } else { Role::SpinButton };
+                harness.click(role,field,|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); }); });
+                let initial = editor.input_identity().unwrap();
+                let values = pairs(&editor); let before = controller.snapshot().clone();
+                let key = |key,modifiers,pressed| egui::Event::Key {key,physical_key:None,pressed,repeat:false,modifiers};
+                let events = if ime {
+                    vec![key(egui::Key::End,egui::Modifiers::NONE,true),key(egui::Key::End,egui::Modifiers::NONE,false),egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+                        egui::Event::Ime(egui::ImeEvent::Disabled)]
+                } else {
+                    let original = if field == "Name" { draft(&editor).name.value.clone() } else { range(&editor).fields[2].raw.clone() };
+                    vec![key(egui::Key::A,egui::Modifiers::COMMAND,true),key(egui::Key::A,egui::Modifiers::COMMAND,false),egui::Event::Text("x".into()),
+                        key(egui::Key::A,egui::Modifiers::COMMAND,true),key(egui::Key::A,egui::Modifiers::COMMAND,false),egui::Event::Text(original)]
+                };
+                harness.frame(events,|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); }); });
+                assert_eq!(pairs(&editor),values,"{field} ime={ime}");
+                assert_ne!(editor.input_identity().as_ref(),Some(&initial),"{field} ime={ime}");
+                assert_eq!(editor.discard_if_current(&initial,controller.snapshot()),Err(ObjectInputRefusal::StaleInput));
+                assert_eq!(controller.snapshot(),&before);
+            }
+        }
+    }
+
+    #[test]
+    fn object_input_identity_exhaustion_and_rng_failure_keep_native_reload() {
+        for generation in [0,u64::MAX-1] {
+            let (mut controller,mut editor,mut harness) = open(&format!("object-identity-exhaustion-{generation}"));
+            choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+            editor.input_generation = generation;
+            if generation == 0 { editor.input_instance=None; }
+            text(&mut harness,&mut editor,&mut controller,"Name","Native input");
+            assert!(editor.input_identity().is_none()); assert!(editor.has_draft());
+            assert_eq!(editor.capture_discard_target("old",controller.snapshot()),Err(ObjectInputRefusal::IdentityUnavailable));
+            click(&mut harness,&mut editor,&mut controller,"Reload and discard all object edits");
+            assert!(!editor.has_draft()); assert!(editor.input_identity().is_none());
+            editor.reset(); assert!(editor.input_identity().is_none());
+        }
+    }
+
+    #[test]
+    fn object_input_identity_missing_empty_and_unsupported_do_not_manufacture_buffers() {
+        let (mut controller,mut editor,mut harness) = open("object-identity-missing-empty");
+        choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+        text(&mut harness,&mut editor,&mut controller,"Name","Pending absent parameter");
+        let initial=editor.input_identity().unwrap();
+        let mut empty=controller.snapshot().clone();empty["model"]["parameters"]=json!([]);empty["model"]["sources"]=json!([]);
+        editor.reconcile(&empty);assert_eq!(editor.input_identity().as_ref(),Some(&initial));
+        assert_eq!(editor.input_snapshot(&empty)["observation"],"missing");
+        for format in ["inx","live2d.can3"] {
+            let mut other=empty.clone();other["documentFormat"]=json!(format);
+            assert_eq!(editor.check_discard_target(&initial,&other),Err(ObjectInputRefusal::Unavailable));
+            assert!(editor.has_draft());
+        }
+        editor.discard_if_current(&initial,&empty).unwrap();
+        assert!(editor.loaded.is_none() && !editor.has_draft());
+        assert!(!editor.input_snapshot(&empty)["reloadAvailable"].as_bool().unwrap());
+        let gone=editor.input_identity();editor.reconcile(&empty);assert_eq!(editor.input_identity(),gone);
+        assert_eq!(editor.check_discard_target(&initial,&empty),Err(ObjectInputRefusal::Unavailable));
+    }
+
     #[test]
     fn remote_quit_object_drafts_compare_loaded_authored_values_and_reverts() {
         let mut editor = super::ObjectEditor::new();
@@ -526,6 +730,9 @@ mod tests {
     use egui::accesskit::Role;
 
     fn draft(editor: &ObjectEditor) -> &LoadedObject { editor.loaded.as_ref().unwrap() }
+    fn range(editor: &ObjectEditor) -> &RangeDraft {
+        let ObjectDetails::Parameter { range } = &draft(editor).details else { panic!("expected parameter range") }; range
+    }
     fn draft_mut(editor: &mut ObjectEditor) -> &mut LoadedObject { editor.loaded.as_mut().unwrap() }
     fn parent(editor: &ObjectEditor) -> &FieldDraft<String> {
         let ObjectDetails::Source { parent:Some(parent),.. } = &draft(editor).details else { panic!("expected Parent Part") }; parent

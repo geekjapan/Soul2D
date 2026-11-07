@@ -324,6 +324,65 @@ const AGENT_SET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_DRAFT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_SEND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_LAUNCH_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const OBJECT_DISCARD_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum ObjectDiscardOutcome {
+    Reloaded,
+    Input(crate::editor_live2d_objects::ObjectInputRefusal),
+    StaleDocument,
+    ConsentInvalid,
+    EditorClosing,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+impl ObjectDiscardOutcome {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Reloaded => "reloaded", Self::Input(refusal) => refusal.state(), Self::StaleDocument => "stale_document",
+            Self::ConsentInvalid => "consent_invalid", Self::EditorClosing => "editor_closing",
+            Self::ReplyNotProduced => "reply_not_produced", Self::ReplyFailed => "reply_failed",
+            Self::ReplyLost => "reply_lost", Self::ReplyExpired => "reply_expired",
+        }
+    }
+}
+
+enum RemoteObjectDiscard {
+    Idle,
+    Reviewing { attempt:u64, target:crate::editor_agent::ObjectDiscardTarget },
+    Waiting { attempt:u64, target:crate::editor_agent::ObjectDiscardTarget,
+        receipt:Receiver<Result<(), String>>, deadline:Instant },
+    Finished { attempt:u64, outcome:ObjectDiscardOutcome, invalid_invocation:Option<crate::editor_agent::AcpInvocation> },
+}
+
+impl RemoteObjectDiscard {
+    fn attempt(&self) -> u64 {
+        match self { Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt }
+    }
+    fn pending(&self) -> bool { matches!(self, Self::Reviewing { .. } | Self::Waiting { .. }) }
+    fn state(&self) -> Value {
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Reviewing { attempt, .. } => json!({"state":"awaiting_human", "attempt":attempt}),
+            Self::Waiting { attempt, .. } => json!({"state":"waiting_for_reply", "attempt":attempt}),
+            Self::Finished { attempt, outcome, .. } => json!({"state":outcome.state(), "attempt":attempt}),
+        }
+    }
+    fn close(&mut self, agent: &mut crate::editor_agent::AgentPanel) {
+        let pending = std::mem::replace(self, Self::Idle);
+        *self = match pending {
+            Self::Reviewing { attempt, target } | Self::Waiting { attempt, target, .. } => {
+                if let Some(review) = target.review() { agent.close_object_discard_review(&review); }
+                Self::Finished { attempt, outcome:ObjectDiscardOutcome::EditorClosing, invalid_invocation:target.invocation().cloned() }
+            }
+            other => other,
+        };
+    }
+}
 
 impl crate::editor_agent::AgentLaunchAction {
     fn from_tool(name: &str) -> Option<Self> {
@@ -785,6 +844,7 @@ impl RemoteQuit {
 /// apart from the controller, the listener and the agent panel so every MCP entry point can hold those too.
 /// All of it is view state: nothing here reaches the document, its history or its revision.
 struct EditorView<'a> {
+    object_discard: &'a mut RemoteObjectDiscard,
     remote_quit: &'a mut RemoteQuit,
     agent_cancel: &'a mut RemoteAgentCancel,
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
@@ -864,6 +924,7 @@ struct EditorView<'a> {
 macro_rules! editor_view {
     ($app:expr, $ctx:expr) => {
         EditorView {
+            object_discard: &mut $app.object_discard,
             remote_quit: &mut $app.remote_quit,
             agent_cancel: &mut $app.agent_cancel,
             agent_cancel_target: $app.agent.cancel_target(),
@@ -978,6 +1039,29 @@ impl EditorView<'_> {
         let control_reply_capable = matches!(origin, McpOrigin::Client | McpOrigin::Agent(_));
         let identified_stop = control_reply_capable && message["jsonrpc"] == "2.0" && message.get("id").is_some_and(|id|
             id.is_string() || id.as_i64().is_some() || id.as_u64().is_some());
+        let object_discard_target: Result<crate::editor_agent::ObjectDiscardTarget, String> = (|| {
+            if !identified_stop { return Err("Object discard requires an identified request with a reply writer".into()); }
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
+                || self.ctx.input(|input|input.viewport().close_requested()) { return Err(CLOSING_MESSAGE.into()); }
+            if self.remote_quit.active() { return Err("Object discard refused: Quit is pending".into()); }
+            let expected = message["params"]["arguments"]["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            let input = self.objects.capture_discard_target(expected,controller.snapshot())
+                .map_err(|refusal|format!("Object discard refused: {}",refusal.state()))?;
+            let document = crate::editor_agent::ObjectDiscardDocument {
+                revision:controller.snapshot()["revision"].as_u64().ok_or("Document revision unavailable")?,
+                path:controller.project_path().map(Path::to_owned),
+            };
+            let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
+            let target = crate::editor_agent::ObjectDiscardTarget::new(input,document,approval)?;
+            match &*self.object_discard {
+                RemoteObjectDiscard::Reviewing { target:original, .. } if original == &target && target.invocation().is_some() => Ok(target),
+                RemoteObjectDiscard::Reviewing { .. } | RemoteObjectDiscard::Waiting { .. } => Err("Object discard already pending; read editor state".into()),
+                RemoteObjectDiscard::Finished { invalid_invocation:Some(invalid), .. } if target.invocation() == Some(invalid) =>
+                    Err("This original Object discard was invalidated; make a fresh request".into()),
+                _ => self.object_discard.attempt().checked_add(1).map(|_|target).ok_or("Object discard attempt identity exhausted".into()),
+            }
+        })();
         let stop_target = self.agent_stop_owner.ok_or_else(|| "Coding agent Stop is unavailable or its identity is exhausted".to_owned())
             .and_then(|owner| match &origin {
                 McpOrigin::Client => Ok(crate::editor_agent::StopTarget::External(owner)),
@@ -1091,6 +1175,7 @@ impl EditorView<'_> {
                     _ => Ok(target.clone()),
                 }
             });
+        let mut object_discard_receipt = None;
         let mut draft_receipt = None;
         let mut send_receipt = None;
         let mut launch_receipt = None;
@@ -1117,6 +1202,11 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.live2d.objects.discard" {
+                    let target = object_discard_target.clone()?;
+                    let review = target.review().ok_or("Object discard needs its original authenticated invocation")?;
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::ObjectDiscard(review)), None);
+                }
                 if call["op"] == "editor.coding_agent.send" {
                     return Err("ACP Send is unavailable for an owned invocation".into());
                 }
@@ -1305,6 +1395,22 @@ impl EditorView<'_> {
                 send_receipt = Some((sender, admitted.clone()));
                 return Ok(admitted);
             }
+            if call["op"] == "editor.live2d.objects.discard" {
+                let target = object_discard_target.clone()?;
+                let attempt = if target.invocation().is_some() {
+                    match &*self.object_discard {
+                        RemoteObjectDiscard::Reviewing { attempt, target:original } if original == &target => *attempt,
+                        _ => return Err("The original Object discard review is no longer valid".into()),
+                    }
+                } else { self.object_discard.attempt().checked_add(1).ok_or("Object discard attempt identity exhausted")? };
+                let (sender, receipt) = sync_channel(1);
+                *self.object_discard = RemoteObjectDiscard::Waiting { attempt, target, receipt,
+                    deadline:Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT };
+                let admitted = json!({"live2dObjectDiscard":{"state":"admitted", "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_object_inputs_and_document"}});
+                object_discard_receipt = Some((sender,admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.coding_agent.prompt.set" {
                 if !identified_stop { return Err("Draft editing requires an identified request with a reply writer".into()); }
                 let target = draft_target.clone()?;
@@ -1417,6 +1523,15 @@ impl EditorView<'_> {
                     }
                 }
             }
+            if let Some(target) = approval.object_discard_review() {
+                if !self.object_discard.pending()
+                    && !matches!(&*self.object_discard, RemoteObjectDiscard::Finished { invalid_invocation:Some(invalid), .. }
+                        if target.invocation() == Some(invalid)) {
+                    if let Some(attempt) = self.object_discard.attempt().checked_add(1) {
+                        *self.object_discard = RemoteObjectDiscard::Reviewing { attempt, target };
+                    }
+                }
+            }
             if let Some(target) = approval.draft_review() {
                 if !matches!(&*self.agent_draft, RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. })
                     && !matches!(&*self.agent_draft, RemoteAgentDraft::Finished { invalid_invocation:Some(invalid), .. }
@@ -1491,6 +1606,20 @@ impl EditorView<'_> {
                 return RpcReply::tracked(message, response, receipt);
             }
             *self.agent_send = RemoteAgentSend::Finished { attempt:self.agent_send.attempt(), outcome:AgentSendOutcome::ReplyNotProduced };
+            return RpcReply::plain(response);
+        }
+        if let Some((receipt, admitted)) = object_discard_receipt {
+            if response.as_ref().is_some_and(|reply|reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteObjectDiscard::Waiting { deadline, .. } = self.object_discard {
+                    *deadline = Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message,response,receipt);
+            }
+            let pending = std::mem::replace(self.object_discard,RemoteObjectDiscard::Idle);
+            let RemoteObjectDiscard::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            *self.object_discard = RemoteObjectDiscard::Finished { attempt, outcome:ObjectDiscardOutcome::ReplyNotProduced,
+                invalid_invocation:target.invocation().cloned() };
             return RpcReply::plain(response);
         }
         if let Some((receipt, admitted)) = draft_receipt {
@@ -1570,6 +1699,7 @@ impl EditorView<'_> {
 
     fn quit_work_refusal(&self, controller: &EditorController) -> Option<String> {
         let reason = if *self.closing { "The editor is closing" }
+        else if self.object_discard.pending() { "Quit refused: an Object input discard request is pending" }
         else if self.agent_send.pending() { "Quit refused: a coding-agent Send request is pending" }
         else if self.agent_start.pending() { "Quit refused: a coding-agent Start request is pending" }
         else if matches!(&*self.agent_new_session, RemoteAgentLaunch::Reviewing { .. } | RemoteAgentLaunch::Waiting { .. }) {
@@ -2164,6 +2294,10 @@ impl EditorView<'_> {
     /// The fields of the editor state resource that only the window holds.
     fn state(&mut self, controller: &EditorController) -> Value {
         let snapshot = controller.snapshot();
+        let mut object_inputs = self.objects.input_snapshot(snapshot);
+        object_inputs["discardable"] = json!(object_inputs["discardable"] == true && !*self.closing
+            && !self.object_discard.pending() && self.object_discard.attempt() != u64::MAX && !self.remote_quit.active()
+            && !matches!(&*self.remote_quit,RemoteQuit::Closing(_)));
         self.viewport.reconcile_views(snapshot);
         self.parameters.reconcile(snapshot, self.animation_name, self.seek_frame);
         let armed = self.parameters.armed.and_then(|id| {
@@ -2181,7 +2315,7 @@ impl EditorView<'_> {
             .iter()
             .map(|(label, key)| (label.to_lowercase(), json!(crate::editor_windows::panel_visible(&self.tools.store, key))))
             .collect();
-        json!({
+        let mut state = json!({
             "quit": self.remote_quit.state(),
             "codingAgent": {
                 "enabled": self.agent_state.enabled,
@@ -2260,7 +2394,10 @@ impl EditorView<'_> {
             "physicsPreview": {"enabled": self.viewport.physics, "available": snapshot["documentFormat"] == "inx"},
             "workspaces": crate::editor_windows::workspace_names(&self.tools.store),
             "drafts": {"panels": controller.draft_dirty() || controller.panel_drafts, "tools": self.tool_edits()},
-        })
+        });
+        state["live2dObjectInputs"] = object_inputs;
+        state["live2dObjectDiscard"] = self.object_discard.state();
+        state
     }
 }
 
@@ -2289,6 +2426,7 @@ pub struct EditorApp {
     agent_set: RemoteAgentSet,
     agent_start: RemoteAgentLaunch,
     agent_new_session: RemoteAgentLaunch,
+    object_discard: RemoteObjectDiscard,
     agent_draft: RemoteAgentDraft,
     agent_send: RemoteAgentSend,
     #[cfg(test)]
@@ -2426,6 +2564,7 @@ impl EditorApp {
             agent_set: RemoteAgentSet::Idle,
             agent_start: RemoteAgentLaunch::Idle,
             agent_new_session: RemoteAgentLaunch::Idle,
+            object_discard: RemoteObjectDiscard::Idle,
             agent_draft: RemoteAgentDraft::Idle,
             agent_send: RemoteAgentSend::Idle,
             #[cfg(test)]
@@ -2868,6 +3007,7 @@ impl EditorApp {
 
     fn begin_closing(&mut self) {
         self.closing = true;
+        self.object_discard.close(&mut self.agent);
         self.agent_send.close();
         self.agent_start.close(&mut self.agent);
         self.agent_new_session.close(&mut self.agent);
@@ -2880,6 +3020,55 @@ impl EditorApp {
             }
             other => other,
         };
+    }
+
+    fn object_discard_status(&self, target: &crate::editor_agent::ObjectDiscardTarget, admitted: bool) -> Result<(), ObjectDiscardOutcome> {
+        if self.controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
+            || self.controller.project_path() != target.document.path.as_deref() { return Err(ObjectDiscardOutcome::StaleDocument); }
+        self.objects.check_discard_target(&target.input,self.controller.snapshot()).map_err(ObjectDiscardOutcome::Input)?;
+        if !self.agent.object_discard_status(target,admitted) { return Err(ObjectDiscardOutcome::ConsentInvalid); }
+        Ok(())
+    }
+
+    fn finish_object_discard(&mut self, ctx: &egui::Context) {
+        let (target, admitted) = match &self.object_discard {
+            RemoteObjectDiscard::Reviewing { target, .. } => (target.clone(),false),
+            RemoteObjectDiscard::Waiting { target, .. } => (target.clone(),true),
+            _ => return,
+        };
+        if target.invocation().is_some() { self.agent.pump(); }
+        let closing = self.closing || matches!(self.remote_quit,RemoteQuit::Closing(_))
+            || ctx.input(|input|input.viewport().close_requested());
+        if closing { self.object_discard.close(&mut self.agent); return; }
+        let mut failure = self.object_discard_status(&target,admitted).err();
+        match &mut self.object_discard {
+            RemoteObjectDiscard::Reviewing { .. } if failure.is_none() => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            RemoteObjectDiscard::Waiting { receipt, deadline, .. } if failure.is_none() => {
+                failure = if Instant::now() >= *deadline { Some(ObjectDiscardOutcome::ReplyExpired) } else {
+                    match receipt.try_recv() {
+                        Ok(Ok(())) => None,
+                        Ok(Err(_)) => Some(ObjectDiscardOutcome::ReplyFailed),
+                        Err(TryRecvError::Disconnected) => Some(ObjectDiscardOutcome::ReplyLost),
+                        Err(TryRecvError::Empty) => { ctx.request_repaint_after(Duration::from_millis(10)); return; }
+                    }
+                };
+            }
+            _ => {}
+        }
+        let pending = std::mem::replace(&mut self.object_discard,RemoteObjectDiscard::Idle);
+        let (attempt,target) = match pending {
+            RemoteObjectDiscard::Reviewing { attempt,target } | RemoteObjectDiscard::Waiting { attempt,target,.. } => (attempt,target),
+            _ => unreachable!(),
+        };
+        let outcome = failure.unwrap_or_else(|| match self.objects.discard_if_current(&target.input,self.controller.snapshot()) {
+            Ok(()) => { self.sync_panel_drafts(); ObjectDiscardOutcome::Reloaded }
+            Err(refusal) => ObjectDiscardOutcome::Input(refusal),
+        });
+        if let Some(review) = target.review() { self.agent.invalidate_object_discard_review(&review); }
+        self.object_discard = RemoteObjectDiscard::Finished { attempt, outcome, invalid_invocation:target.invocation().cloned() };
     }
 
     fn finish_agent_draft(&mut self, ctx: &egui::Context) {
@@ -8274,6 +8463,7 @@ impl eframe::App for EditorApp {
         self.guide_settings_window(ctx);
         self.finish_close_requests(ctx, host_effect, confirmation_pending);
         self.finish_remote_quit(ctx);
+        self.finish_object_discard(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -16863,7 +17053,7 @@ mod shell_flow_tests {
         assert_eq!(std::fs::read(target).unwrap(),std::fs::read(dir.join("object.cmo3")).unwrap());
     }
 
-    fn object_range_app(name: &str) -> (EditorApp, PathBuf, Harness) {
+    pub(super) fn object_range_app(name: &str) -> (EditorApp, PathBuf, Harness) {
         let (mut app,dir) = app(name);
         let source = dir.join("object.cmo3");
         let xml = crate::editor_test_support::artpath_cmo3_xml();
@@ -16880,7 +17070,7 @@ mod shell_flow_tests {
         (app,dir,harness)
     }
 
-    fn object_range_draw(app: &mut EditorApp,ctx: &egui::Context) {
+    pub(super) fn object_range_draw(app: &mut EditorApp,ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
     }
 
@@ -19502,6 +19692,389 @@ mod editor_state_tests {
         json!({"jsonrpc":"2.0", "id":"draft-edit", "method":"tools/call",
             "params":{"name":"editor_coding_agent_prompt_set", "arguments":{
                 "expectedDraftIdentity":app.agent.draft_snapshot().identity().unwrap(), "text":text}}})
+    }
+
+    fn object_discard_app(name: &str, dirty: bool) -> (EditorApp,crate::editor_test_support::Harness) {
+        let (mut app,_,mut harness) = super::shell_flow_tests::object_range_app(name);
+        if dirty {
+            harness.text("Name","Private retained Object input",|ctx| super::shell_flow_tests::object_range_draw(&mut app,ctx));
+            assert!(app.objects.has_draft());
+        }
+        app.tools.store.set("Outline.visible",false).unwrap();
+        (app,harness)
+    }
+
+    fn object_discard_message(app: &EditorApp) -> Value {
+        json!({"jsonrpc":"2.0","id":"object-discard","method":"tools/call",
+            "params":{"name":"editor_live2d_objects_discard","arguments":{
+                "expectedInputIdentity":app.objects.input_snapshot(app.controller.snapshot())["identity"]}}})
+    }
+
+    fn request_object_discard(app: &mut EditorApp) -> RpcReply {
+        let message = object_discard_message(app);
+        CTX.with(|ctx| editor_view!(app,ctx).mcp(&mut app.controller,&message,McpOrigin::Client))
+    }
+
+    fn finish_object_discard(app: &mut EditorApp) { CTX.with(|ctx|app.finish_object_discard(ctx)); }
+
+    #[test]
+    fn object_discard_admits_then_reloads_clean_and_dirty_without_changing_other_work() {
+        for dirty in [false,true] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-preserve-{dirty}"),dirty);
+            app.timeline_weight_draft = Some(("Other panel input".into(),0.4));
+            app.unsaved = Some(unsaved_dialog()); app.tools.prompt=Some(restore_prompt());
+            app.agent.set_prompt_for_test("Private unsent agent text".into());
+            let document = app.controller.snapshot().clone(); let settings=app.tools.store.clone();
+            let dialog=app.unsaved.as_ref().unwrap().dialog.clone(); let restore=app.tools.prompt.clone();
+            let path=app.controller.project_path().unwrap().to_owned(); let bytes=std::fs::read(&path).unwrap();
+            let identity=state(&mut app)["live2dObjectInputs"]["identity"].clone();
+            let reply=request_object_discard(&mut app); finish_object_discard(&mut app);
+            assert_eq!(app.objects.has_draft(),dirty);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"waiting_for_reply");
+            let mut output=Vec::new(); reply.write_line(&mut output).unwrap();
+            let response:Value=serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["result"]["structuredContent"]["live2dObjectDiscard"]["state"],"admitted");
+            finish_object_discard(&mut app);
+            let observed=state(&mut app);
+            assert_eq!(observed["live2dObjectDiscard"],json!({"state":"reloaded","attempt":1}));
+            assert_ne!(observed["live2dObjectInputs"]["identity"],identity);
+            assert!(!observed.to_string().contains("Private retained") && !observed.to_string().contains("Private unsent"));
+            assert!(!app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&document);
+            assert_eq!(app.tools.store,settings); assert_eq!(std::fs::read(path).unwrap(),bytes);
+            assert_eq!(app.timeline_weight_draft,Some(("Other panel input".into(),0.4)));
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog,dialog); assert_eq!(app.tools.prompt,restore);
+            assert_eq!(app.agent.prompt_text_for_test(),"Private unsent agent text");
+        }
+    }
+
+    #[test]
+    fn object_discard_preserves_existing_undo_and_redo_branches() {
+        let (mut app,_) = object_discard_app("object-discard-undo-redo",true);
+        let original=app.controller.snapshot()["model"].clone();
+        let mut models=Vec::new();
+        for name in ["First accepted value","Second accepted value"] {
+            let revision=app.controller.snapshot()["revision"].clone();
+            assert_eq!(app.controller.core_request(&json!({"op":"live2d.rename","guid":"parameter-guid","name":name,"expectedRevision":revision}))["succeeded"],true);
+            models.push(app.controller.snapshot()["model"].clone());
+        }
+        assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+        let before=app.controller.snapshot().clone();assert_eq!(before["canUndo"],true);assert_eq!(before["canRedo"],true);
+        request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"reloaded");
+        assert_eq!(app.controller.snapshot(),&before);assert!(!app.objects.has_draft());
+        for (op,model) in [("redo",&models[1]),("undo",&models[0]),("undo",&original)] {
+            assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"],true);
+            assert_eq!(&app.controller.snapshot()["model"],model);
+        }
+    }
+
+    #[test]
+    fn object_discard_failed_lost_expired_and_internal_replies_preserve_inputs() {
+        struct Writer { remaining:usize, flush_fails:bool }
+        impl std::io::Write for Writer {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+                let n=bytes.len().min(self.remaining); self.remaining-=n;
+                if n==0 { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(n) }
+            }
+            fn flush(&mut self)->std::io::Result<()> { if self.flush_fails { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) } }
+        }
+        for case in ["failed","partial","flush","lost","expired","into_message"] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-reply-{case}"),true);
+            let before=state(&mut app)["live2dObjectInputs"].clone();
+            let reply=request_object_discard(&mut app);
+            let duplicate=object_discard_message(&app);
+            let refused=CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&duplicate,McpOrigin::Client).into_message().unwrap());
+            assert_eq!(refused["result"]["isError"],true);
+            assert_eq!(app.object_discard.attempt(),1);
+            match case {
+                "failed"|"partial"|"flush" => assert!(reply.write_line(&mut Writer {
+                    remaining:if case=="flush" {usize::MAX} else if case=="partial" {3} else {0},flush_fails:case=="flush" }).is_err()),
+                "lost" => drop(reply),
+                "into_message" => { let _=reply.into_message(); }
+                _ => { reply.write_line(&mut Vec::new()).unwrap();
+                    let RemoteObjectDiscard::Waiting { deadline,.. }=&mut app.object_discard else {panic!()};
+                    *deadline=Instant::now()-Duration::from_millis(1); }
+            }
+            finish_object_discard(&mut app);
+            let expected=match case {"failed"|"partial"|"flush"=>"reply_failed","expired"=>"reply_expired",_=>"reply_lost"};
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],expected);
+            assert_eq!(app.objects.input_snapshot(app.controller.snapshot())["identity"],before["identity"]);
+            assert!(app.objects.has_draft());
+            request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"reloaded","attempt":2}));
+        }
+    }
+
+    #[test]
+    fn object_discard_rejects_unidentified_internal_malformed_and_unloaded_calls() {
+        let (mut app,_) = object_discard_app("object-discard-envelope",true);
+        let original=object_discard_message(&app);
+        for id in [Value::Null,json!(true),json!({}),json!([]),json!(1.5)] {
+            let mut message=original.clone();message["id"]=id;
+            let reply=CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&message,McpOrigin::Client).into_message());
+            assert!(reply.is_none_or(|reply|reply["result"]["isError"]==true || reply.get("error").is_some()));
+            assert!(!app.object_discard.pending());
+        }
+        let mut notification=original.clone();notification.as_object_mut().unwrap().remove("id");
+        CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&notification,McpOrigin::Client).write_line(&mut Vec::new()).unwrap());
+        let internal=CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&original,McpOrigin::Internal).into_message().unwrap());
+        assert_eq!(internal["result"]["isError"],true);assert!(app.objects.has_draft());assert_eq!(app.object_discard.attempt(),0);
+        let mut empty=runtime_export_app("object-discard-unopened",false);
+        for _ in 0..2 { assert_eq!(state(&mut empty)["live2dObjectInputs"]["identity"],Value::Null); }
+        assert!(!state(&mut empty)["live2dObjectInputs"]["reloadAvailable"].as_bool().unwrap());
+        let mut message=original;message["params"]["arguments"]["expectedInputIdentity"]=json!("unopened");
+        let reply=CTX.with(|ctx|editor_view!(empty,ctx).mcp(&mut empty.controller,&message,McpOrigin::Client).into_message().unwrap());
+        assert_eq!(reply["result"]["isError"],true);assert!(!empty.object_discard.pending());
+    }
+
+    #[test]
+    fn object_discard_captures_current_document_basis_and_never_retargets_later_changes() {
+        for late in [false,true] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-document-{late}"),true);
+            let edit=|app:&mut EditorApp,id:&str| {
+                let revision=app.controller.snapshot()["revision"].clone();
+                assert_eq!(app.controller.core_request(&json!({"op":"live2d.set_id","guid":"parameter-guid","id":id,"expectedRevision":revision}))["succeeded"],true);
+            };
+            edit(&mut app,"AlreadyStale");
+            let before=app.controller.snapshot().clone();
+            request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();
+            if late { edit(&mut app,"ChangedAfterAdmission"); }
+            finish_object_discard(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],if late {"stale_document"} else {"reloaded"});
+            assert_eq!(app.objects.has_draft(),late);
+            if !late { assert_eq!(app.controller.snapshot(),&before); }
+        }
+    }
+
+    #[test]
+    fn object_discard_pending_clean_eof_is_consumed_and_counters_do_not_wrap() {
+        let (mut app,mut harness)=object_discard_app("object-discard-clean-eof",false);
+        request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();
+        let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);sender.send(HostMessage::StdinClosed).unwrap();
+        let mut frame=eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert!(app.stdin_closed && !app.closing);assert_eq!(harness.close_requests,0);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"reloaded");
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));assert_eq!(harness.close_requests,0);
+        app.object_discard=RemoteObjectDiscard::Finished {attempt:u64::MAX-1,outcome:ObjectDiscardOutcome::Reloaded,invalid_invocation:None};
+        request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+        assert_eq!(app.object_discard.attempt(),u64::MAX);
+        let reply=request_object_discard(&mut app).into_message().unwrap();assert_eq!(reply["result"]["isError"],true);
+        assert_eq!(app.object_discard.attempt(),u64::MAX);
+    }
+
+    #[test]
+    fn object_discard_missing_retained_parameter_reloads_native_fallback_without_document_edit() {
+        let (mut app,_) = object_discard_app("object-discard-missing",true);
+        let revision=app.controller.snapshot()["revision"].clone();
+        let deleted=app.controller.core_request(&json!({"op":"live2d.parameter.delete","guid":"parameter-guid","expectedRevision":revision}));
+        assert_eq!(deleted["succeeded"],true,"{deleted}");
+        let before=app.controller.snapshot().clone();
+        assert_eq!(state(&mut app)["live2dObjectInputs"]["observation"],"missing");
+        request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"reloaded");
+        assert_eq!(state(&mut app)["live2dObjectInputs"]["observation"],"current");
+        assert!(!app.objects.has_draft());assert_eq!(app.controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn object_discard_stales_while_reply_is_held_and_late_receipt_never_revives_attempt() {
+        let (mut app,mut harness)=object_discard_app("object-discard-late-receipt",true);
+        let old=request_object_discard(&mut app);
+        harness.text("Name","Newer human input",|ctx|super::shell_flow_tests::object_range_draw(&mut app,ctx));
+        finish_object_discard(&mut app);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"stale_input","attempt":1}));
+        let fresh=request_object_discard(&mut app);old.write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"waiting_for_reply","attempt":2}));
+        assert!(app.objects.has_draft());fresh.write_line(&mut Vec::new()).unwrap();finish_object_discard(&mut app);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"reloaded","attempt":2}));
+    }
+
+    #[test]
+    fn object_discard_full_app_post_delivery_aba_and_ime_invalidate_name_and_range() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for field in ["Name","Default"] { for ime in [false,true] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-full-ui-{field}-{ime}"),false);
+            app.tools.store.set("Outline.visible",true).unwrap();
+            let mut harness=Harness::new();harness.screen=egui::vec2(1800.0,2400.0);
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.click(Role::Button,"Live2D objects",|ctx|app.update(ctx,&mut frame));
+            harness.click(if field=="Name"{Role::TextInput}else{Role::SpinButton},field,|ctx|app.update(ctx,&mut frame));
+            let before=app.controller.snapshot().clone();
+            let identity=state(&mut app)["live2dObjectInputs"]["identity"].clone();
+            request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();
+            let key=|key,modifiers,pressed|egui::Event::Key {key,physical_key:None,pressed,repeat:false,modifiers};
+            let events=if ime {
+                vec![key(egui::Key::End,egui::Modifiers::NONE,true),key(egui::Key::End,egui::Modifiers::NONE,false),
+                    egui::Event::Ime(egui::ImeEvent::Enabled),egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),egui::Event::Ime(egui::ImeEvent::Disabled)]
+            } else {vec![key(egui::Key::A,egui::Modifiers::COMMAND,true),key(egui::Key::A,egui::Modifiers::COMMAND,false),egui::Event::Text("x".into()),
+                key(egui::Key::A,egui::Modifiers::COMMAND,true),key(egui::Key::A,egui::Modifiers::COMMAND,false),egui::Event::Text(if field=="Name"{"ParamTest"}else{"0"}.into())]};
+            harness.frame(events,|ctx|app.update(ctx,&mut frame));
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"stale_input","{field} ime={ime}");
+            assert_ne!(state(&mut app)["live2dObjectInputs"]["identity"],identity);
+            assert!(!app.objects.has_draft(),"same final input is clean but the old request is stale");
+            assert_eq!(app.controller.snapshot(),&before);
+        }}
+    }
+
+    #[test]
+    fn object_discard_full_app_native_close_cancels_even_when_blocked() {
+        for dirty in [false,true] {
+            let (mut app,mut harness)=object_discard_app(&format!("object-discard-native-close-{dirty}"),dirty);
+            window_shell::set_close_setting(&mut app.tools.store,window_shell::CloseSetting::DontSave).unwrap();
+            request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();
+            harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
+            let mut frame=eframe::Frame::_new_kittest();harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"editor_closing");
+            assert_eq!(app.objects.has_draft(),dirty);assert_eq!(app.closing,!dirty);
+            assert_eq!(harness.close_requests,usize::from(!dirty));
+        }
+    }
+
+    #[test]
+    fn object_discard_native_close_cancelled_in_current_frame_does_not_discard() {
+        use crate::editor_test_support::{Harness,center};use egui::accesskit::Role;
+        let (mut app,_) = object_discard_app("object-discard-close-cancel",false);
+        app.unsaved=Some(unsaved_dialog());
+        let mut harness=Harness::new();let mut frame=eframe::Frame::_new_kittest();
+        for _ in 0..2 {harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));}
+        let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        let at=center(&output,Role::Button,"Cancel");
+        let initial=state(&mut app)["live2dObjectInputs"]["identity"].clone();
+        request_object_discard(&mut app).write_line(&mut Vec::new()).unwrap();
+        harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
+        let press=|pressed|egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed,modifiers:egui::Modifiers::NONE};
+        harness.frame(vec![egui::Event::PointerMoved(at),press(true),press(false)],|ctx|app.update(ctx,&mut frame));
+        assert!(app.unsaved.is_none() && !app.closing);assert_eq!(harness.close_requests,0);
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"editor_closing");
+        assert_eq!(state(&mut app)["live2dObjectInputs"]["identity"],initial);
+    }
+
+    #[test]
+    fn object_discard_actual_http_uses_local_delivery_before_shared_reload() {
+        use std::io::{Read,Write};use std::net::{Shutdown,TcpStream};
+        let (mut app,_) = object_discard_app("object-discard-http",true);
+        let before=app.controller.snapshot().clone();
+        let server=McpServer::start(&McpSettings {enabled:true,host:"127.0.0.1".into(),port:0,auth:true},Some("owned-object-discard-token".into())).unwrap();
+        let address=server.url().strip_prefix("http://").unwrap().split('/').next().unwrap().to_owned();
+        app.mcp_server=Some(server);let body=object_discard_message(&app).to_string();
+        let client=std::thread::spawn(move||{
+            let mut stream=TcpStream::connect(address).unwrap();stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(stream,"POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer owned-object-discard-token\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();let mut response=String::new();stream.read_to_string(&mut response).unwrap();response
+        });
+        let ctx=egui::Context::default();let deadline=Instant::now()+Duration::from_secs(5);
+        while !client.is_finished() || app.object_discard.pending() {
+            assert!(Instant::now()<deadline);app.serve_mcp(&ctx);app.finish_object_discard(&ctx);std::thread::yield_now();
+        }
+        let response=client.join().unwrap();assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let reply:Value=serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["live2dObjectDiscard"]["state"],"admitted");
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"reloaded");
+        assert!(!app.objects.has_draft());assert_eq!(app.controller.snapshot(),&before);app.mcp_server=None;
+    }
+
+    #[test]
+    fn object_discard_actual_stdio_dispatches_flushes_and_preserves_other_draft_at_eof() {
+        use crate::editor_test_support::Harness;
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<(Vec<u8>,usize)>>);
+        impl std::io::Write for Output {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {self.0.lock().unwrap().0.extend_from_slice(bytes);Ok(bytes.len())}
+            fn flush(&mut self)->std::io::Result<()> {self.0.lock().unwrap().1+=1;Ok(())}
+        }
+        let (mut app,_) = object_discard_app("object-discard-stdio",true);
+        app.timeline_weight_draft=Some(("Retained unrelated draft".into(),0.5));
+        let before=app.controller.snapshot().clone();let message=format!("{}\n",object_discard_message(&app));
+        let output=Output(std::sync::Arc::new(std::sync::Mutex::new((Vec::new(),0))));let writer=output.clone();
+        let (sender,receiver)=sync_channel(1);app.host_rx=Some(receiver);
+        let worker=std::thread::spawn(move||editor_stdio::serve_lines(std::io::Cursor::new(message),writer,&sender,&egui::Context::default()));
+        let mut harness=Harness::new();let mut frame=eframe::Frame::_new_kittest();let deadline=Instant::now()+Duration::from_secs(5);
+        while !worker.is_finished() || app.object_discard.pending() || !app.stdin_closed {
+            assert!(Instant::now()<deadline);harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));std::thread::yield_now();
+        }
+        worker.join().unwrap();let output=output.0.lock().unwrap();assert!(output.0.ends_with(b"\n") && output.1>0);
+        let reply:Value=serde_json::from_slice(&output.0).unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["live2dObjectDiscard"]["state"],"admitted");
+        assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"reloaded");
+        assert_eq!(app.timeline_weight_draft,Some(("Retained unrelated draft".into(),0.5)));
+        assert_eq!(app.controller.snapshot(),&before);assert!(!app.closing);assert_eq!(harness.close_requests,0);
+    }
+
+    #[test]
+    fn object_discard_every_authenticated_occurrence_requires_original_human_allow() {
+        use crate::editor_test_support::Harness;use egui::accesskit::Role;
+        for dirty in [false,true] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-acp-{dirty}"),dirty);
+            let (mut peer,token)=draft_peer(&mut app);
+            let request=object_discard_message(&app);
+            let original=draft_http(&app,&token,&request);let duplicate=draft_http(&app,&token,&request);
+            serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"awaiting_human");
+            assert_eq!(lifecycle_http_result(duplicate,"object-discard")["isError"],true);
+            let path=app.tools.store_path.clone();
+            Harness::new().click(Role::Button,"Allow once",|ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+            let late=draft_http(&app,&token,&request);serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(original,"object-discard")["structuredContent"]["live2dObjectDiscard"]["state"],"admitted");
+            assert_eq!(lifecycle_http_result(late,"object-discard")["isError"],true);
+            finish_object_discard(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"reloaded","attempt":1}));
+            assert!(!app.objects.has_draft());assert!(app.agent.state().turn_active);
+            let fresh=draft_http(&app,&token,&object_discard_message(&app));serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"],json!({"state":"awaiting_human","attempt":2}));
+            app.begin_closing();assert_eq!(lifecycle_http_result(fresh,"object-discard")["isError"],true);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn object_discard_auth_review_denial_expiry_document_change_and_closing_never_reload() {
+        use crate::editor_test_support::Harness;use egui::accesskit::Role;
+        for case in ["denied","expired","document","closing"] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-review-{case}"),true);
+            let (mut peer,token)=draft_peer(&mut app);
+            let original=draft_http(&app,&token,&object_discard_message(&app));serve_agent_requests(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"awaiting_human");
+            match case {
+                "denied"=>{let path=app.tools.store_path.clone();Harness::new().click(Role::Button,"Deny changes this turn",|ctx|app.agent.host_approval_window(ctx,path.as_deref()));}
+                "expired"=>app.agent.expire_host_approval_for_test(),
+                "closing"=>app.begin_closing(),
+                _=>{let revision=app.controller.snapshot()["revision"].clone();assert_eq!(app.controller.core_request(&json!({"op":"live2d.set_id","guid":"parameter-guid","id":"OtherId","expectedRevision":revision}))["succeeded"],true);}
+            }
+            finish_object_discard(&mut app);serve_agent_requests(&mut app);finish_object_discard(&mut app);
+            assert_eq!(lifecycle_http_result(original,"object-discard")["isError"],true);assert!(app.objects.has_draft());
+            let expected=match case {"closing"=>"editor_closing","document"=>"stale_document",_=>"consent_invalid"};
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],expected);
+            if case=="denied" {
+                let again=draft_http(&app,&token,&object_discard_message(&app));serve_agent_requests(&mut app);
+                assert!(lifecycle_http_result(again,"object-discard").to_string().contains("denied protected changes"));
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn object_discard_admitted_acp_refreshes_permission_completion_and_disconnect() {
+        use crate::editor_test_support::Harness;use egui::accesskit::Role;
+        for case in ["permission","completed","disconnect"] {
+            let (mut app,_) = object_discard_app(&format!("object-discard-live-authority-{case}"),true);
+            let (mut peer,token)=draft_peer(&mut app);
+            let original=draft_http(&app,&token,&object_discard_message(&app));serve_agent_requests(&mut app);
+            let path=app.tools.store_path.clone();Harness::new().click(Role::Button,"Allow once",|ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+            serve_agent_requests(&mut app);assert_eq!(lifecycle_http_result(original,"object-discard")["isError"],false);
+            match case {
+                "permission"=>peer.enqueue(lifecycle_permission()),
+                "completed"=>peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}})),
+                _=>{peer.frames.take();let deadline=Instant::now()+Duration::from_secs(5);
+                    while app.agent.state().turn_active {app.agent.pump();assert!(Instant::now()<deadline);std::thread::yield_now();}}
+            }
+            finish_object_discard(&mut app);
+            assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"consent_invalid");assert!(app.objects.has_draft());
+            peer.finish(&mut app);
+        }
     }
 
     fn request_agent_draft(app: &mut EditorApp, text: &str) -> RpcReply {

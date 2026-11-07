@@ -397,6 +397,7 @@ pub(crate) enum ApprovalTarget {
     CodingAgentSet(AgentSetTarget),
     CodingAgentNewSession(NewSessionReviewTarget),
     CodingAgentDraft(DraftReviewTarget),
+    ObjectDiscard(ObjectDiscardReviewTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
     Outputs(Vec<PathBuf>),
@@ -449,7 +450,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
+        matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.live2d.objects.discard" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
             || matches!(call["op"].as_str(), Some("automesh.preset.save" | "automesh.preset.delete" | "physics.preset.save" |
@@ -493,6 +494,13 @@ impl HostApproval {
         let ApprovalTarget::CodingAgentDraft(review) = &request.target else { return None };
         Some(DraftTarget { before:review.before.clone(), invocation:Some(review.invocation.clone()),
             text:request.call["text"].as_str()?.to_owned() })
+    }
+
+    pub(crate) fn object_discard_review(&self) -> Option<ObjectDiscardTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        let ApprovalTarget::ObjectDiscard(review) = &request.target else { return None };
+        Some(ObjectDiscardTarget { input:review.input.clone(), document:review.document.clone(), invocation:Some(review.invocation.clone()) })
     }
 
     pub(crate) fn new_session_review(&self) -> Option<NewSessionReviewTarget> {
@@ -543,7 +551,7 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentNewSession(_) | ApprovalTarget::CodingAgentDraft(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentNewSession(_) | ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
@@ -567,7 +575,7 @@ impl HostApproval {
         if matches!(target, ApprovalTarget::Settings(None)) { return Ok(()) }
         let tool = call["op"].as_str().unwrap_or_default().replace('.', "_");
         let effect = soul2d_core::manifest::effect_of(&tool).filter(|effect| matches!(*effect, "file-write" | "project-reset" | "import" | "application-lifecycle")
-            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_))))
+            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_))))
             .ok_or("The operation effect is missing from the command manifest")?;
         if let Some(request) = &self.request {
             if matches!(request.decision, ApprovalDecision::AllowedOnce) {
@@ -660,6 +668,13 @@ impl HostApproval {
                     if request.call["text"] == "" { ui.label("This clears the unsent message."); }
                     ui.label("Native edits or opt-in changes invalidate this request. Prompt expiry is owner-observed; permissions/disconnection visible at the final check invalidate consent. The reader stays open.");
                 },
+                ApprovalTarget::ObjectDiscard(review) => {
+                    ui.label("Target: all retained Live2D Object inputs, including Name, ID, Parent Part, Rotation destination and parameter range");
+                    ui.label(format!("Document: {}   Revision: {}", review.document.path.as_ref().map(|path|path.display().to_string())
+                        .unwrap_or_else(|| "Unsaved".into()), review.document.revision));
+                    ui.label("Allow this original request once, even when inputs are clean. After local reply delivery and final input, document and invocation checks, Reload rebuilds the same object or the first available object, or clears the buffer when none remain.");
+                    ui.label("Native edits or document changes invalidate this request. This does not apply edits, save, change undo, answer dialogs or discard other panels' drafts. Input contents are not disclosed.");
+                },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
                     let kind = if path.is_dir() { "Output folder" } else { "Output file" };
@@ -739,7 +754,7 @@ impl HostApproval {
                 ui.label("Replaces the current document. Source paths are read when this call runs.");
             }
             ui.label("The original call waits here. Allow applies this exact change once.");
-            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered changes, including message replacement, for this turn.");
+            ui.label("Expires after two minutes or when this ACP turn ends. Deny blocks covered changes, including message replacement and Object input discard, for this turn.");
             if ui.add_enabled(matches!(request.decision, ApprovalDecision::Pending), egui::Button::new("Allow once")).clicked() {
                 request.decision = ApprovalDecision::AllowedOnce;
             }
@@ -977,6 +992,42 @@ impl DraftTarget {
 
 pub(crate) enum DraftEditResult { Applied, NoOp }
 pub(crate) enum DraftRefusal { Disabled, StaleDraft, IdentityUnavailable, ConsentInvalid }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectDiscardDocument {
+    pub(crate) revision: u64,
+    pub(crate) path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObjectDiscardReviewTarget {
+    input: crate::editor_live2d_objects::ObjectInputIdentity,
+    document: ObjectDiscardDocument,
+    invocation: AcpInvocation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObjectDiscardTarget {
+    pub(crate) input: crate::editor_live2d_objects::ObjectInputIdentity,
+    pub(crate) document: ObjectDiscardDocument,
+    invocation: Option<AcpInvocation>,
+}
+
+impl ObjectDiscardTarget {
+    pub(crate) fn new(input: crate::editor_live2d_objects::ObjectInputIdentity, document: ObjectDiscardDocument,
+        approval: Option<&HostApproval>) -> Result<Self, String> {
+        let invocation = match approval {
+            Some(approval) => Some(approval.invocation.clone().filter(|call|approval.active && call.permissions != u64::MAX)
+                .ok_or("Object discard needs its original authenticated transmitted uncancelled prompt")?),
+            None => None,
+        };
+        Ok(Self { input, document, invocation })
+    }
+    pub(crate) fn invocation(&self) -> Option<&AcpInvocation> { self.invocation.as_ref() }
+    pub(crate) fn review(&self) -> Option<ObjectDiscardReviewTarget> {
+        Some(ObjectDiscardReviewTarget { input:self.input.clone(), document:self.document.clone(), invocation:self.invocation.clone()? })
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct SendSnapshot {
@@ -1278,6 +1329,34 @@ impl<W: Write> AgentPanel<W> {
     pub(crate) fn replace_draft_if_current(&mut self, target: DraftTarget) -> Result<DraftEditResult, DraftRefusal> {
         self.draft_status(&target, true)?;
         Ok(if self.prompt.replace(target.text) { DraftEditResult::Applied } else { DraftEditResult::NoOp })
+    }
+
+    pub(crate) fn object_discard_status(&self, target: &ObjectDiscardTarget, admitted: bool) -> bool {
+        let Some(invocation) = target.invocation() else { return true };
+        let Some(run) = &self.run else { return false };
+        run.id == invocation.run && !run.closed && run.client.prompt_active() && !run.client.conversation.cancelling()
+            && run.client.active_prompt() == Some(invocation.prompt) && invocation.permissions != u64::MAX
+            && run.client.permission_epoch() == invocation.permissions
+            && (admitted || (run.host_approval.object_discard_review().as_ref() == Some(target)
+                && run.host_approval.request.as_ref().is_some_and(|request|request.created.elapsed() < HOST_APPROVAL_TIMEOUT)))
+    }
+
+    pub(crate) fn invalidate_object_discard_review(&mut self, target: &ObjectDiscardReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if let Some(request) = &mut run.host_approval.request {
+                if matches!(&request.target, ApprovalTarget::ObjectDiscard(review) if review == target)
+                    && !matches!(request.decision, ApprovalDecision::Denied) { request.decision = ApprovalDecision::Stale; }
+            }
+        }
+    }
+
+    pub(crate) fn close_object_discard_review(&mut self, target: &ObjectDiscardReviewTarget) {
+        if let Some(run) = &mut self.run {
+            if run.host_approval.request.as_ref().is_some_and(|request|
+                matches!(&request.target, ApprovalTarget::ObjectDiscard(review) if review == target)) {
+                run.clear_approval("The editor is closing; Object inputs were not discarded");
+            }
+        }
     }
 
     #[cfg(test)]
