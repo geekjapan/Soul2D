@@ -1510,6 +1510,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn forms_raw_identical_legacy_text_is_an_authored_clamped_edit() {
+        let mut settings = FormSettings::from_form(&mesh_form());
+        settings.multiply[3] = 2.25;
+        let mut harness = Harness::new();
+        harness.screen = egui::vec2(1200.0, 1800.0);
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut settings));
+        };
+        harness.click(Role::SpinButton, "Multiply color A", &mut draw);
+        let key = |pressed| egui::Event::Key { key: egui::Key::A, physical_key: None, pressed, repeat: false,
+            modifiers: egui::Modifiers::COMMAND };
+        harness.frame(vec![key(true), key(false), egui::Event::Text("2.25".into())], &mut draw);
+        harness.frame(Vec::new(), &mut draw);
+        assert_eq!(settings.multiply[3], 1.0, "authored input follows the native clamp even when its bytes match the loaded value");
+    }
+
     fn form_opacity(editor: &FormEditor) -> f64 {
         match &editor.main {
             MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft,
