@@ -103,6 +103,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// Tools that set state only the editor window holds. Every other host refuses them, and the manifest
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
+    "editor_flip_pairing_cancel",
     "editor_live2d_objects_discard",
     "editor_live2d_forms_discard", "editor_motion3_discard",
     "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set", "editor_coding_agent_start", "editor_coding_agent_new_session", "editor_coding_agent_prompt_set", "editor_coding_agent_send",
@@ -217,6 +218,11 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         Ok(ids)
     };
     Ok(match name {
+        "editor_flip_pairing_cancel" => {
+            let identity = arguments["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            json!({"op":"editor.flip_pairing.cancel", "expectedInputIdentity":identity})
+        },
         "editor_live2d_forms_discard" | "editor_motion3_discard" => {
             let identity = arguments["expectedInputIdentity"].as_str().filter(|text| !text.is_empty())
                 .ok_or("expectedInputIdentity must be a nonempty string")?;
@@ -5449,6 +5455,16 @@ flip-pair partners. The clipboard is used up.",
              Original whitespace is preserved. First briefing uses current document context at execution. No launch, enable, \
              permission grant or document edit. Failed/lost/expired reply delivery never sends. Headless hosts refuse.",
             closed_schema(&[("expectedDraftIdentity", json!({"type":"string"}))], &["expectedDraftIdentity"])),
+        tool("editor_flip_pairing_cancel", "Action: admit native Cancel for the captured retained Flip Pairing window, including \
+             clean inputs and explanatory owners. Read flipPairingInputs.cancel.identity as expectedInputIdentity. This loses its \
+             pair draft, filter, selection, patterns and message. Admission is not completion: poll flipPairingCancel by attempt. \
+             One execution follows exact successful local reply delivery and final matching input, document and authority checks \
+             after current UI and Close/Quit. Each authenticated ACP occurrence requires original-call human Allow once, sharing \
+             the existing 256-occurrence prompt limit with Forms/Motion3. Native changes, document changes, closing, invalid \
+             consent and failed/lost/expired delivery prevent execution permanently. No automatic retry. Stored FlipConfig, \
+             Session/history/files, sibling drafts and independent pending reads remain unchanged; a later read may create \
+             another window. No input contents or dialog answers. Headless, internal calls and notifications refuse.",
+            closed_schema(&[("expectedInputIdentity", json!({"type":"string", "minLength":1}))], &["expectedInputIdentity"])),
         tool("editor_live2d_forms_discard", "Action: admit one native Forms input discard or reload. Read live2dFormInputs.actions \
              and use the selected action's nonempty identity as expectedInputIdentity. Reads never initialize retained inputs. \
              discard_main discards only main inputs; reload_form replaces main, form and source settings through shared native \
@@ -6621,6 +6637,29 @@ mod tests {
             assert!(editor_request(&request(arguments)).unwrap().is_err());
         }
         assert_eq!(crate::manifest::effect_of("editor_live2d_objects_discard"),Some("editor-state"));
+    }
+
+    #[test]
+    fn flip_cancel_translation_is_singleton_closed_and_headless_refuses() {
+        let request = |arguments|json!({"jsonrpc":"2.0", "id":"flip", "method":"tools/call",
+            "params":{"name":"editor_flip_pairing_cancel", "arguments":arguments}});
+        let call = request(json!({"expectedInputIdentity":"  opaque 日本語  "}));
+        assert_eq!(editor_request(&call).unwrap().unwrap(),
+            json!({"op":"editor.flip_pairing.cancel", "expectedInputIdentity":"  opaque 日本語  "}));
+        for args in [json!({}), json!({"expectedInputIdentity":""}), json!({"expectedInputIdentity":false}),
+            json!({"expectedInputIdentity":1}), json!({"expectedInputIdentity":null}),
+            json!({"expectedInputIdentity":"id", "action":"cancel"}), json!({"expectedInputIdentity":"id", "force":true})] {
+            assert!(editor_request(&request(args)).unwrap().is_err());
+        }
+        let tool = tools().into_iter().find(|tool|tool["name"] == "editor_flip_pairing_cancel").unwrap();
+        assert_eq!(tool["inputSchema"]["properties"], json!({"expectedInputIdentity":{"type":"string", "minLength":1}}));
+        assert_eq!(tool["inputSchema"]["required"], json!(["expectedInputIdentity"]));
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(crate::manifest::effect_of("editor_flip_pairing_cancel"), Some("editor-state"));
+        let mut session = Session::new();
+        let before = session.snapshot();
+        assert_eq!(session.handle_mcp(&call).unwrap()["result"]["isError"], true);
+        assert_eq!(session.snapshot(), before);
     }
 
     #[test]

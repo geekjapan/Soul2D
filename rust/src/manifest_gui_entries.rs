@@ -156,6 +156,11 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "Edit > Command Browser",
         "Edit > Command Browser; command-browser shortcut",
     ]),
+    ("editor_flip_pairing_cancel", &[
+        "Flip Pairing > Cancel",
+        "Flip Pairing > Cancel / Close window",
+        "Flip Pairing > Close window",
+    ]),
     ("editor_guides_set", &[
         "Guide Settings > Close window",
         "Viewport context menu > Guide line > Guide Settings",
@@ -297,6 +302,7 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "Tools > Flip Pairing",
     ]),
     ("extdata_set", &[
+        "Flip Pairing > Save",
         "Tools > Flip Pairing",
     ]),
     ("history_clear", &[

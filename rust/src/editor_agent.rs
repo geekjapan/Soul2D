@@ -453,7 +453,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) { return true; }
+        if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) { return true; }
         matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.live2d.objects.discard" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
@@ -722,8 +722,13 @@ impl HostApproval {
                             | soul2d_core::editor_controller::Motion3InputAction::ReloadBindings => "Discard or reload retained parameter bindings and reset their chooser.",
                             soul2d_core::editor_controller::Motion3InputAction::ReloadMotion => "Reload the selected motion, including its retained point and bindings inputs.",
                         },
+                        PanelDiscardInput::Flip(_) => "Cancel the captured Flip Pairing window, losing its pair draft, node filter and selection, patterns and message, including clean inputs. An independent pending read remains and may later create another window.",
                     });
-                    ui.label("Allow this original request once, including clean inputs. Execution follows local reply delivery and final input, document and invocation checks. Native failure can leave partial effects, reported in editor state. No automatic retry.");
+                    ui.label(if matches!(&target.input, PanelDiscardInput::Flip(_)) {
+                        "Allow this original request once. Execution follows local reply delivery and final input, document and invocation checks. Only this captured owner is cancelled. No automatic retry."
+                    } else {
+                        "Allow this original request once, including clean inputs. Execution follows local reply delivery and final input, document and invocation checks. Native failure can leave partial effects, reported in editor state. No automatic retry."
+                    });
                     ui.label("This does not apply edits, save, change undo, answer dialogs or discard other panels' inputs. Retained input contents are not disclosed.");
                 },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
@@ -1084,18 +1089,36 @@ impl ObjectDiscardTarget {
 pub(crate) enum PanelDiscardInput {
     Forms(crate::editor_live2d_forms::FormsDiscardTarget),
     Motion3(crate::editor_motion3::Motion3DiscardTarget),
+    Flip(crate::editor_windows::FlipCancelTarget),
 }
 
 impl PanelDiscardInput {
     pub(crate) fn action(&self) -> &'static str {
-        match self { Self::Forms(input) => input.action().name(), Self::Motion3(input) => input.action().name() }
+        match self { Self::Forms(input) => input.action().name(), Self::Motion3(input) => input.action().name(), Self::Flip(_) => "cancel" }
     }
     fn review_label(&self) -> &str {
-        match self { Self::Forms(input) => input.review_label(), Self::Motion3(input) => input.review_label() }
+        match self { Self::Forms(input) => input.review_label(), Self::Motion3(input) => input.review_label(),
+            Self::Flip(_) => "the captured retained Flip Pairing window" }
+    }
+    pub(crate) fn result_key(&self) -> &'static str {
+        match self { Self::Forms(_) => "live2dFormDiscard", Self::Motion3(_) => "motion3Discard", Self::Flip(_) => "flipPairingCancel" }
+    }
+    pub(crate) fn lane_name(&self) -> &'static str {
+        match self {
+            Self::Forms(_) => "forms", Self::Flip(_) => "flip",
+            Self::Motion3(input) => match input.action() {
+                soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
+                | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => "point",
+                soul2d_core::editor_controller::Motion3InputAction::DiscardBindings
+                | soul2d_core::editor_controller::Motion3InputAction::ReloadBindings => "bindings",
+                soul2d_core::editor_controller::Motion3InputAction::ReloadMotion => "reload",
+            },
+        }
     }
     pub(crate) fn lane(&self) -> usize {
         match self {
             Self::Forms(_) => 0,
+            Self::Flip(_) => 4,
             Self::Motion3(input) => match input.action() {
                 soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
                 | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => 1,
@@ -3377,7 +3400,7 @@ mod tests {
 
     #[test]
     fn panel_discard_occurrences_survive_cleanup_and_permission_changes_and_fail_closed_at_capacity() {
-        use soul2d_core::editor_controller::{EditorController, FormsInputAction};
+        use soul2d_core::editor_controller::{EditorController, FormsInputAction, Motion3InputAction};
         use crate::editor_test_support::{Harness, temp_dir};
         let path = temp_dir("panel-discard-reservations").join("source.cmo3");
         std::fs::write(&path, crate::editor_test_support::cmo3_bytes()).unwrap();
@@ -3389,6 +3412,42 @@ mod tests {
         let identity = inputs["actions"].as_array().unwrap().iter().find(|entry|entry["action"] == "reload_form").unwrap()["identity"].as_str().unwrap();
         let input = PanelDiscardInput::Forms(forms.capture_discard_target(FormsInputAction::ReloadForm, identity, controller.snapshot()).unwrap());
         let document = ObjectDiscardDocument { revision:controller.snapshot()["revision"].as_u64().unwrap(), path:Some(path) };
+        let mut windows = crate::editor_windows::Windows::new();
+        let mut store = Settings::empty();
+        store.set("firstrun_complete", true).unwrap();
+        store.set("hasDoneQuickSetup", true).unwrap();
+        let mut shortcuts = soul2d_core::settings::ShortcutRegistry::with_defaults();
+        let status = crate::editor_windows::McpStatus::default();
+        let mut harness = Harness::new();
+        {
+            let mut draw = |ctx:&egui::Context| {windows.show(ctx, crate::editor_windows::Host {
+                all_keys:[false;2], snapshot:controller.snapshot(), selected_node:None, project_path:None,
+                store:&mut store, store_path:None, shortcuts:&mut shortcuts, locales:&[], lang:"en", tr:&str::to_owned, mcp:&status,
+            });};
+            harness.click(egui::accesskit::Role::Button, "Tools", &mut draw);
+            harness.click(egui::accesskit::Role::Button, "Flip Pairing", &mut draw);
+        }
+        let flip_identity = windows.flip_input_state().identity.unwrap();
+        let flip = PanelDiscardInput::Flip(windows.capture_flip_cancel_target(&flip_identity).unwrap());
+        assert_eq!((flip.lane(), flip.lane_name(), flip.result_key(), flip.action()), (4, "flip", "flipPairingCancel", "cancel"));
+        let mut motion_controller = EditorController::new();
+        let motion_path = temp_dir("panel-discard-mixed-capacity").join("wave.motion3.json");
+        std::fs::write(&motion_path, json!({"Version":3, "Meta":{"Duration":2,"Fps":30,"Loop":true,
+            "AreBeziersRestricted":false,"CurveCount":1,"TotalSegmentCount":1,"TotalPointCount":2},
+            "Curves":[{"Target":"Parameter","Id":"Linear","Segments":[0,2,0,1,6]}]}).to_string()).unwrap();
+        assert_eq!(motion_controller.core_request(&json!({"op":"motion3.import", "name":"Wave", "path":motion_path}))["succeeded"], true);
+        let mut motion = crate::editor_motion3::Motion3Panel::default();
+        motion.select_for_test("Wave");
+        Harness::new().frame(Vec::new(), |ctx| {egui::CentralPanel::default().show(ctx, |ui| {
+            motion.show(ui, &mut motion_controller, &mut false);
+        });});
+        let motion_inputs = motion.input_snapshot(motion_controller.snapshot());
+        let motion_identity = motion_inputs["actions"].as_array().unwrap().iter().find(|entry|entry["action"] == "reload_point")
+            .unwrap()["identity"].as_str().unwrap();
+        let motion_input = PanelDiscardInput::Motion3(motion.capture_discard_target(Motion3InputAction::ReloadPoint,
+            motion_identity, motion_controller.snapshot()).unwrap());
+        let variants = [(input.clone(), document.clone()), (flip, document.clone()), (motion_input, ObjectDiscardDocument {
+            revision:motion_controller.snapshot()["revision"].as_u64().unwrap(), path:None})];
         let (mut panel, _agent, _) = active_panel_endpoint();
         panel.sync_approval();
         let run = panel.run.as_mut().unwrap();
@@ -3405,8 +3464,11 @@ mod tests {
         approval.request.as_mut().unwrap().decision = ApprovalDecision::AllowedOnce;
         approval.guard(&call, Ok(ApprovalTarget::PanelDiscard(first.clone())), None).unwrap();
         assert!(approval.reserve_input_discard(&first, true).unwrap_err().contains("occurrence_consumed"));
+        let switched_family = PanelDiscardTarget::new(variants[1].0.clone(), variants[1].1.clone(), Some(approval)).unwrap();
+        assert!(approval.reserve_input_discard(&switched_family, false).unwrap_err().contains("occurrence_consumed"));
         for occurrence in 2..=256 {
             approval.invocation.as_mut().unwrap().call = occurrence;
+            let (input, document) = &variants[occurrence as usize % variants.len()];
             let target = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
             approval.reserve_input_discard(&target, false).unwrap();
         }
@@ -3416,10 +3478,10 @@ mod tests {
         approval.set_active(true);
         approval.input_context = Some((run.id, prompt, permissions + 1));
         approval.invocation = Some(AcpInvocation { run:run.id, prompt, permissions:permissions + 1, call:1 });
-        let changed_permissions = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+        let changed_permissions = PanelDiscardTarget::new(variants[1].0.clone(), variants[1].1.clone(), Some(approval)).unwrap();
         assert!(approval.reserve_input_discard(&changed_permissions, false).unwrap_err().contains("occurrence_consumed"));
         approval.invocation.as_mut().unwrap().call = 257;
-        let overflow = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+        let overflow = PanelDiscardTarget::new(variants[2].0.clone(), variants[2].1.clone(), Some(approval)).unwrap();
         assert!(approval.reserve_input_discard(&overflow, false).unwrap_err().contains("occurrence_capacity"));
         assert_eq!(approval.input_occurrences.len(), 256);
         assert_eq!(approval.input_occurrences[0].call, 1);

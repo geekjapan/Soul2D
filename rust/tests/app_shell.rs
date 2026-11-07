@@ -779,6 +779,7 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         ("editor_live2d_objects_discard", json!({"expectedInputIdentity":"not-an-editor"})),
         ("editor_live2d_forms_discard", json!({"action":"reload_form","expectedInputIdentity":"not-an-editor"})),
         ("editor_motion3_discard", json!({"action":"reload_point","expectedInputIdentity":"not-an-editor"})),
+        ("editor_flip_pairing_cancel", json!({"expectedInputIdentity":"not-an-editor"})),
         ("editor_coding_agent_send", json!({"expectedDraftIdentity":"not-an-editor"})),
         ("editor_selection_set", json!({"nodes": [2]})),
         ("editor_armed_set", json!({"parameter": 10})),

@@ -17,6 +17,9 @@ use soul2d_core::window_shell::{self, AddressDialogOperation, AddressDialogTarge
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+use crate::editor_input_epoch::{InputEpoch, InputEpochs, InputRefusal};
+use crate::editor_number_input::new_input_view;
+
 // ------------------------------------------------------------------------------------------ constants
 
 // source/soul2d/config.d
@@ -2490,6 +2493,18 @@ impl TextureViewer {
 
 // ------------------------------------------------------------------------------------------ flip pairs window
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlipCancelTarget {
+    identity: String,
+}
+
+pub(crate) struct FlipInputState {
+    pub(crate) open: bool,
+    pub(crate) dirty: bool,
+    pub(crate) pending_read: bool,
+    pub(crate) identity: Option<String>,
+}
+
 struct FlipWindow {
     pairs: Vec<FlipPair>,
     original: Vec<FlipPair>,
@@ -2499,6 +2514,8 @@ struct FlipWindow {
     left: String,
     right: String,
     message: String,
+    input_epoch: InputEpoch,
+    input_view: egui::Id,
 }
 
 /// Returned by the flip window: the pairs to keep, or `None` to leave things as they were.
@@ -2509,9 +2526,10 @@ enum FlipOutcome {
 }
 
 impl FlipWindow {
-    fn new(pairs: Vec<FlipPair>, nodes: Vec<(u32, String, String)>, message: String) -> Self {
+    fn new(pairs: Vec<FlipPair>, nodes: Vec<(u32, String, String)>, message: String, input_epoch: InputEpoch) -> Self {
         let pairs = normalize(pairs);
-        Self { original: pairs.clone(), pairs, nodes, filter: String::new(), picked: None, left: String::new(), right: String::new(), message }
+        Self { original: pairs.clone(), pairs, nodes, filter: String::new(), picked: None, left: String::new(), right: String::new(),
+            message, input_epoch, input_view:new_input_view() }
     }
 
     fn name(&self, uuid: Option<u32>) -> String {
@@ -2520,7 +2538,7 @@ impl FlipWindow {
         })
     }
 
-    fn show(&mut self, env: &Env) -> FlipOutcome {
+    fn show(&mut self, env: &Env, epochs: &mut InputEpochs) -> FlipOutcome {
         let mut outcome = FlipOutcome::Open;
         let mut open = true;
         let ctx = env.ctx;
@@ -2532,9 +2550,11 @@ impl FlipWindow {
                 if !self.message.is_empty() {
                     ui.weak(self.message.as_str());
                 }
-                ui.columns(2, |columns| {
-                    self.node_column(&mut columns[0], env);
-                    self.pair_column(&mut columns[1], env);
+                ui.scope_builder(egui::UiBuilder::new().id(self.input_view), |ui| {
+                    ui.columns(2, |columns| {
+                        self.node_column(&mut columns[0], env, epochs);
+                        self.pair_column(&mut columns[1], env, epochs);
+                    });
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2552,10 +2572,12 @@ impl FlipWindow {
         outcome
     }
 
-    fn node_column(&mut self, ui: &mut egui::Ui, env: &Env) {
+    fn node_column(&mut self, ui: &mut egui::Ui, env: &Env, epochs: &mut InputEpochs) {
         ui.strong("Nodes without a pair");
         let caption = ui.label("Filter nodes");
-        ui.text_edit_singleline(&mut self.filter).labelled_by(caption.id);
+        if ui.text_edit_singleline(&mut self.filter).labelled_by(caption.id).changed() {
+            self.input_epoch = epochs.next();
+        }
         let filter = self.filter.to_lowercase();
         let taken: HashSet<u32> = self.pairs.iter().flat_map(|pair| pair.parts.iter().flatten().copied()).collect();
         egui::ScrollArea::vertical().id_salt("flip_nodes").max_height(300.0).show(ui, |ui| {
@@ -2563,23 +2585,27 @@ impl FlipWindow {
                 if taken.contains(uuid) || !name.to_lowercase().contains(&filter) {
                     continue;
                 }
-                if ui.selectable_label(self.picked == Some(*uuid), format!("{name} ({kind})")).clicked() {
+                if ui.selectable_label(self.picked == Some(*uuid), format!("{name} ({kind})")).clicked()
+                    && self.picked != Some(*uuid) {
                     self.picked = Some(*uuid);
+                    self.input_epoch = epochs.next();
                 }
             }
         });
         let addable = self.picked.is_some_and(|node| !taken.contains(&node));
         if ui.add_enabled(addable, egui::Button::new("Add as new row")).clicked() {
             self.pairs.push(FlipPair { parts: [self.picked.take(), None] });
+            self.input_epoch = epochs.next();
         }
         let _ = env;
     }
 
-    fn pair_column(&mut self, ui: &mut egui::Ui, env: &Env) {
+    fn pair_column(&mut self, ui: &mut egui::Ui, env: &Env, epochs: &mut InputEpochs) {
         let first = labelled_text(ui, &env.t("Part 1"), &mut self.left);
         let second = labelled_text(ui, &env.t("Part 2"), &mut self.right);
-        let _ = (first, second);
+        if first.changed() || second.changed() { self.input_epoch = epochs.next(); }
         if ui.button(env.t("Pair")).clicked() {
+            let previous = (self.pairs.clone(), self.message.clone());
             let names: Vec<(u32, String)> = self.nodes.iter().map(|node| (node.0, node.1.clone())).collect();
             let current = normalize(std::mem::take(&mut self.pairs));
             match auto_add(&current, &names, &self.left, &self.right) {
@@ -2592,6 +2618,7 @@ impl FlipWindow {
                     self.message = error;
                 }
             }
+            if previous.0 != self.pairs || previous.1 != self.message { self.input_epoch = epochs.next(); }
         }
         let mut remove = None;
         let mut put = None;
@@ -2620,9 +2647,11 @@ impl FlipWindow {
         if let (Some((row, slot)), Some(node)) = (put, self.picked) {
             assign(&mut self.pairs, node, row, slot);
             self.picked = None;
+            self.input_epoch = epochs.next();
         }
         if let Some(row) = remove {
             self.pairs.remove(row);
+            self.input_epoch = epochs.next();
         }
     }
 }
@@ -2655,6 +2684,7 @@ pub struct Windows {
     /// The texture answers a load of the viewer still waits for.
     texture_request: Option<TextureLoad>,
     flip: Option<FlipWindow>,
+    flip_epochs: InputEpochs,
     /// The nodes of the document while its flip pairs are being read.
     flip_nodes: Option<Vec<(u32, String, String)>>,
     /// Answers that need the editor's attention, handed over with the next frame's requests.
@@ -2664,6 +2694,40 @@ pub struct Windows {
 }
 
 impl Windows {
+    fn flip_cancel_identity(&self) -> Result<String, InputRefusal> {
+        let window = self.flip.as_ref().ok_or(InputRefusal::Unavailable)?;
+        self.flip_epochs.identity("flip_cancel", &[Some(window.input_epoch)]).ok_or(InputRefusal::IdentityUnavailable)
+    }
+
+    pub(crate) fn flip_input_state(&self) -> FlipInputState {
+        FlipInputState {
+            open:self.flip.is_some(), dirty:self.has_document_draft(), pending_read:self.flip_nodes.is_some(),
+            identity:self.flip_cancel_identity().ok(),
+        }
+    }
+
+    pub(crate) fn capture_flip_cancel_target(&self, expected: &str) -> Result<FlipCancelTarget, InputRefusal> {
+        let identity = self.flip_cancel_identity()?;
+        if identity != expected { return Err(InputRefusal::StaleInput); }
+        Ok(FlipCancelTarget { identity })
+    }
+
+    pub(crate) fn check_flip_cancel_target(&self, target: &FlipCancelTarget) -> Result<(), InputRefusal> {
+        self.capture_flip_cancel_target(&target.identity).map(|_|())
+    }
+
+    pub(crate) fn cancel_flip_if_current(&mut self, target: &FlipCancelTarget) -> Result<(), InputRefusal> {
+        self.check_flip_cancel_target(target)?;
+        self.cancel_flip_owner();
+        Ok(())
+    }
+
+    fn install_flip(&mut self, pairs: Vec<FlipPair>, nodes: Vec<(u32, String, String)>, message: String) {
+        self.flip = Some(FlipWindow::new(pairs, nodes, message, self.flip_epochs.next()));
+    }
+
+    fn cancel_flip_owner(&mut self) { self.flip = None; }
+
     pub fn has_document_draft(&self) -> bool {
         self.flip.as_ref().is_some_and(|flip| normalize(flip.pairs.clone()) != flip.original)
     }
@@ -2676,7 +2740,7 @@ impl Windows {
     }
 
     pub fn forget_document(&mut self) {
-        self.flip = None;
+        self.cancel_flip_owner();
         self.flip_nodes = None;
         self.texture_request = None;
         if let Some(viewer) = self.texture.as_mut() {
@@ -2881,7 +2945,7 @@ impl Windows {
                     Ok(answer) => flip_from_answer(&answer, &known),
                     Err(error) => (Vec::new(), format!("The document's flip pairs could not be read: {error}")),
                 };
-                self.flip = Some(FlipWindow::new(pairs, nodes, message));
+                self.install_flip(pairs, nodes, message);
             }
             McpTarget::FlipWrite => {
                 if let Err(error) = structured(response.as_ref()) {
@@ -3357,7 +3421,7 @@ impl Windows {
     /// Opens the window once the document's stored pairs are known (`McpTarget::FlipRead`).
     fn open_flip(&mut self, env: &mut Env) {
         if !env.is_inx() {
-            self.flip = Some(FlipWindow::new(Vec::new(), Vec::new(), "Flip pairs need an open INX document.".to_owned()));
+            self.install_flip(Vec::new(), Vec::new(), "Flip pairs need an open INX document.".to_owned());
             return;
         }
         self.flip_nodes = Some(tree_nodes(&env.snapshot["model"]["nodes"]));
@@ -3437,11 +3501,12 @@ impl Windows {
                 }
             }
         }
-        if let Some(mut window) = self.flip.take() {
-            match window.show(env) {
-                FlipOutcome::Open => self.flip = Some(window),
-                FlipOutcome::Cancelled => {}
+        if let Some(outcome) = self.flip.as_mut().map(|window|window.show(env, &mut self.flip_epochs)) {
+            match outcome {
+                FlipOutcome::Open => {},
+                FlipOutcome::Cancelled => self.cancel_flip_owner(),
                 FlipOutcome::Saved(pairs) => {
+                    self.cancel_flip_owner();
                     let call = call_request("extdata_set", flip_store_arguments(&pairs));
                     env.out.push(Request::Mcp(McpTarget::FlipWrite, call));
                 }
@@ -3469,7 +3534,7 @@ mod logic_tests {
         use super::*;
         let store = Settings::empty();
         let mut windows = Windows::default();
-        windows.flip = Some(FlipWindow::new(vec![FlipPair { parts: [Some(1), Some(2)] }], Vec::new(), String::new()));
+        windows.install_flip(vec![FlipPair { parts: [Some(1), Some(2)] }], Vec::new(), String::new());
         assert!(!windows.quit_pending(&store));
         windows.flip.as_mut().unwrap().pairs[0].parts[1] = Some(3);
         assert!(windows.quit_pending(&store));
@@ -4225,7 +4290,7 @@ mod frame_tests {
         windows.set_texture_viewer(false, None, None);
 
         let nodes_list = tree_nodes(&rig.snapshot["model"]["nodes"]);
-        windows.flip = Some(FlipWindow::new(vec![pair_of(12, 13)], nodes_list, "message".to_owned()));
+        windows.install_flip(vec![pair_of(12, 13)], nodes_list, "message".to_owned());
         windows.flip.as_mut().unwrap().picked = Some(9);
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         for expected in ["Nodes without a pair", "Filter nodes", "Part 1", "Part 2", "Use selected node as Part 1 of row 1", "Remove row 1", "Eye_L", "Eye_R"] {
@@ -5543,6 +5608,244 @@ mod frame_tests {
             mcp: &rig.mcp,
             out: Vec::new(),
         }
+    }
+
+    fn flip_owner(pairs: Vec<FlipPair>) -> (egui::Context, Windows, Rig) {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        windows.started = true;
+        let tr = |text: &str|text.to_owned();
+        { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); }
+        let payload = dump_flip_config(&pairs);
+        windows.deliver(McpTarget::FlipRead, Some(flip_response(payload.is_some(), payload.as_deref().unwrap_or_default())));
+        (ctx, windows, rig)
+    }
+
+    fn flip_identity(windows: &Windows) -> String { windows.flip_input_state().identity.unwrap() }
+
+    fn flip_focus(ctx: &egui::Context, windows: &mut Windows, rig: &mut Rig, label: &str) {
+        frame(ctx, windows, rig, Vec::new());
+        let (_, output) = frame(ctx, windows, rig, Vec::new());
+        let at = crate::editor_test_support::center(&output, Role::TextInput, label);
+        frame(ctx, windows, rig, vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)]);
+    }
+
+    fn flip_text(ctx: &egui::Context, windows: &mut Windows, rig: &mut Rig, label: &str, value: &str) {
+        flip_focus(ctx, windows, rig, label);
+        let select = |pressed|egui::Event::Key {key:egui::Key::A, physical_key:None, pressed,
+            repeat:false, modifiers:egui::Modifiers::COMMAND};
+        let mut events = vec![select(true)];
+        if value.is_empty() {
+            for pressed in [true, false] {
+                events.push(egui::Event::Key {key:egui::Key::Backspace, physical_key:None, pressed,
+                    repeat:false, modifiers:egui::Modifiers::NONE});
+            }
+        } else {events.push(egui::Event::Text(value.to_owned()));}
+        events.push(select(false));
+        frame(ctx, windows, rig, events);
+        frame(ctx, windows, rig, Vec::new());
+    }
+
+    #[test]
+    fn flip_cancel_observation_is_pure_and_only_existing_owners_are_available() {
+        let windows = Windows::new();
+        let absent = windows.flip_input_state();
+        assert!(!absent.open && !absent.dirty && !absent.pending_read && absent.identity.is_none());
+        assert_eq!(windows.capture_flip_cancel_target("absent"), Err(InputRefusal::Unavailable));
+        let (ctx, mut windows, mut rig) = flip_owner(vec![pair_of(12, 13)]);
+        let snapshot = rig.snapshot.clone();
+        let identity = flip_identity(&windows);
+        let target = windows.capture_flip_cancel_target(&identity).unwrap();
+        windows.about = true;
+        for _ in 0..3 {
+            let state = windows.flip_input_state();
+            assert!(state.open && !state.dirty && !state.pending_read);
+            assert_eq!(state.identity.as_deref(), Some(identity.as_str()));
+            frame(&ctx, &mut windows, &mut rig, Vec::new());
+            assert_eq!(windows.check_flip_cancel_target(&target), Ok(()));
+        }
+        assert!(windows.about);
+        assert_eq!(rig.snapshot, snapshot);
+        assert_eq!(windows.capture_flip_cancel_target("wrong"), Err(InputRefusal::StaleInput));
+    }
+
+    #[test]
+    fn flip_cancel_actual_pick_row_and_pair_aba_change_identity_without_redefining_dirty() {
+        let (ctx, mut windows, mut rig) = flip_owner(Vec::new());
+        let snapshot = rig.snapshot.clone();
+        let initial = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Eye_L (Node)");
+        assert!(!windows.has_document_draft());
+        assert_eq!(windows.check_flip_cancel_target(&initial), Err(InputRefusal::StaleInput));
+        let picked = flip_identity(&windows);
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Eye_L (Node)");
+        assert_eq!(flip_identity(&windows), picked);
+        let target = windows.capture_flip_cancel_target(&picked).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Add as new row");
+        assert!(windows.has_document_draft());
+        assert_eq!(windows.check_flip_cancel_target(&target), Err(InputRefusal::StaleInput));
+        let added = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Remove row 1");
+        assert!(!windows.has_document_draft());
+        assert_eq!(windows.check_flip_cancel_target(&added), Err(InputRefusal::StaleInput));
+        assert_eq!(windows.check_flip_cancel_target(&initial), Err(InputRefusal::StaleInput));
+        assert_eq!(rig.snapshot, snapshot);
+    }
+
+    #[test]
+    fn flip_cancel_raw_normalization_and_message_changes_stale_but_genuine_pair_noops_do_not() {
+        let (ctx, mut windows, mut rig) = flip_owner(vec![FlipPair {parts:[Some(12), None]}]);
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Remove row 1");
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Eye_L (Node)");
+        flip_text(&ctx, &mut windows, &mut rig, "Part 1", "_L");
+        flip_text(&ctx, &mut windows, &mut rig, "Part 2", "_R");
+        let before_pair = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Pair");
+        assert_eq!(windows.flip.as_ref().unwrap().pairs, [pair_of(12, 13)]);
+        assert_eq!(windows.check_flip_cancel_target(&before_pair), Err(InputRefusal::StaleInput));
+        let before_assign = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Use selected node as Part 2 of row 1");
+        assert_eq!(windows.flip.as_ref().unwrap().pairs[0].parts, [None, Some(12)]);
+        assert!(!windows.has_document_draft());
+        assert_eq!(windows.check_flip_cancel_target(&before_assign), Err(InputRefusal::StaleInput));
+        let raw = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Pair");
+        assert_eq!(windows.flip.as_ref().unwrap().pairs[0].parts, [Some(12), None]);
+        assert!(!windows.has_document_draft());
+        assert_eq!(windows.check_flip_cancel_target(&raw), Err(InputRefusal::StaleInput));
+        let normalized = flip_identity(&windows);
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Pair");
+        assert_eq!(flip_identity(&windows), normalized);
+        flip_text(&ctx, &mut windows, &mut rig, "Part 1", "");
+        let before_error = flip_identity(&windows);
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Pair");
+        assert_ne!(flip_identity(&windows), before_error);
+        let error = flip_identity(&windows);
+        click(&ctx, &mut windows, &mut rig, Role::Button, "Pair");
+        assert_eq!(flip_identity(&windows), error);
+    }
+
+    #[test]
+    fn flip_cancel_real_text_equivalent_aba_cancelled_ime_and_idle_have_distinct_freshness() {
+        for label in ["Filter nodes", "Part 1", "Part 2"] {
+            for edit in ["equivalent", "aba", "ime", "bare_ime", "caret"] {
+                let (ctx, mut windows, mut rig) = flip_owner(Vec::new());
+                flip_text(&ctx, &mut windows, &mut rig, label, "seed");
+                let target = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+                let select = |pressed|egui::Event::Key {key:egui::Key::A, physical_key:None, pressed,
+                    repeat:false, modifiers:egui::Modifiers::COMMAND};
+                let events = match edit {
+                    "equivalent" => vec![select(true), egui::Event::Text("seed".into()), select(false)],
+                    "aba" => vec![select(true), egui::Event::Text("changed".into()), select(false),
+                        select(true), egui::Event::Text("seed".into()), select(false)],
+                    "ime" => vec![egui::Event::Ime(egui::ImeEvent::Enabled), egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())), egui::Event::Ime(egui::ImeEvent::Disabled)],
+                    "bare_ime" => vec![egui::Event::Ime(egui::ImeEvent::Enabled), egui::Event::Ime(egui::ImeEvent::Disabled)],
+                    _ => vec![key(egui::Key::ArrowLeft, false, false)],
+                };
+                frame(&ctx, &mut windows, &mut rig, events);
+                let window = windows.flip.as_ref().unwrap();
+                let text = match label {"Filter nodes" => &window.filter, "Part 1" => &window.left, _ => &window.right};
+                assert_eq!(text, "seed", "{label} {edit}");
+                assert!(!windows.has_document_draft());
+                let expected = if matches!(edit, "bare_ime" | "caret") {Ok(())} else {Err(InputRefusal::StaleInput)};
+                assert_eq!(windows.check_flip_cancel_target(&target), expected, "{label} {edit}");
+                frame(&ctx, &mut windows, &mut rig, Vec::new());
+                assert_eq!(windows.check_flip_cancel_target(&target), expected, "no revival {label} {edit}");
+            }
+        }
+    }
+
+    #[test]
+    fn flip_cancel_native_and_checked_disposal_preserve_independent_read_and_siblings() {
+        for action in ["Cancel", "Close window", "checked"] {
+            let (ctx, mut windows, mut rig) = flip_owner(vec![pair_of(12, 13)]);
+            let snapshot = rig.snapshot.clone();
+            windows.about = true;
+            windows.notices.push("owned unrelated notice".into());
+            let tr = |text: &str|text.to_owned();
+            { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); assert_eq!(env.out.len(), 1); }
+            let target = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+            if action == "checked" {windows.cancel_flip_if_current(&target).unwrap();}
+            else {assert!(click(&ctx, &mut windows, &mut rig, Role::Button, action).0.iter()
+                .all(|request|matches!(request, Request::Notice(_))));}
+            let pending = windows.flip_input_state();
+            assert!(!pending.open && !pending.dirty && pending.pending_read && pending.identity.is_none());
+            assert_eq!(windows.capture_flip_cancel_target(&target.identity), Err(InputRefusal::Unavailable));
+            assert_eq!(windows.cancel_flip_if_current(&target), Err(InputRefusal::Unavailable));
+            assert!(windows.flip_input_state().pending_read);
+            assert!(windows.about);
+            assert_eq!(rig.snapshot, snapshot);
+            windows.deliver(McpTarget::FlipRead, Some(flip_response(true, br#"[{"uuid1":12,"uuid2":13}]"#)));
+            assert!(windows.flip_input_state().open && !windows.flip_input_state().pending_read);
+            assert_eq!(windows.cancel_flip_if_current(&target), Err(InputRefusal::StaleInput));
+            { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); }
+            windows.forget_document();
+            windows.deliver(McpTarget::FlipRead, Some(flip_response(false, b"")));
+            assert!(!windows.flip_input_state().open && !windows.flip_input_state().pending_read);
+        }
+    }
+
+    #[test]
+    fn flip_cancel_failed_malformed_and_non_inx_native_owners_are_eligible() {
+        for kind in ["failed", "malformed", "non_inx"] {
+            let (ctx, mut windows, mut rig) = flip_owner(Vec::new());
+            let old = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+            if kind == "non_inx" {rig.snapshot["documentFormat"] = json!("live2d.cmo3");}
+            let tr = |text: &str|text.to_owned();
+            { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); }
+            match kind {
+                "failed" => windows.deliver(McpTarget::FlipRead, None),
+                "malformed" => windows.deliver(McpTarget::FlipRead, Some(flip_response(true, b"not JSON"))),
+                _ => {},
+            }
+            let state = windows.flip_input_state();
+            assert!(state.open && !state.dirty && state.identity.is_some());
+            assert_eq!(windows.check_flip_cancel_target(&old), Err(InputRefusal::StaleInput));
+            let target = windows.capture_flip_cancel_target(state.identity.as_deref().unwrap()).unwrap();
+            windows.cancel_flip_if_current(&target).unwrap();
+            assert!(!windows.flip_input_state().open);
+        }
+    }
+
+    #[test]
+    fn flip_cancel_identity_failure_and_exhaustion_keep_native_cancel_available() {
+        for exhausted in [false, true] {
+            let (ctx, mut windows, mut rig) = flip_owner(Vec::new());
+            let target = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+            if exhausted {windows.flip_epochs.exhaust_for_test();} else {windows.flip_epochs.fail_instance_for_test();}
+            let state = windows.flip_input_state();
+            assert!(state.open && state.identity.is_none());
+            assert_eq!(windows.check_flip_cancel_target(&target), Err(InputRefusal::IdentityUnavailable));
+            assert!(click(&ctx, &mut windows, &mut rig, Role::Button, "Cancel").0.is_empty());
+            assert!(!windows.flip_input_state().open);
+        }
+    }
+
+    #[test]
+    fn flip_cancel_reopening_separates_real_text_undo_and_ime_view_memory() {
+        let (ctx, mut windows, mut rig) = flip_owner(Vec::new());
+        flip_text(&ctx, &mut windows, &mut rig, "Part 1", "old private pattern");
+        let old = windows.capture_flip_cancel_target(&flip_identity(&windows)).unwrap();
+        let tr = |text: &str|text.to_owned();
+        { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); }
+        windows.deliver(McpTarget::FlipRead, Some(flip_response(false, b"")));
+        assert_eq!(windows.check_flip_cancel_target(&old), Err(InputRefusal::StaleInput));
+        flip_focus(&ctx, &mut windows, &mut rig, "Part 1");
+        frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Z, true, false)]);
+        assert_eq!(windows.flip.as_ref().unwrap().left, "");
+        frame(&ctx, &mut windows, &mut rig, vec![egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("old composition".into()))]);
+        { let mut env = flip_env(&ctx, &mut rig, &tr); windows.open_flip(&mut env); }
+        windows.deliver(McpTarget::FlipRead, Some(flip_response(false, b"")));
+        flip_text(&ctx, &mut windows, &mut rig, "Part 1", "new");
+        frame(&ctx, &mut windows, &mut rig, vec![egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+            egui::Event::Ime(egui::ImeEvent::Disabled)]);
+        assert_eq!(windows.flip.as_ref().unwrap().left, "new");
+        assert!(!windows.has_document_draft());
     }
 
     #[test]

@@ -387,6 +387,7 @@ impl RemoteObjectDiscard {
 enum PanelDiscardOutcome {
     Forms(crate::editor_live2d_forms::FormsDiscardOutcome),
     Motion3(crate::editor_motion3::Motion3DiscardOutcome),
+    FlipCancelled,
     Input(crate::editor_input_epoch::InputRefusal),
     StaleDocument,
     ConsentInvalid,
@@ -402,6 +403,7 @@ impl PanelDiscardOutcome {
         let state = match self {
             Self::Forms(outcome) => return outcome.value(),
             Self::Motion3(outcome) => return outcome.value(),
+            Self::FlipCancelled => "cancelled",
             Self::Input(refusal) => refusal.state(),
             Self::StaleDocument => "stale_document", Self::ConsentInvalid => "consent_invalid",
             Self::EditorClosing => "editor_closing", Self::ReplyNotProduced => "reply_not_produced",
@@ -911,7 +913,7 @@ impl RemoteQuit {
 /// All of it is view state: nothing here reaches the document, its history or its revision.
 struct EditorView<'a> {
     object_discard: &'a mut RemoteObjectDiscard,
-    panel_discards: &'a mut [RemotePanelDiscard; 4],
+    panel_discards: &'a mut [RemotePanelDiscard; 5],
     remote_quit: &'a mut RemoteQuit,
     agent_cancel: &'a mut RemoteAgentCancel,
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
@@ -1118,13 +1120,16 @@ impl EditorView<'_> {
             let args = &message["params"]["arguments"];
             let expected = args["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
                 .ok_or("expectedInputIdentity must be a nonempty string")?;
-            let action = args["action"].as_str().ok_or("action must be a string")?;
             let input = match message["params"]["name"].as_str() {
                 Some("editor_live2d_forms_discard") => PanelDiscardInput::Forms(self.forms.capture_discard_target(
-                    FormsInputAction::parse(action).ok_or("Unknown Forms input action")?, expected, controller.snapshot())
+                    FormsInputAction::parse(args["action"].as_str().ok_or("action must be a string")?)
+                        .ok_or("Unknown Forms input action")?, expected, controller.snapshot())
                     .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
                 Some("editor_motion3_discard") => PanelDiscardInput::Motion3(self.motion3.capture_discard_target(
-                    Motion3InputAction::parse(action).ok_or("Unknown Motion3 input action")?, expected, controller.snapshot())
+                    Motion3InputAction::parse(args["action"].as_str().ok_or("action must be a string")?)
+                        .ok_or("Unknown Motion3 input action")?, expected, controller.snapshot())
+                    .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
+                Some("editor_flip_pairing_cancel") => PanelDiscardInput::Flip(self.windows.capture_flip_cancel_target(expected)
                     .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
                 _ => return Err("Not a panel input discard request".into()),
             };
@@ -1263,7 +1268,8 @@ impl EditorView<'_> {
         let read_only = matches!(message["method"].as_str(), Some("tools/list" | "resources/list" | "resources/templates/list" | "resources/read" | "ping" | "initialize"))
             || (message["method"] == "tools/call" && message["params"]["name"].as_str()
                 .is_some_and(|name| soul2d_core::manifest::effect_of(name) == Some("-")));
-        let is_panel_discard = matches!(message["params"]["name"].as_str(), Some("editor_live2d_forms_discard" | "editor_motion3_discard"));
+        let is_panel_discard = matches!(message["params"]["name"].as_str(),
+            Some("editor_live2d_forms_discard" | "editor_motion3_discard" | "editor_flip_pairing_cancel"));
         if !is_quit && !read_only && !is_panel_discard { self.remote_quit.cancel("new_operation"); }
         if self.remote_quit.active() {
             let changed = match &*self.remote_quit {
@@ -1313,7 +1319,7 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
-                if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) {
+                if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) {
                     let target = panel_discard_target.clone()?;
                     approval.reserve_input_discard(&target, panel_discard_continuing)?;
                     return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::PanelDiscard(target)), None);
@@ -1511,7 +1517,7 @@ impl EditorView<'_> {
                 send_receipt = Some((sender, admitted.clone()));
                 return Ok(admitted);
             }
-            if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) {
+            if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) {
                 let target = panel_discard_target.clone()?;
                 let lane = target.input.lane();
                 let attempt = if target.invocation().is_some() {
@@ -1522,10 +1528,10 @@ impl EditorView<'_> {
                 } else { self.panel_discards[lane].attempt().checked_add(1).ok_or("Input discard attempt identity exhausted")? };
                 let (sender, receipt) = sync_channel(1);
                 let action = target.input.action();
+                let key = target.input.result_key();
+                let lane_name = target.input.lane_name();
                 self.panel_discards[lane] = RemotePanelDiscard::Waiting { attempt, target, receipt,
                     deadline:Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT };
-                let key = if lane == 0 { "live2dFormDiscard" } else { "motion3Discard" };
-                let lane_name = ["forms", "point", "bindings", "reload"][lane];
                 let admitted = json!({key:{"state":"admitted", "action":action, "lane":lane_name, "attempt":attempt,
                     "policy":"after_local_reply_delivery_and_matching_inputs_document_and_invocation"}});
                 panel_discard_receipt = Some((lane, sender, admitted.clone()));
@@ -2563,6 +2569,10 @@ impl EditorView<'_> {
         state["motion3Inputs"] = self.motion3.input_snapshot(snapshot);
         state["motion3Discard"] = json!({"point":self.panel_discards[1].state(),
             "bindings":self.panel_discards[2].state(), "reload":self.panel_discards[3].state()});
+        let flip = self.windows.flip_input_state();
+        state["flipPairingInputs"] = json!({"open":flip.open, "dirty":flip.dirty, "pendingRead":flip.pending_read,
+            "cancel":{"nativeAvailable":flip.open, "discardable":flip.identity.is_some(), "identity":flip.identity}});
+        state["flipPairingCancel"] = self.panel_discards[4].state();
         state
     }
 }
@@ -2593,7 +2603,7 @@ pub struct EditorApp {
     agent_start: RemoteAgentLaunch,
     agent_new_session: RemoteAgentLaunch,
     object_discard: RemoteObjectDiscard,
-    panel_discards: [RemotePanelDiscard; 4],
+    panel_discards: [RemotePanelDiscard; 5],
     agent_draft: RemoteAgentDraft,
     agent_send: RemoteAgentSend,
     #[cfg(test)]
@@ -3207,6 +3217,7 @@ impl EditorApp {
             let input_status = match &target.input {
                 crate::editor_agent::PanelDiscardInput::Forms(input) => self.forms.check_discard_target(input, self.controller.snapshot()),
                 crate::editor_agent::PanelDiscardInput::Motion3(input) => self.motion3.check_discard_target(input, self.controller.snapshot()),
+                crate::editor_agent::PanelDiscardInput::Flip(input) => self.windows.check_flip_cancel_target(input),
             };
             let mut failure = if self.controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
                 || self.controller.project_path() != target.document.path.as_deref() { Some(PanelDiscardOutcome::StaleDocument) }
@@ -3238,6 +3249,8 @@ impl EditorApp {
                         .map(PanelDiscardOutcome::Forms),
                     crate::editor_agent::PanelDiscardInput::Motion3(input) => self.motion3.discard_if_current(input, &mut self.controller)
                         .map(PanelDiscardOutcome::Motion3),
+                    crate::editor_agent::PanelDiscardInput::Flip(input) => self.windows.cancel_flip_if_current(input)
+                        .map(|()|PanelDiscardOutcome::FlipCancelled),
                 };
                 self.sync_panel_drafts();
                 result.unwrap_or_else(PanelDiscardOutcome::Input)
@@ -21175,6 +21188,493 @@ mod editor_state_tests {
             assert!(app.unsaved.is_none());
             assert_eq!(app.controller.snapshot(), &snapshot);
             assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        }
+    }
+
+    fn flip_cancel_app(name: &str, dirty: bool) -> (EditorApp, crate::editor_test_support::Harness) {
+        use base64::Engine;
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app(name);
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        app.tools.store.set("Outline.visible", false).unwrap();
+        let payload = base64::engine::general_purpose::STANDARD.encode(br#"[{"uuid1":1,"uuid2":4294967295}]"#);
+        assert_eq!(app.controller.core_request(&json!({"op":"extdata.set",
+            "key":crate::editor_windows::FLIP_CONFIG_KEY, "base64":payload}))["succeeded"], true);
+        let source = app.controller.project_path().unwrap().parent().unwrap().join("stored-flip-pairs.inx");
+        assert_eq!(app.controller.core_request(&json!({"op":"save", "path":source}))["succeeded"], true);
+        let mut harness = Harness::new();
+        harness.screen = egui::vec2(1800.0, 1600.0);
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+        harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+        if dirty {
+            harness.click(Role::Button, "Face (Part)", |ctx|app.update(ctx, &mut frame));
+            harness.click(Role::Button, "Add as new row", |ctx|app.update(ctx, &mut frame));
+        }
+        assert!(app.windows.flip_input_state().open);
+        assert_eq!(app.windows.has_document_draft(), dirty);
+        (app, harness)
+    }
+
+    fn flip_cancel_message(app: &EditorApp) -> Value {
+        let identity = app.windows.flip_input_state().identity.unwrap();
+        json!({"jsonrpc":"2.0", "id":"flip-cancel", "method":"tools/call", "params":{
+            "name":"editor_flip_pairing_cancel", "arguments":{"expectedInputIdentity":identity}}})
+    }
+
+    #[test]
+    fn flip_cancel_full_app_exact_reply_precedes_native_disposal_and_pure_state_does_not_disclose_inputs() {
+        for dirty in [false, true] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-cancel-delivery-{dirty}"), dirty);
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.text("Part 1", "private retained flip pattern", |ctx|app.update(ctx, &mut frame));
+            app.timeline_weight_draft = Some(("Other panel draft".into(), 0.4));
+            let snapshot = app.controller.snapshot().clone();
+            let source = app.controller.project_path().unwrap().to_owned();
+            let bytes = std::fs::read(&source).unwrap();
+            let stored = call(&mut app, "extdata_get", json!({"key":crate::editor_windows::FLIP_CONFIG_KEY}));
+            assert_eq!(stored["present"], true);
+            let message = flip_cancel_message(&app);
+            for _ in 0..3 {
+                let state = state(&mut app);
+                assert_eq!(state["flipPairingInputs"]["cancel"]["identity"], message["params"]["arguments"]["expectedInputIdentity"]);
+                assert_eq!(state["flipPairingInputs"]["cancel"]["nativeAvailable"], true);
+                assert_eq!(state["flipPairingInputs"]["dirty"], dirty);
+                assert_eq!(state["flipPairingCancel"]["state"], "idle");
+                assert!(!state.to_string().contains("private retained flip pattern"));
+            }
+            let reply = request_panel_discard(&mut app, &message);
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], "waiting_for_reply");
+            assert_eq!(state(&mut app)["flipPairingCancel"]["state"], "waiting_for_reply");
+            assert!(app.windows.flip_input_state().open);
+            let mut output = Vec::new();
+            reply.write_line(&mut output).unwrap();
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["id"], "flip-cancel");
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(response["result"]["structuredContent"]["flipPairingCancel"], json!({
+                "state":"admitted", "action":"cancel", "lane":"flip", "attempt":1,
+                "policy":"after_local_reply_delivery_and_matching_inputs_document_and_invocation"}));
+            assert!(app.windows.flip_input_state().open);
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+            assert_eq!(app.panel_discards[4].state()["attempt"], 1);
+            assert!(!app.windows.flip_input_state().open && !app.windows.has_document_draft());
+            let published = state(&mut app);
+            assert_eq!(published["flipPairingCancel"], json!({"state":"cancelled", "action":"cancel", "attempt":1}));
+            assert_eq!(published["flipPairingInputs"], json!({"open":false, "dirty":false, "pendingRead":false,
+                "cancel":{"nativeAvailable":false, "discardable":false, "identity":null}}));
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(app.timeline_weight_draft, Some(("Other panel draft".into(), 0.4)));
+            assert_eq!(std::fs::read(source).unwrap(), bytes);
+            assert_eq!(call(&mut app, "extdata_get", json!({"key":crate::editor_windows::FLIP_CONFIG_KEY})), stored);
+            for _ in 0..2 {harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));}
+            assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+        }
+    }
+
+    #[test]
+    fn flip_cancel_full_app_post_delivery_equivalent_aba_and_cancelled_ime_stale_without_revival() {
+        use egui::accesskit::Role;
+        for label in ["Filter nodes", "Part 1", "Part 2"] {
+            for edit in ["equivalent", "aba", "ime"] {
+                let (mut app, mut harness) = flip_cancel_app(&format!("flip-cancel-post-reply-{label}-{edit}"), false);
+                let mut frame = eframe::Frame::_new_kittest();
+                harness.text(label, "seed", |ctx|app.update(ctx, &mut frame));
+                let message = flip_cancel_message(&app);
+                let snapshot = app.controller.snapshot().clone();
+                request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+                let select = |pressed|egui::Event::Key {key:egui::Key::A, physical_key:None, pressed,
+                    repeat:false, modifiers:egui::Modifiers::COMMAND};
+                let events = match edit {
+                    "equivalent" => vec![select(true), egui::Event::Text("seed".into()), select(false)],
+                    "aba" => vec![select(true), egui::Event::Text("changed".into()), select(false),
+                        select(true), egui::Event::Text("seed".into()), select(false)],
+                    _ => vec![egui::Event::Ime(egui::ImeEvent::Enabled), egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())), egui::Event::Ime(egui::ImeEvent::Disabled)],
+                };
+                let output = harness.frame(events, |ctx|app.update(ctx, &mut frame));
+                assert_eq!(crate::editor_test_support::find(&output, Role::TextInput, label).unwrap().value(), Some("seed"), "{label} {edit}");
+                assert_eq!(app.panel_discards[4].state()["state"], "stale_input", "{label} {edit}");
+                assert!(app.windows.flip_input_state().open && !app.windows.has_document_draft());
+                assert_eq!(app.controller.snapshot(), &snapshot);
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert_eq!(app.panel_discards[4].state()["state"], "stale_input");
+                let fresh = flip_cancel_message(&app);
+                assert_ne!(fresh["params"]["arguments"]["expectedInputIdentity"], message["params"]["arguments"]["expectedInputIdentity"]);
+                request_panel_discard(&mut app, &fresh).write_line(&mut Vec::new()).unwrap();
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+                assert_eq!(app.panel_discards[4].state()["attempt"], 2);
+                assert_eq!(app.controller.snapshot(), &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_cancel_full_app_blocked_native_close_invalidates_the_delivered_attempt() {
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-post-reply-close", true);
+        let message = flip_cancel_message(&app);
+        let snapshot = app.controller.snapshot().clone();
+        request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+        harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close)));
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+        assert!(!app.closing && harness.close_requests == 0 && app.windows.has_document_draft());
+        assert_eq!(app.panel_discards[4].state()["state"], "editor_closing");
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+        assert_eq!(app.panel_discards[4].state()["state"], "editor_closing");
+        assert!(app.windows.flip_input_state().open);
+    }
+
+    #[test]
+    fn flip_cancel_full_app_tools_reopening_after_delivery_preserves_the_replacement_owner() {
+        use egui::accesskit::Role;
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-post-reply-reopen", false);
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.text("Part 1", "old retained private pattern", |ctx|app.update(ctx, &mut frame));
+        let output = harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+        let at = crate::editor_test_support::center(&output, Role::Button, "Flip Pairing");
+        let message = flip_cancel_message(&app);
+        let snapshot = app.controller.snapshot().clone();
+        request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+        harness.frame(vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {pos:at, button:egui::PointerButton::Primary,
+            pressed:true, modifiers:egui::Modifiers::NONE}, egui::Event::PointerButton {pos:at, button:egui::PointerButton::Primary,
+            pressed:false, modifiers:egui::Modifiers::NONE}], |ctx|app.update(ctx, &mut frame));
+        assert_eq!(app.panel_discards[4].state()["state"], "stale_input");
+        assert!(app.windows.flip_input_state().open && !app.windows.flip_input_state().pending_read);
+        let output = harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+        assert_eq!(crate::editor_test_support::find(&output, Role::TextInput, "Part 1").unwrap().value(), Some(""));
+        assert_eq!(app.controller.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn flip_cancel_refuses_unidentified_internal_malformed_duplicate_and_absent_owner_calls() {
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-refusal", true);
+        let original = flip_cancel_message(&app);
+        let identity = app.windows.flip_input_state().identity;
+        for id in [Value::Null, json!(true), json!({}), json!([]), json!(1.5)] {
+            let mut message = original.clone(); message["id"] = id;
+            let reply = request_panel_discard(&mut app, &message).into_message();
+            assert!(reply.is_none_or(|reply|reply["result"]["isError"] == true || reply.get("error").is_some()));
+            assert!(!app.panel_discards[4].pending());
+        }
+        let mut notification = original.clone(); notification.as_object_mut().unwrap().remove("id");
+        let _ = request_panel_discard(&mut app, &notification).into_message();
+        assert!(!app.panel_discards[4].pending());
+        let internal = CTX.with(|ctx|editor_view!(app, ctx).mcp(&mut app.controller, &original, McpOrigin::Internal).into_message()).unwrap();
+        assert_eq!(internal["result"]["isError"], true);
+        for args in [json!({}), json!({"expectedInputIdentity":"wrong"}), json!({"expectedInputIdentity":""}),
+            json!({"expectedInputIdentity":1}), json!({"expectedInputIdentity":identity, "action":"cancel"})] {
+            let mut message = original.clone(); message["params"]["arguments"] = args;
+            assert_eq!(request_panel_discard(&mut app, &message).into_message().unwrap()["result"]["isError"], true);
+            assert!(!app.panel_discards[4].pending());
+        }
+        assert_eq!(app.windows.flip_input_state().identity, identity);
+        let accepted = request_panel_discard(&mut app, &original);
+        assert_eq!(request_panel_discard(&mut app, &original).into_message().unwrap()["result"]["isError"], true);
+        assert_eq!(app.panel_discards[4].attempt(), 1);
+        drop(accepted);
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+        assert_eq!(app.panel_discards[4].state()["state"], "reply_lost");
+        harness.click(egui::accesskit::Role::Button, "Cancel", |ctx|app.update(ctx, &mut frame));
+        assert_eq!(request_panel_discard(&mut app, &original).into_message().unwrap()["result"]["isError"], true);
+        assert!(!app.windows.flip_input_state().open && !app.panel_discards[4].pending());
+    }
+
+    #[test]
+    fn flip_cancel_failed_partial_flush_lost_expired_and_internal_replies_never_dispose_or_revive() {
+        struct Writer {remaining:usize, flush_fails:bool}
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes:&[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(self.remaining); self.remaining -= n;
+                if n == 0 {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(n)}
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.flush_fails {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(())}
+            }
+        }
+        for case in ["failed", "partial", "flush", "lost", "expired", "into_message"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-cancel-receipt-{case}"), true);
+            let message = flip_cancel_message(&app);
+            let identity = app.windows.flip_input_state().identity;
+            let snapshot = app.controller.snapshot().clone();
+            let reply = request_panel_discard(&mut app, &message);
+            let late = match case {
+                "failed" | "partial" | "flush" => {
+                    assert!(reply.write_line(&mut Writer {remaining:if case == "flush" {usize::MAX} else if case == "partial" {3} else {0},
+                        flush_fails:case == "flush"}).is_err()); None
+                }
+                "lost" => {drop(reply); None}
+                "into_message" => {let _ = reply.into_message(); None}
+                _ => {let RemotePanelDiscard::Waiting {deadline, ..} = &mut app.panel_discards[4] else {panic!()};
+                    *deadline = Instant::now() - Duration::from_millis(1); Some(reply)}
+            };
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            let expected = match case {"failed" | "partial" | "flush" => "reply_failed", "expired" => "reply_expired", _ => "reply_lost"};
+            assert_eq!(app.panel_discards[4].state()["state"], expected);
+            if let Some(reply) = late {reply.write_line(&mut Vec::new()).unwrap();}
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], expected);
+            assert_eq!(app.windows.flip_input_state().identity, identity);
+            assert!(app.windows.has_document_draft());
+            assert_eq!(app.controller.snapshot(), &snapshot);
+        }
+    }
+
+    #[test]
+    fn flip_cancel_rechecks_current_document_revision_and_save_as_path_after_delivery() {
+        for case in ["revision", "path", "same_path"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-cancel-document-{case}"), true);
+            let message = flip_cancel_message(&app);
+            let identity = app.windows.flip_input_state().identity;
+            request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+            if case == "revision" {
+                let previous = app.controller.snapshot()["revision"].as_u64().unwrap();
+                assert_eq!(app.controller.core_request(&json!({"op":"new"}))["succeeded"], true);
+                assert!(app.controller.snapshot()["revision"].as_u64().unwrap() > previous);
+            } else if case == "same_path" {
+                let path = app.controller.project_path().unwrap().to_owned();
+                let source = std::fs::read(&path).unwrap();
+                let revision = app.controller.snapshot()["revision"].as_u64().unwrap();
+                assert_eq!(app.controller.core_request(&json!({"op":"open", "path":path}))["succeeded"], true);
+                assert_eq!(app.controller.project_path(), Some(path.as_path()));
+                assert!(app.controller.snapshot()["revision"].as_u64().unwrap() > revision);
+                assert_eq!(std::fs::read(path).unwrap(), source);
+            } else {
+                let path = app.controller.project_path().unwrap().parent().unwrap().join("new-basis.inx");
+                call(&mut app, "save", json!({"path":path}));
+                assert!(path.exists());
+            }
+            let changed = app.controller.snapshot().clone();
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], "stale_document");
+            assert_eq!(app.windows.flip_input_state().identity, identity);
+            assert_eq!(app.controller.snapshot(), &changed);
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], "stale_document");
+        }
+    }
+
+    #[test]
+    fn flip_cancel_clean_pending_blocks_eof_and_quit_without_cancelling_pending_quit() {
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-quit-eof", false);
+        let message = flip_cancel_message(&app);
+        let quit = json!({"jsonrpc":"2.0", "id":"quit", "method":"tools/call", "params":{"name":"editor_quit", "arguments":{}}});
+        let pending_quit = request_panel_discard(&mut app, &quit);
+        assert!(app.remote_quit.active());
+        assert_eq!(request_panel_discard(&mut app, &message).into_message().unwrap()["result"]["isError"], true);
+        assert!(app.remote_quit.active());
+        app.remote_quit.cancel("test_reset"); drop(pending_quit);
+        let reply = request_panel_discard(&mut app, &message);
+        assert_eq!(request_panel_discard(&mut app, &quit).into_message().unwrap()["result"]["isError"], true);
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(), |ctx|app.finish_close_requests(ctx, HostDrainEffect::Eof, false));
+        assert!(!app.closing && harness.close_requests == 0);
+        reply.write_line(&mut Vec::new()).unwrap();
+        harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+        assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+        assert!(!app.closing && harness.close_requests == 0);
+    }
+
+    #[test]
+    fn flip_cancel_actual_client_http_delivers_the_matching_admission_and_preserves_sibling_drafts() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-http", true);
+        app.timeline_weight_draft = Some(("Other retained input".into(), 0.4));
+        let snapshot = app.controller.snapshot().clone();
+        let server = McpServer::start(&McpSettings {enabled:true, host:"127.0.0.1".into(), port:0, auth:true},
+            Some("owned-flip-client-token".into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().split('/').next().unwrap().to_owned();
+        app.mcp_server = Some(server);
+        let body = flip_cancel_message(&app).to_string();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer owned-flip-client-token\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new(); stream.read_to_string(&mut response).unwrap(); response
+        });
+        let mut frame = eframe::Frame::_new_kittest();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_finished() || app.panel_discards[4].pending() {
+            assert!(Instant::now() < deadline);
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame)); std::thread::yield_now();
+        }
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let reply: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(reply["id"], "flip-cancel");
+        assert_eq!(reply["result"]["structuredContent"]["flipPairingCancel"]["state"], "admitted");
+        assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+        assert!(!app.windows.flip_input_state().open);
+        assert_eq!(app.timeline_weight_draft, Some(("Other retained input".into(), 0.4)));
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        app.mcp_server = None;
+    }
+
+    #[test]
+    fn flip_cancel_actual_stdio_flush_and_eof_preserve_other_drafts() {
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes:&[u8]) -> std::io::Result<usize> {self.0.lock().unwrap().0.extend_from_slice(bytes); Ok(bytes.len())}
+            fn flush(&mut self) -> std::io::Result<()> {self.0.lock().unwrap().1 += 1; Ok(())}
+        }
+        let (mut app, mut harness) = flip_cancel_app("flip-cancel-stdio", true);
+        app.timeline_weight_draft = Some(("Other retained input".into(), 0.4));
+        let snapshot = app.controller.snapshot().clone();
+        let line = format!("{}\n", flip_cancel_message(&app));
+        let output = Output(std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0))));
+        let writer = output.clone();
+        let (sender, receiver) = sync_channel(1); app.host_rx = Some(receiver);
+        let worker = std::thread::spawn(move ||editor_stdio::serve_lines(std::io::Cursor::new(line), writer, &sender, &egui::Context::default()));
+        let mut frame = eframe::Frame::_new_kittest();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() || app.panel_discards[4].pending() || !app.stdin_closed {
+            assert!(Instant::now() < deadline);
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame)); std::thread::yield_now();
+        }
+        worker.join().unwrap();
+        let output = output.0.lock().unwrap();
+        assert!(output.0.ends_with(b"\n") && output.1 > 0);
+        let reply: Value = serde_json::from_slice(&output.0).unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["flipPairingCancel"]["state"], "admitted");
+        assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+        assert_eq!(app.timeline_weight_draft, Some(("Other retained input".into(), 0.4)));
+        assert_eq!(app.controller.snapshot(), &snapshot);
+        assert!(!app.closing && harness.close_requests == 0);
+    }
+
+    #[test]
+    fn flip_cancel_owned_authenticated_acp_requires_original_allow_once_and_rechecks_authority() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["allowed", "denied", "permission", "completed", "cancel", "disconnect", "expired", "input_before_allow",
+            "prompt_replaced", "run_replaced"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-cancel-acp-{case}"), false);
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.text("Part 1", "private retained flip pattern", |ctx|app.update(ctx, &mut frame));
+            let (mut peer, mut token) = draft_peer(&mut app);
+            let message = flip_cancel_message(&app);
+            let original = draft_http(&app, &token, &message);
+            let duplicate = draft_http(&app, &token, &message);
+            serve_agent_requests(&mut app);
+            assert_eq!(app.panel_discards[4].state()["state"], "awaiting_human");
+            assert!(app.windows.flip_input_state().open);
+            assert_eq!(lifecycle_http_result(duplicate, "flip-cancel")["isError"], true);
+            if case == "input_before_allow" {
+                harness.text("Part 1", "changed before human consent", |ctx|app.update(ctx, &mut frame));
+                assert_eq!(lifecycle_http_result(original, "flip-cancel")["isError"], true);
+                assert_eq!(app.panel_discards[4].state()["state"], "stale_input");
+                harness.text("Part 1", "private retained flip pattern", |ctx|app.update(ctx, &mut frame));
+                assert_eq!(app.panel_discards[4].state()["state"], "stale_input");
+                assert!(app.windows.flip_input_state().open);
+                peer.finish(&mut app);
+                continue;
+            }
+            let path = app.tools.store_path.clone();
+            let mut approval = Harness::new();
+            let review = approval.frame(Vec::new(), |ctx|app.agent.host_approval_window(ctx, path.as_deref()));
+            let texts = crate::editor_test_support::texts(&review);
+            assert!(texts.iter().any(|text|text.contains("captured Flip Pairing")));
+            assert!(!texts.iter().any(|text|text.contains("private retained flip pattern")));
+            approval.click(Role::Button, if case == "denied" {"Deny changes this turn"} else {"Allow once"},
+                |ctx|app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            let reply = lifecycle_http_result(original, "flip-cancel");
+            assert_eq!(reply["isError"], case == "denied", "{case}: {reply}");
+            assert!(!reply.to_string().contains("private retained flip pattern"));
+            match case {
+                "permission" => peer.enqueue(lifecycle_permission()),
+                "completed" => peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}})),
+                "prompt_replaced" => {
+                    peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
+                    app.agent.pump();
+                    assert!(!app.agent.state().turn_active);
+                    app.agent.set_prompt_for_test("New owned Flip fixture turn".into());
+                    app.agent.send(None);
+                    assert!(app.agent.state().turn_active);
+                },
+                "run_replaced" => {
+                    peer.finish(&mut app);
+                    (peer, token) = draft_peer(&mut app);
+                    assert!(app.agent.state().ready && app.agent.state().turn_active);
+                },
+                "cancel" => {assert!(matches!(app.agent.cancel(), crate::editor_agent::CancelResult::Requested {approval_reply_failed:false}));},
+                "expired" => {let RemotePanelDiscard::Waiting {deadline, ..} = &mut app.panel_discards[4] else {panic!()};
+                    *deadline = Instant::now() - Duration::from_millis(1);},
+                "disconnect" => {peer.frames.take(); let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.agent.state().turn_active {app.agent.pump(); assert!(Instant::now() < deadline); std::thread::yield_now();}},
+                _ => {},
+            }
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            let expected = if case == "allowed" {"cancelled"} else if case == "expired" {"reply_expired"} else {"consent_invalid"};
+            assert_eq!(app.panel_discards[4].state()["state"], expected, "{case}");
+            assert_eq!(app.windows.flip_input_state().open, case != "allowed");
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], expected);
+            if matches!(case, "expired" | "prompt_replaced" | "run_replaced") {
+                assert_eq!(flip_cancel_message(&app), message);
+                let fresh = draft_http(&app, &token, &message);
+                serve_agent_requests(&mut app);
+                assert_eq!(app.panel_discards[4].state()["state"], "awaiting_human");
+                assert_eq!(app.panel_discards[4].attempt(), 2);
+                app.begin_closing();
+                assert_eq!(lifecycle_http_result(fresh, "flip-cancel")["isError"], true);
+                assert!(app.windows.flip_input_state().open);
+            }
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn flip_cancel_explanatory_and_inx_owners_are_independent_of_pending_forms_and_motion_lanes() {
+        use egui::accesskit::Role;
+        for forms in [false, true] {
+            let (mut app, mut harness) = panel_discard_app(&format!("flip-cancel-independent-{forms}"), forms, true);
+            app.tools.store.set("firstrun_complete", true).unwrap();
+            app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+            harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+            assert!(app.windows.flip_input_state().open);
+            let inputs = if forms {app.forms.input_snapshot(app.controller.snapshot())} else {app.motion3.input_snapshot(app.controller.snapshot())};
+            let side = panel_discard_message(&app, forms, if forms {"discard_main"} else {"reload_bindings"});
+            let flip = flip_cancel_message(&app);
+            let side_reply = request_panel_discard(&mut app, &side);
+            let flip_reply = request_panel_discard(&mut app, &flip);
+            assert!(app.panel_discards[4].pending() && app.panel_discards[if forms {0} else {2}].pending());
+            let snapshot = app.controller.snapshot().clone();
+            let path = app.controller.project_path().unwrap().to_owned();
+            let bytes = std::fs::read(&path).unwrap();
+            flip_reply.write_line(&mut Vec::new()).unwrap();
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"], "cancelled");
+            assert!(app.panel_discards[if forms {0} else {2}].pending());
+            assert!(!app.windows.flip_input_state().open);
+            assert_eq!(if forms {app.forms.input_snapshot(app.controller.snapshot())} else {app.motion3.input_snapshot(app.controller.snapshot())}, inputs);
+            assert!(if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let mut output = Vec::new(); side_reply.write_line(&mut output).unwrap();
+            let result: Value = serde_json::from_slice(&output).unwrap();
+            let key = if forms {"live2dFormDiscard"} else {"motion3Discard"};
+            assert_eq!(result["result"]["structuredContent"][key]["state"], "admitted");
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[if forms {0} else {2}].state()["state"], if forms {"main_discarded"} else {"bindings_reloaded"});
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
     }
 

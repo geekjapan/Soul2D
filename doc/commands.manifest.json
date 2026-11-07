@@ -12042,6 +12042,34 @@
       ]
     },
     {
+      "description": "Action: admit native Cancel for the captured retained Flip Pairing window, including clean inputs and explanatory owners. Read flipPairingInputs.cancel.identity as expectedInputIdentity. This loses its pair draft, filter, selection, patterns and message. Admission is not completion: poll flipPairingCancel by attempt. One execution follows exact successful local reply delivery and final matching input, document and authority checks after current UI and Close/Quit. Each authenticated ACP occurrence requires original-call human Allow once, sharing the existing 256-occurrence prompt limit with Forms/Motion3. Native changes, document changes, closing, invalid consent and failed/lost/expired delivery prevent execution permanently. No automatic retry. Stored FlipConfig, Session/history/files, sibling drafts and independent pending reads remain unchanged; a later read may create another window. No input contents or dialog answers. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Flip Pairing > Cancel",
+        "Flip Pairing > Cancel / Close window",
+        "Flip Pairing > Close window"
+      ],
+      "headless_ok": false,
+      "id": "editor_flip_pairing_cancel",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedInputIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedInputIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: show or hide the canvas grid of the editor viewport and set its spacing in world units (1 to 1000000) and its colour as unmultiplied [r, g, b, a]. The lines run through the world origin and are not drawn when they would be closer than 4 points. Editor only. Not a document edit.",
       "effect": "editor-state",
       "headless_ok": false,
@@ -13606,6 +13634,7 @@
       "description": "Store (base64 string) or remove (base64 null) one named payload of the INX extension section as one undo step.",
       "effect": "document-edit",
       "guiEntry": [
+        "Flip Pairing > Save",
         "Tools > Flip Pairing"
       ],
       "headless_ok": true,
