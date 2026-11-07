@@ -1060,6 +1060,23 @@ extended morph evaluation remain pending. The primary morph query below evaluate
 the supported primary targets and constraints. These records remain
 intact in the original CAFF/XML and are required for equivalent animation.
 
+The published-formula prerequisite for ellipse/SNS evaluation remains open after
+a primary-source review on 2026-11-07. The official
+[extended-interpolation manual](https://docs.live2d.com/en/cubism-editor-manual/extended-interpolation/)
+describes generated intermediate keyforms and linear runtime interpolation;
+the [interpolation-type manual](https://docs.live2d.com/en/cubism-editor-manual/extended-type/)
+describes controls and qualitative behavior. Neither retrieved page defines the
+curve equations, exact generated samples or mixed-axis interpolation weights.
+This bounded search does not prove that no specification exists elsewhere.
+Preserve the explicit refusal of unsupported evaluation; vendor-baked forms do
+not supply the missing generation rules. At the maximum point count, the
+[Japanese manual](https://docs.live2d.com/cubism-editor-manual/extended-interpolation/)
+and its English counterpart also differ over whether the spacing warning includes
+exactly `0.03`. That boundary needs clarification before it becomes an acceptance
+rule. Metadata preservation and already-generated linear forms do not establish
+ellipse/SNS generation or evaluation support. The remaining prerequisite is
+tracked by [Issue #14](https://github.com/geekjapan/Soul2D/issues/14#issuecomment-6701920738).
+
 Accepted primary-reader evidence is
 `build/verification/cmo-source-r3sheq3h/result.json`: four models, 1,261 sources,
 7,281 primary forms, all three five-axis 243-cell grids, and five failure controls.

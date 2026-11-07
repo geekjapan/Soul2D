@@ -1,11 +1,17 @@
 # GUI operation inventory
 
-This is the incremental inventory for Issue #99. It holds the sixty Soul2D GUI and related MCP operations below and, in the
-section "Cubism Editor menu bar", the 319 entries of the Cubism Editor menus, and in "Cubism Editor palettes and tool details" the
-405 palette and tool-detail controls, each with its Soul2D status. The section "nijigenerate-derived D editor" pins the
-last D tree of the earlier, unpublished development history (2026-10-11) and lists its menus, panels, viewport tools, inspector fields and the D-era commands
-that left the manifest. "Cubism Editor dialogs" holds 339 fields of the modelling-side dialogs. "Soul2D editor menu bar" lists the editor's own 48 menu entries and their shared tool routes, including bounded external and ACP Quit. "Cubism Editor dialogs, animation side" holds 246 more fields. "Cubism Editor view area, toolbar and view features" holds 103 rows and "Soul2D editor panels" groups the editor's panel control labels into 17 rows. Every slice named by #99 section 1 now has a section; the Cubism half is read from the manual, not from a running Editor. Tool counts and Skill coverage do
-not prove that every GUI action is covered.
+This is the incremental inventory for Issue #99. The Cubism sections cover menus,
+palettes, tool details, modelling and animation dialogs, the view area and
+toolbars. They are read from the manual, not from a running Editor. The
+nijigenerate-derived section pins the last D tree of the earlier, unpublished
+development history (2026-10-11) and records its menus, panels, viewport tools,
+inspector fields and retired command IDs.
+
+The Soul2D sections map operations, menu entries, related window controls and
+panel groups to shared tool routes. Row counts and routing categories are kept
+with their chapter tables below. Every slice named by #99 section 1 has a
+section; section presence, tool counts and Skill coverage do not prove that
+every GUI action is covered.
 
 | Operation | Source GUI entry | Agent action | Read result | Status |
 |---|---|---|---|---|
@@ -547,7 +553,7 @@ Palettes and tool details follow in the next section; dialogs and the viewport c
 
 Read from the Cubism Editor manual on 2026-10-20 (the palette pages and the tool-detail page with its tool sub-pages). One row per control, option or context-menu entry, 405 rows: ツール詳細 (Tool detail) 73, インスペクタ (Inspector) 90, パーツパレット (Parts palette) 62, デフォーマパレット (Deformer palette) 25, パラメータパレット (Parameter palette) 61, タイムラインパレット (Timeline palette) 62, シーンパレット (Scene palette) 5, プロジェクトパレット (Project palette) 9, ログパレット (Log palette) 6, パレットの基本操作 (Palette basics) 12. Same status vocabulary as the menu bar above.
 
-Counts: covered 248, tracked 66, absent 78, no counterpart 13.
+Table routing counts on 2026-11-07: covered 258, tracked 56, absent 78, no counterpart 13.
 
 Dialogs follow below; the viewport context menus are the slice after.
 
@@ -1012,7 +1018,7 @@ The upstream inventory of #99 section 1 is taken from the earlier development hi
 
 Command registry: the D-era `doc/commands.manifest.json` of that tree listed 378 commands; 148 of them are still in the current manifest under the same id, and the 230 below are not, each with the command that carries its behaviour now (0 unmatched).
 
-Counts over all rows: covered 292, absent 21, no counterpart 3.
+Table routing counts on 2026-11-07: covered 294, bounded 1, absent 19, no counterpart 2. Bounded Quit retains the conditions stated in its row.
 
 ### Main menu (`widgets/mainmenu.d`)
 
@@ -1816,9 +1822,9 @@ This does not establish the remaining physics controls or Cubism menu semantics.
 
 ## Soul2D editor menu bar (`rust/src/editor_windows.rs`, `menu_bar`)
 
-Read from the source on 2026-10-20, one row per entry with the `MenuAction` it dispatches, 48 rows. `covered` means the entry ends in a Session or editor operation that an MCP tool also reaches; `GUI-only` names an entry that does not, which is the list #99 section 2 asks for. Host file dialogs only supply a path; the operation is the same as the tool's. Shared routes do not establish equivalence of every GUI field, dialog or ACP lifecycle operation.
+The original source audit was taken on 2026-10-20. The table includes menu entries and related Texture Viewer controls, with their dispatch and tool routes. `covered` means the entry ends in a Session or editor operation that an MCP tool also reaches; `GUI-only` names an entry that does not, which is the list #99 section 2 asks for. Host file dialogs only supply a path; the operation is the same as the tool's. Shared routes do not establish equivalence of every GUI field, dialog or ACP lifecycle operation.
 
-Routing counts updated on 2026-10-25: 48 shared tool routes (47 covered entries and one bounded Quit), GUI-only 0. ACP Quit uses exact human lifecycle consent, identified local reply output, the initiating uncancelled successful turn, owned-client release and a fresh full safety check. Human Save/Discard remains a separate native flow. Shared routes do not establish complete dialog, lifecycle or vendor parity.
+Table routing counts on 2026-11-07: 52 rows (51 marked `covered` and one bounded Quit), GUI-only 0. ACP Quit uses exact human lifecycle consent, identified local reply output, the initiating uncancelled successful turn, owned-client release and a fresh full safety check. Human Save/Discard remains a separate native flow. Shared routes do not establish complete dialog, lifecycle or vendor parity.
 
 | Menu entry | Dispatch | Session operation / tool | Status |
 |---|---|---|---|
@@ -2331,9 +2337,9 @@ Counts: covered 74, tracked 4, absent 22, no counterpart 3.
 
 ## Soul2D editor panels (`rust/src/editor_ui.rs`)
 
-Read from the source on 2026-10-20: the 118 distinct control labels of `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers), grouped by panel, 22 rows (Cancel and Stop are listed separately). `covered` means every control of the group ends in a Session operation that an MCP tool also reaches; `GUI-only` names a group that does not.
+The original source audit on 2026-10-20 recorded 118 distinct control labels in `editor_ui.rs` (buttons, check boxes, selectable labels, menu buttons and collapsing headers). The table has since gained rows as controls were mapped; 118 is not a fresh count of current widget labels. `covered` identifies a shared operation/tool route, and `GUI-only` identifies a remaining native-control group. Routing does not establish equivalence of every field, dialog or ACP workflow.
 
-Counts: covered 21, GUI-only 1.
+Table counts on 2026-11-07: 27 rows, comprising 19 marked `covered`, seven bounded Coding agent lifecycle rows and one `GUI-only` remainder. Each lifecycle row states its own admission, reply-delivery or ownership conditions; those rows are not unconditional parity claims.
 
 | Panel | Controls | Session operation / tool | Status |
 |---|---|---|---|
