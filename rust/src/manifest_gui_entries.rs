@@ -139,6 +139,9 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_coding_agent_prompt_set", &[
         "Coding agent > User message",
     ]),
+    ("editor_coding_agent_send", &[
+        "Coding agent > Send",
+    ]),
     ("editor_coding_agent_set", &[
         "Coding agent > Enable coding agent (ACP)",
     ]),

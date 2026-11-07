@@ -776,6 +776,7 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         ("editor_coding_agent_new_session", json!({})),
         ("editor_coding_agent_start", json!({})),
         ("editor_coding_agent_prompt_set", json!({"expectedDraftIdentity":"not-an-editor", "text":"owned test"})),
+        ("editor_coding_agent_send", json!({"expectedDraftIdentity":"not-an-editor"})),
         ("editor_selection_set", json!({"nodes": [2]})),
         ("editor_armed_set", json!({"parameter": 10})),
         ("editor_camera_set", json!({"centre": [0.0, 0.0], "zoom": 1.0})),

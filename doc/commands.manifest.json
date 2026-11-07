@@ -11927,6 +11927,31 @@
       ]
     },
     {
+      "description": "Action: admit native Send of the exact unsent draft identified by expectedDraftIdentity. Identified external Client requests only; authenticated ACP self-Send, internal calls and notifications refuse. Exact local reply delivery and matching owner, opt-in, draft and prompt-allocation identity precede one native Send. Read codingAgentSend and match attempt. local_ok includes a prompt queued while session/new is pending, not peer acceptance or turn completion. immediate_error may follow conversation recording or partial writes; never retry automatically. Original whitespace is preserved. First briefing uses current document context at execution. No launch, enable, permission grant or document edit. Failed/lost/expired reply delivery never sends. Headless hosts refuse.",
+      "effect": "application-lifecycle",
+      "guiEntry": [
+        "Coding agent > Send"
+      ],
+      "headless_ok": false,
+      "id": "editor_coding_agent_send",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedDraftIdentity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedDraftIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: admit the session-only coding-agent checkbox transition after identified local reply delivery and matching state. Enabling does not launch, bind, save settings or clear errors. Disabling uses native Stop once, then sets enabled=false even if shutdown fails and retains the closed owner without its endpoint. Same-value requests do nothing and never retry Stop. ACP self-disable that stops an owner requires original-call human Allow once, without successful-turn waiting. Read codingAgentSet and match its attempt; admission is not execution. Preserves unsent text, document, drafts, history and settings. Failed, lost or expired delivery never executes. No automatic retry. Headless, notifications and internal calls refuse.",
       "effect": "application-lifecycle",
       "guiEntry": [

@@ -12,7 +12,7 @@
 
 use eframe::egui::{self, TextBuffer};
 use serde_json::{json, Map, Value};
-use soul2d_core::acp::{Block, Client, Incoming, LaunchSpec, McpHttp, Plan, PermissionRequest, PromptId, PromptOutcome, RoleKind};
+use soul2d_core::acp::{Block, Client, Incoming, LaunchSpec, McpHttp, Plan, PermissionRequest, PromptAttemptStamp, PromptId, PromptOutcome, RoleKind};
 use soul2d_core::mcp_http::{handle_connection_deferred, HttpDispatch, PendingReply, RpcReply};
 use soul2d_core::settings::Settings;
 use std::io::Write;
@@ -978,15 +978,41 @@ impl DraftTarget {
 pub(crate) enum DraftEditResult { Applied, NoOp }
 pub(crate) enum DraftRefusal { Disabled, StaleDraft, IdentityUnavailable, ConsentInvalid }
 
+#[derive(Clone, PartialEq)]
+pub(crate) struct SendSnapshot {
+    owner: StopOwner,
+    draft: DraftSnapshot,
+    prompt_attempt: PromptAttemptStamp,
+}
+
+#[derive(Clone)]
+pub(crate) struct SendTarget { before: SendSnapshot }
+
+#[derive(Clone)]
+pub(crate) enum SendRefusal { Disabled, Closed, Unavailable, IdentityUnavailable, StaleTarget }
+
+impl SendRefusal {
+    pub(crate) fn state(&self) -> &'static str {
+        match self { Self::Disabled => "disabled", Self::Closed => "closed", Self::Unavailable => "unavailable",
+            Self::IdentityUnavailable => "identity_unavailable", Self::StaleTarget => "stale_target" }
+    }
+}
+
+pub(crate) enum SendResult { Unavailable, LocalOk, ImmediateError }
+
+impl SendSnapshot {
+    pub(crate) fn target(&self, identity: &str) -> Result<SendTarget, SendRefusal> {
+        if self.draft.identity() != Some(identity) { return Err(SendRefusal::StaleTarget); }
+        Ok(SendTarget { before:self.clone() })
+    }
+}
+
 pub struct AgentPanel<W: Write = ChildStdin> {
     enabled: bool,
     opt_in_epoch: u64,
     status: String,
     error: Option<String>,
     prompt: PromptDraft,
-    /// What the editor tells the agent with the first prompt of a session (`set_briefing`); none for a host
-    /// without a document.
-    briefing: Option<String>,
     /// A settings field changed and was not yet reported to the caller.
     settings_dirty: bool,
     launch: fn(&LaunchSpec) -> Result<Client<W>, String>,
@@ -1023,7 +1049,6 @@ impl<W: Write> AgentPanel<W> {
             status: "Idle".to_string(),
             error: None,
             prompt: PromptDraft::new(),
-            briefing: None,
             settings_dirty: false,
             launch,
             run: None,
@@ -1441,19 +1466,29 @@ impl<W: Write> AgentPanel<W> {
         }
     }
 
-    /// The text that goes with the first prompt of each session as a second content block: the MCP server on
-    /// offer, the skill resources and the selection at that moment. Set by the editor before each `show`.
-    pub fn set_briefing(&mut self, briefing: Option<String>) {
-        self.briefing = briefing;
+    pub(crate) fn send_snapshot(&self) -> Result<SendSnapshot, SendRefusal> {
+        if !self.enabled { return Err(SendRefusal::Disabled); }
+        let run = self.run.as_ref().ok_or(SendRefusal::Unavailable)?;
+        if run.closed { return Err(SendRefusal::Closed); }
+        if !self.controls().send { return Err(SendRefusal::Unavailable); }
+        let draft = self.draft_snapshot();
+        if draft.identity().is_none() { return Err(SendRefusal::IdentityUnavailable); }
+        Ok(SendSnapshot { owner:self.stop_owner().ok_or(SendRefusal::IdentityUnavailable)?, draft,
+            prompt_attempt:run.client.prompt_attempt_stamp().ok_or(SendRefusal::IdentityUnavailable)? })
+    }
+
+    pub(crate) fn send_if_current(&mut self, target: &SendTarget, briefing: Option<&str>) -> Result<SendResult, SendRefusal> {
+        if self.send_snapshot()? != target.before { return Err(SendRefusal::StaleTarget); }
+        Ok(self.send(briefing))
     }
 
     /// Send the prompt box to the agent, with the briefing once per run.
-    pub fn send(&mut self) {
+    pub(crate) fn send(&mut self, briefing: Option<&str>) -> SendResult {
         if !self.controls().send {
-            return;
+            return SendResult::Unavailable;
         }
-        let Some(run) = self.run.as_mut() else { return };
-        let briefing = if run.briefed { None } else { self.briefing.as_deref() };
+        let Some(run) = self.run.as_mut() else { return SendResult::Unavailable };
+        let briefing = if run.briefed { None } else { briefing };
         match run.client.send_prompt_with(&self.prompt, briefing) {
             Ok(_) => {
                 run.briefed |= briefing.is_some();
@@ -1461,8 +1496,9 @@ impl<W: Write> AgentPanel<W> {
                 self.prompt.clear();
                 self.status = "Waiting for the agent".to_string();
                 self.error = None;
+                SendResult::LocalOk
             }
-            Err(error) => self.fail("Send failed", error),
+            Err(error) => { self.fail("Send failed", error); SendResult::ImmediateError }
         }
     }
 
@@ -1643,7 +1679,7 @@ impl<W: Write> AgentPanel<W> {
 
     /// Draw the panel. The caller must also tick and serve MCP every frame, drawn or not.
     /// Returns true when a settings field was edited and the caller should write the settings file.
-    pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings, snapshot: &Value) -> bool {
+    pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings, snapshot: &Value, briefing: Option<&str>) -> bool {
         let mut enabled = self.enabled;
         ui.checkbox(&mut enabled, "Enable coding agent (ACP)")
             .on_hover_text("Runs the configured program and offers it a local, token-protected MCP endpoint.");
@@ -1667,7 +1703,7 @@ impl<W: Write> AgentPanel<W> {
         self.plan_view(ui);
         self.permission_prompt(ui);
         self.split_prompt(ui, snapshot);
-        self.prompt_row(ui);
+        self.prompt_row(ui, briefing);
         saved
     }
 
@@ -1818,7 +1854,7 @@ impl<W: Write> AgentPanel<W> {
         }
     }
 
-    fn prompt_row(&mut self, ui: &mut egui::Ui) {
+    fn prompt_row(&mut self, ui: &mut egui::Ui, briefing: Option<&str>) {
         ui.separator();
         let caption = ui.label("User message:");
         let mut submit = false;
@@ -1834,7 +1870,7 @@ impl<W: Write> AgentPanel<W> {
             }
         });
         if submit {
-            self.send();
+            self.send(briefing);
         }
     }
 }
@@ -2130,7 +2166,7 @@ mod tests {
         panel
     }
 
-    fn pump_until(panel: &mut AgentPanel<PipeWriter>, done: impl Fn(&AgentPanel<PipeWriter>) -> bool) {
+    fn pump_until<W:Write>(panel: &mut AgentPanel<W>, done: impl Fn(&AgentPanel<W>) -> bool) {
         let deadline = Instant::now() + WAIT;
         while Instant::now() < deadline {
             panel.pump();
@@ -2217,7 +2253,7 @@ mod tests {
         let draft_before = panel.draft_snapshot();
         let held = draft_before.target(draft_before.identity().unwrap(), "stale replacement".into(), None).unwrap();
         let output = harness.click(Role::Button, "Split this image", |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot); });
+            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot, None); });
         });
         assert!(has(&output, Role::Button, "Split this image"));
         assert!(matches!(panel.draft_status(&held, true), Err(DraftRefusal::StaleDraft)));
@@ -2231,11 +2267,11 @@ mod tests {
         let prepared = panel.prompt.to_string();
         panel.prompt.replace("Keep my existing text".to_owned());
         harness.click(Role::Button, "Split this image", |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot); });
+            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot, None); });
         });
         assert_eq!(panel.prompt_text_for_test(), "Keep my existing text");
         panel.prompt.replace(prepared.clone());
-        panel.send();
+        panel.send(None);
         let new_session = agent.recv();
         assert_eq!(new_session["method"], "session/new");
         assert_eq!(new_session["params"]["mcpServers"][0]["type"], "http");
@@ -2280,7 +2316,7 @@ mod tests {
         let mut harness = Harness::new();
         harness.click(Role::Button, "Split this image", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui, &mut settings, &json!({"documentFormat":"inx", "partSplit":{"open":true}}));
+                panel.show(ui, &mut settings, &json!({"documentFormat":"inx", "partSplit":{"open":true}}), None);
             });
         });
         assert!(panel.prompt.is_empty());
@@ -2288,7 +2324,7 @@ mod tests {
         for snapshot in [json!({"documentFormat":"inx", "partSplit":{"open":false}}),
                          json!({"documentFormat":"live2d.cmo3", "partSplit":{"open":true}})] {
             let output = harness.frame(Vec::new(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot); });
+                egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut settings, &snapshot, None); });
             });
             assert!(!has(&output, Role::Button, "Split this image"));
         }
@@ -2297,9 +2333,9 @@ mod tests {
     #[test]
     fn the_first_prompt_of_a_run_carries_the_briefing_once() {
         let (mut panel, mut agent) = panel_over_pipes();
-        panel.set_briefing(Some("Soul2D briefing: read resource://soul2d/editor/state".to_owned()));
+
         panel.set_prompt_for_test("fix the nose".to_string());
-        panel.send();
+        panel.send(Some("Soul2D briefing: read resource://soul2d/editor/state"));
         let new_session = agent.recv();
         assert_eq!(new_session["method"], "session/new");
         agent.send(json!({"jsonrpc": "2.0", "id": new_session["id"], "result": {"sessionId": "s1"}}));
@@ -2314,7 +2350,7 @@ mod tests {
         agent.send(json!({"jsonrpc": "2.0", "id": prompt["id"], "result": {"stopReason": "end_turn"}}));
         pump_until(&mut panel, |panel| !panel.state().turn_active);
         panel.set_prompt_for_test("second".to_string());
-        panel.send();
+        panel.send(Some("Soul2D briefing: read resource://soul2d/editor/state"));
         assert_eq!(agent.recv()["params"]["prompt"], json!([{"type": "text", "text": "second"}]), "once per run");
         // A new run (restart) is briefed again; a run without a briefing sends one block.
         let (client, mut agent) = connect();
@@ -2324,7 +2360,7 @@ mod tests {
             "protocolVersion": 1, "agentCapabilities": {"mcpCapabilities": {"http": false}}}}));
         pump_until(&mut panel, |panel| panel.state().ready);
         panel.set_prompt_for_test("third".to_string());
-        panel.send();
+        panel.send(Some("Soul2D briefing: read resource://soul2d/editor/state"));
         let new_session = agent.recv();
         agent.send(json!({"jsonrpc": "2.0", "id": new_session["id"], "result": {"sessionId": "s2"}}));
         pump_until(&mut panel, |panel| panel.status() == "Session ready");
@@ -2338,7 +2374,7 @@ mod tests {
 
         panel.set_prompt_for_test("fix the nose".to_string());
         assert!(panel.controls().send);
-        panel.send();
+        panel.send(None);
         assert_eq!(panel.prompt_text_for_test(), "", "a sent prompt leaves the box");
         assert_eq!(panel.status(), "Waiting for the agent");
         let new_session = agent.recv();
@@ -2490,7 +2526,7 @@ mod tests {
         let (mut panel, _agent, _) = active_panel_endpoint();
         panel.run.as_mut().unwrap().closed = true;
         panel.set_prompt_for_test("  unsent 日本語  ".into());
-        panel.set_briefing(Some("retained briefing".into()));
+
         let draft = panel.draft_snapshot();
         let opt_in = panel.opt_in_epoch;
         let before = panel.next_run;
@@ -2503,7 +2539,7 @@ mod tests {
         assert_eq!(panel.next_run, before);
         assert_eq!(panel.draft_snapshot(), draft);
         assert_eq!(panel.prompt_text_for_test(), "  unsent 日本語  ");
-        assert_eq!(panel.briefing.as_deref(), Some("retained briefing"));
+
         assert_eq!(panel.opt_in_epoch, opt_in);
         assert!(panel.is_enabled());
         assert_eq!(panel.status(), "Start failed");
@@ -2692,7 +2728,7 @@ mod tests {
     fn coding_agent_new_session_reports_stop_before_invalid_configuration_and_preserves_unsent_identity() {
         let (mut panel, _agent, _) = active_panel_endpoint();
         panel.set_prompt_for_test("  unsent 日本語  ".into());
-        panel.set_briefing(Some("retained briefing".into()));
+
         let draft = panel.draft_snapshot();
         let opt_in = panel.opt_in_epoch;
         let before = panel.next_run;
@@ -2705,7 +2741,7 @@ mod tests {
         assert_eq!(panel.next_run, before);
         assert_eq!(panel.draft_snapshot(), draft);
         assert_eq!(panel.prompt_text_for_test(), "  unsent 日本語  ");
-        assert_eq!(panel.briefing.as_deref(), Some("retained briefing"));
+
         assert_eq!(panel.opt_in_epoch, opt_in);
         assert!(panel.is_enabled());
         assert_eq!(panel.status(), "Start failed");
@@ -2811,20 +2847,20 @@ mod tests {
         let before = panel.draft_snapshot();
         let target = before.target(before.identity().unwrap(), "old remote replacement".into(), None).unwrap();
         let mut harness = Harness::new();
-        let mut draw = |ctx:&egui::Context| { egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui)); };
+        let mut draw = |ctx:&egui::Context| { egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui, None)); };
         harness.click(Role::TextInput, "User message:", &mut draw);
         harness.frame(vec![egui::Event::Text("x".into()), egui::Event::Key { key:egui::Key::Backspace,
             physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }], &mut draw);
         assert_eq!(panel.prompt_text_for_test(), "A");
         assert!(matches!(panel.replace_draft_if_current(target), Err(DraftRefusal::StaleDraft)));
         harness.frame(vec![egui::Event::Text("z".into())], |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui, None));
         });
         let typed = panel.draft_snapshot();
         harness.next_input = Some(Box::new(|input| input.modifiers = egui::Modifiers::COMMAND));
         harness.frame(vec![egui::Event::Key { key:egui::Key::Z, physical_key:None,
             pressed:true, repeat:false, modifiers:egui::Modifiers::COMMAND }], |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui, None));
         });
         assert_eq!(panel.prompt_text_for_test(), "A");
         assert_ne!(panel.draft_snapshot().identity(), typed.identity());
@@ -2851,6 +2887,118 @@ mod tests {
     }
 
     #[test]
+    fn coding_agent_send_failed_native_attempt_stales_target_even_after_writer_recovers() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Wire { bytes:Vec<u8>, remaining:Option<usize>, flush_error:bool }
+        struct SwitchWriter(Arc<Mutex<Wire>>);
+        impl Write for SwitchWriter {
+            fn write(&mut self, bytes:&[u8]) -> std::io::Result<usize> {
+                let mut wire = self.0.lock().unwrap();
+                let count = wire.remaining.map_or(bytes.len(), |left| left.min(bytes.len()));
+                if count == 0 { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                wire.bytes.extend_from_slice(&bytes[..count]);
+                if let Some(left) = &mut wire.remaining { *left -= count; }
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.0.lock().unwrap().flush_error { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+            }
+        }
+        for session in [false, true] {
+            for flush_error in [false, true] {
+                let wire = Arc::new(Mutex::new(Wire::default()));
+                let (reader, mut peer) = std::io::pipe().unwrap();
+                let mut panel = AgentPanel::with_launcher(|_| Err("never launches".into()));
+                panel.set_enabled(true);
+                panel.attach(Client::new(reader, SwitchWriter(wire.clone())), None, None);
+                writeln!(peer,"{}",json!({"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}})).unwrap();
+                pump_until(&mut panel, |panel| panel.state().ready);
+                if session {
+                    panel.set_prompt_for_test("warm session".into()); panel.send(None);
+                    writeln!(peer,"{}",json!({"jsonrpc":"2.0","id":1,"result":{"sessionId":"owned"}})).unwrap();
+                    pump_until(&mut panel, |panel| panel.status()=="Session ready");
+                    writeln!(peer,"{}",json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}})).unwrap();
+                    pump_until(&mut panel, |panel| !panel.state().turn_active);
+                }
+                panel.set_prompt_for_test("  Owned 日本語\nmessage  ".into());
+                let draft = panel.draft_snapshot();
+                let target = panel.send_snapshot().ok().unwrap().target(draft.identity().unwrap()).ok().unwrap();
+                { let mut state=wire.lock().unwrap(); state.flush_error=flush_error; state.remaining=(!flush_error).then_some(5); }
+                assert!(matches!(panel.send(Some("private first briefing")), SendResult::ImmediateError));
+                assert_eq!(panel.draft_snapshot(), draft);
+                assert!(panel.controls().send);
+                let blocks=panel.run.as_ref().unwrap().client.conversation.blocks.len();
+                let bytes={ let mut state=wire.lock().unwrap(); state.remaining=None; state.flush_error=false; state.bytes.clone() };
+                assert!(matches!(panel.send_if_current(&target, None), Err(SendRefusal::StaleTarget)));
+                assert_eq!(wire.lock().unwrap().bytes, bytes);
+                assert_eq!(panel.run.as_ref().unwrap().client.conversation.blocks.len(), blocks);
+                let fresh=panel.send_snapshot().ok().unwrap().target(draft.identity().unwrap()).ok().unwrap();
+                assert!(matches!(panel.send_if_current(&fresh,None), Ok(SendResult::LocalOk)));
+                assert!(wire.lock().unwrap().bytes.len()>bytes.len(), "restored writer must really accept a fresh explicit send");
+                assert_eq!(panel.prompt_text_for_test(), "");
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_snapshot_refuses_draft_aba_and_disabled_without_editing() {
+        let (mut panel, _peer) = panel_over_pipes();
+        panel.set_prompt_for_test("original".into());
+        let identity=panel.draft_snapshot().identity().unwrap().to_owned();
+        let snapshot=panel.send_snapshot().ok().unwrap();
+        assert!(matches!(snapshot.target("wrong"),Err(SendRefusal::StaleTarget)));
+        let target=snapshot.target(&identity).ok().unwrap();
+        panel.set_prompt_for_test("changed".into()); panel.set_prompt_for_test("original".into());
+        assert!(matches!(panel.send_if_current(&target,None),Err(SendRefusal::StaleTarget)));
+        panel.set_enabled(false);
+        assert!(matches!(panel.send_snapshot(),Err(SendRefusal::Disabled)));
+        assert_eq!(panel.prompt_text_for_test(),"original");
+    }
+
+    #[test]
+    fn coding_agent_send_held_targets_refuse_opt_in_aba_ready_replacement_and_failed_retained_stop() {
+        for case in ["opt_in", "replacement", "failed_stop"] {
+            let (mut panel, peer) = panel_over_pipes();
+            panel.set_prompt_for_test("owned unchanged held message".into());
+            let draft = panel.draft_snapshot();
+            let owner = panel.stop_owner();
+            let cursor = panel.run.as_ref().unwrap().client.prompt_attempt_stamp();
+            let target = panel.send_snapshot().ok().unwrap().target(draft.identity().unwrap()).ok().unwrap();
+            let mut replacement = None;
+            if case == "failed_stop" {
+                assert!(matches!(panel.stop_with(|_| Err("owned unconfirmed shutdown".into())),
+                    Some(StopResult::FailedRetained { .. })));
+                assert!(panel.state().closed && panel.state().has_client);
+            } else {
+                if case == "opt_in" { panel.set_enabled(false); panel.set_enabled(true); }
+                let (client, mut next_peer) = connect();
+                assert!(panel.attach(client, None, None));
+                let init = next_peer.recv();
+                next_peer.send(json!({"jsonrpc":"2.0", "id":init["id"],
+                    "result":{"protocolVersion":1, "agentCapabilities":{}}}));
+                pump_until(&mut panel, |panel| panel.state().ready);
+                assert!(panel.controls().send);
+                assert!(panel.run.as_ref().unwrap().client.prompt_attempt_stamp() == cursor);
+                if case == "replacement" { assert_eq!(panel.draft_snapshot(), draft); }
+                else { assert_ne!(panel.draft_snapshot().identity(), draft.identity()); }
+                replacement = Some(next_peer);
+            }
+            assert_ne!(panel.stop_owner(), owner);
+            let blocks = panel.run.as_ref().unwrap().client.conversation.blocks.clone();
+            let current_draft = panel.draft_snapshot();
+            let result = panel.send_if_current(&target, Some("must not send this briefing"));
+            if case == "failed_stop" { assert!(matches!(result, Err(SendRefusal::Closed))); }
+            else { assert!(matches!(result, Err(SendRefusal::StaleTarget))); }
+            assert_eq!(panel.draft_snapshot(), current_draft);
+            assert_eq!(panel.prompt_text_for_test(), "owned unchanged held message");
+            assert_eq!(panel.run.as_ref().unwrap().client.conversation.blocks, blocks);
+            let current_peer = replacement.as_ref().unwrap_or(&peer);
+            assert!(matches!(current_peer.lines.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
     fn coding_agent_draft_send_clears_only_on_local_success() {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         struct SwitchWriter(Arc<AtomicBool>);
@@ -2871,7 +3019,7 @@ mod tests {
             while !panel.state().ready { assert!(Instant::now() < deadline); panel.pump(); std::thread::yield_now(); }
             panel.set_prompt_for_test("native Send text".into());
             let before = panel.draft_snapshot(); fail.store(fails, Ordering::SeqCst);
-            panel.send();
+            panel.send(None);
             if fails {
                 assert_eq!(panel.prompt_text_for_test(), "native Send text");
                 assert_eq!(panel.draft_snapshot().identity(), before.identity());
@@ -2996,7 +3144,7 @@ mod tests {
         let mut settings = Settings::empty();
         Harness::new().click(Role::CheckBox, "Enable coding agent (ACP)", |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(!panel.show(ui, &mut settings, &Value::Null));
+                assert!(!panel.show(ui, &mut settings, &Value::Null, None));
             });
         });
         assert!(!panel.is_enabled() && panel.owner().is_none());
@@ -3034,7 +3182,7 @@ mod tests {
         let (mut panel, mut agent) = panel_over_pipes();
         panel.set_enabled(true);
         panel.set_prompt_for_test("panel approval".into());
-        panel.send();
+        panel.send(None);
         let session = agent.recv();
         agent.send(json!({"jsonrpc":"2.0", "id":session["id"], "result":{"sessionId":"panel-test"}}));
         pump_until(&mut panel, |panel| panel.status() == "Session ready");
@@ -3056,7 +3204,7 @@ mod tests {
         assert!(panel.error().unwrap().contains("could not be confirmed"));
         panel.enabled = false;
         let output = crate::editor_test_support::Harness::new().frame(Vec::new(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut Settings::empty(), &Value::Null); });
+            egui::CentralPanel::default().show(ctx, |ui| { panel.show(ui, &mut Settings::empty(), &Value::Null, None); });
         });
         assert!(crate::editor_test_support::has(&output, egui::accesskit::Role::Label,
             "Off. An ACP client is still owned because shutdown failed; enable the panel to retry Stop."));
@@ -3193,7 +3341,7 @@ mod tests {
         writeln!(agent_stdout, "{}", json!({"jsonrpc":"2.0", "id":init["id"], "result":{"protocolVersion":1}})).unwrap();
         pump_until(&mut panel, |panel| panel.state().ready);
         panel.set_prompt_for_test("Owned test prompt".into());
-        panel.send();
+        panel.send(None);
         line.clear();
         outgoing.read_line(&mut line).unwrap();
         let session: Value = serde_json::from_str(&line).unwrap();
@@ -3252,7 +3400,7 @@ mod tests {
         agent.send(json!({"jsonrpc":"2.0", "id":"pending", "method":"session/request_permission", "params":{}}));
         pump_until(&mut panel, |panel| panel.permission().is_some());
         Harness::new().click(Role::Button, "Cancel", |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui));
+            egui::CentralPanel::default().show(ctx, |ui| panel.prompt_row(ui, None));
         });
         assert_eq!(agent.recv()["method"], "session/cancel");
         assert_eq!(agent.recv()["result"]["outcome"]["outcome"], "cancelled");
@@ -3719,7 +3867,7 @@ mod tests {
         };
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui, settings, &json!({}));
+                panel.show(ui, settings, &json!({}), None);
             });
         })
     }
@@ -3748,7 +3896,7 @@ mod tests {
         };
         let mut saved = true;
         let output = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| saved = panel.show(ui, &mut settings, &json!({})));
+            egui::CentralPanel::default().show(ctx, |ui| saved = panel.show(ui, &mut settings, &json!({}), None));
         });
         assert!(!saved);
         let controls: Vec<_> = nodes(&output)
@@ -3765,7 +3913,7 @@ mod tests {
     fn every_control_of_a_busy_panel_has_an_accessibility_name() {
         let (mut panel, mut agent) = panel_over_pipes();
         panel.set_prompt_for_test("go".to_string());
-        panel.send();
+        panel.send(None);
         let session_new = agent.recv();
         agent.send(json!({"jsonrpc": "2.0", "id": session_new["id"], "result": {"sessionId": "s1"}}));
         pump_until(&mut panel, |panel| panel.status() == "Session ready");
@@ -3848,7 +3996,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| saved |= panel.show(ui, &mut settings, &json!({})));
+                egui::CentralPanel::default().show(ctx, |ui| saved |= panel.show(ui, &mut settings, &json!({}), None));
             });
         }
         assert!(saved, "leaving the field must ask the caller to save");

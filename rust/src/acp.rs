@@ -973,6 +973,9 @@ pub enum Incoming {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptId(u64);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PromptAttemptStamp(u64);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PromptOutcome {
     Completed,
@@ -1139,6 +1142,11 @@ impl<W: Write> Client<W> {
     /// A prompt is waiting for its session or for the agent's response.
     pub fn prompt_active(&self) -> bool {
         self.prompt.active_id().is_some()
+    }
+
+    /// Changes before a prompt attempt can record conversation or write, including failed attempts.
+    pub fn prompt_attempt_stamp(&self) -> Option<PromptAttemptStamp> {
+        (self.next_prompt != u64::MAX).then_some(PromptAttemptStamp(self.next_prompt))
     }
 
     /// The queued or uncancelled running prompt that a cancellation can still target.
@@ -1602,6 +1610,24 @@ fn spawn_stderr_thread(mut reader: impl Read + Send + 'static, ring: StderrRing)
 
 #[cfg(test)]
 mod lifecycle_tests {
+    #[test]
+    fn prompt_attempt_stamp_never_wraps_or_records_beyond_exhaustion() {
+        let (reader, _peer) = std::io::pipe().unwrap();
+        let mut client = super::Client::new(reader, std::io::sink());
+        let before = client.prompt_attempt_stamp();
+        assert!(client.send_prompt("not initialized").is_err());
+        assert!(client.prompt_attempt_stamp() == before);
+        client.init = super::InitState::Ready(serde_json::json!({}));
+        client.next_prompt = u64::MAX - 1;
+        assert!(client.prompt_attempt_stamp().is_some());
+        assert!(client.send_prompt("last allocation").is_ok());
+        assert!(client.prompt_attempt_stamp().is_none());
+        client.prompt = super::PromptState::Idle;
+        let blocks = client.conversation.blocks.clone();
+        assert!(client.send_prompt("must refuse").unwrap_err().contains("exhausted"));
+        assert_eq!(client.conversation.blocks, blocks);
+    }
+
     use super::*;
 
     #[test]

@@ -317,6 +317,7 @@ const AGENT_CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_SET_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_DRAFT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_SEND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_LAUNCH_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl crate::editor_agent::AgentLaunchAction {
@@ -503,6 +504,57 @@ impl RemoteAgentDraft {
                     AgentDraftOutcome::ReplyFailed => "reply_failed",
                     AgentDraftOutcome::ReplyLost => "reply_lost",
                     AgentDraftOutcome::ReplyExpired => "reply_expired",
+                };
+                json!({"state":state, "attempt":attempt})
+            }
+        }
+    }
+}
+
+enum AgentSendOutcome {
+    Sent(crate::editor_agent::SendResult),
+    Refused(crate::editor_agent::SendRefusal),
+    EditorClosing,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+enum RemoteAgentSend {
+    Idle,
+    Waiting { attempt:u64, target:crate::editor_agent::SendTarget,
+        receipt:Receiver<Result<(), String>>, deadline:Instant },
+    Finished { attempt:u64, outcome:AgentSendOutcome },
+}
+
+impl RemoteAgentSend {
+    fn attempt(&self) -> u64 {
+        match self { Self::Idle => 0, Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt }
+    }
+
+    fn pending(&self) -> bool { matches!(self, Self::Waiting { .. }) }
+
+    fn close(&mut self) {
+        if self.pending() { *self = Self::Finished { attempt:self.attempt(), outcome:AgentSendOutcome::EditorClosing }; }
+    }
+
+    fn state(&self) -> Value {
+        use crate::editor_agent::SendResult;
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Waiting { attempt, .. } => json!({"state":"waiting_for_reply", "attempt":attempt}),
+            Self::Finished { attempt, outcome } => {
+                let state = match outcome {
+                    AgentSendOutcome::Sent(SendResult::LocalOk) => "local_ok",
+                    AgentSendOutcome::Sent(SendResult::ImmediateError) => "immediate_error",
+                    AgentSendOutcome::Sent(SendResult::Unavailable) => "unavailable",
+                    AgentSendOutcome::Refused(refusal) => refusal.state(),
+                    AgentSendOutcome::EditorClosing => "editor_closing",
+                    AgentSendOutcome::ReplyNotProduced => "reply_not_produced",
+                    AgentSendOutcome::ReplyFailed => "reply_failed",
+                    AgentSendOutcome::ReplyLost => "reply_lost",
+                    AgentSendOutcome::ReplyExpired => "reply_expired",
                 };
                 json!({"state":state, "attempt":attempt})
             }
@@ -739,6 +791,8 @@ struct EditorView<'a> {
     agent_new_session: &'a mut RemoteAgentLaunch,
     agent_draft: &'a mut RemoteAgentDraft,
     agent_draft_snapshot: crate::editor_agent::DraftSnapshot,
+    agent_send: &'a mut RemoteAgentSend,
+    agent_send_snapshot: Result<crate::editor_agent::SendSnapshot, crate::editor_agent::SendRefusal>,
     animation_draft: &'a mut AnimationDraft,
     timeline_value_draft: &'a mut Option<(TimelineSelection, f64)>,
     timeline_tension_draft: &'a mut Option<(TimelineSelection, f64)>,
@@ -816,6 +870,8 @@ macro_rules! editor_view {
             agent_new_session: &mut $app.agent_new_session,
             agent_draft: &mut $app.agent_draft,
             agent_draft_snapshot: $app.agent.draft_snapshot(),
+            agent_send: &mut $app.agent_send,
+            agent_send_snapshot: $app.agent.send_snapshot(),
             animation_draft: &mut $app.animation_draft,
             timeline_value_draft: &mut $app.timeline_value_draft,
             timeline_tension_draft: &mut $app.timeline_tension_draft,
@@ -967,6 +1023,7 @@ impl EditorView<'_> {
                 AgentLaunchAction::NewSession => (&*self.agent_new_session, &*self.agent_start),
             };
             if other.pending() { return Err("Another coding-agent launch is already pending; read editor state".into()); }
+            if self.agent_send.pending() { return Err("Coding-agent Send is already pending; read editor state".into()); }
             match lane {
                 RemoteAgentLaunch::Reviewing { target:original, .. } if original == &target && target.invocation().is_some() => Ok(target),
                 RemoteAgentLaunch::Reviewing { .. } | RemoteAgentLaunch::Waiting { .. } =>
@@ -989,6 +1046,19 @@ impl EditorView<'_> {
                     Err("This original draft edit was invalidated; make a fresh request".into()),
                 _ => self.agent_draft.attempt().checked_add(1).map(|_| target).ok_or("Draft edit identity exhausted".into()),
             }
+        })();
+        let send_target: Result<crate::editor_agent::SendTarget, String> = (|| {
+            if !reply_capable || !identified_stop { return Err("Send requires an identified external request with a reply writer".into()); }
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
+                || self.ctx.input(|input| input.viewport().close_requested()) { return Err(CLOSING_MESSAGE.into()); }
+            if self.agent_send.pending() { return Err("Coding-agent Send already pending; read editor state".into()); }
+            if self.agent_start.pending() || self.agent_new_session.pending() {
+                return Err("Another coding-agent launch is already pending; read editor state".into());
+            }
+            self.agent_send.attempt().checked_add(1).ok_or("Send identity exhausted")?;
+            let identity = message["params"]["arguments"]["expectedDraftIdentity"].as_str().ok_or("expectedDraftIdentity must be a string")?;
+            self.agent_send_snapshot.clone().and_then(|snapshot| snapshot.target(identity))
+                .map_err(|refusal| format!("Coding-agent Send refused: {}", refusal.state()))
         })();
         let acp_quit = match &origin { McpOrigin::Agent(approval) => approval.quit_target().ok(), _ => None };
         let is_quit = message["method"] == "tools/call" && message["params"]["name"] == "editor_quit";
@@ -1017,6 +1087,7 @@ impl EditorView<'_> {
                 }
             });
         let mut draft_receipt = None;
+        let mut send_receipt = None;
         let mut launch_receipt = None;
         let mut set_receipt = None;
         let mut quit_receipt = None;
@@ -1041,6 +1112,9 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if call["op"] == "editor.coding_agent.send" {
+                    return Err("ACP Send is unavailable for an owned invocation".into());
+                }
                 if let Some(action) = crate::editor_agent::AgentLaunchAction::from_operation(call["op"].as_str().unwrap_or_default()) {
                     if action == crate::editor_agent::AgentLaunchAction::Start {
                         return Err("ACP Start is unavailable for an owned invocation".into());
@@ -1212,6 +1286,18 @@ impl EditorView<'_> {
                 let admitted = json!({(action.state_key()):{"state":"admitted", "attempt":attempt,
                     "policy":"after_local_reply_delivery_and_matching_owner_and_configuration"}});
                 launch_receipt = Some((action, sender, admitted.clone()));
+                return Ok(admitted);
+            }
+            if call["op"] == "editor.coding_agent.send" {
+                if !reply_capable || !identified_stop { return Err("Send requires an identified external request with a reply writer".into()); }
+                let target = send_target.clone()?;
+                let attempt = self.agent_send.attempt().checked_add(1).ok_or("Send identity exhausted")?;
+                let (sender, receipt) = sync_channel(1);
+                *self.agent_send = RemoteAgentSend::Waiting { attempt, target, receipt,
+                    deadline:Instant::now() + AGENT_SEND_REPLY_TIMEOUT };
+                let admitted = json!({"codingAgentSend":{"state":"admitted", "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_owner_and_draft"}});
+                send_receipt = Some((sender, admitted.clone()));
                 return Ok(admitted);
             }
             if call["op"] == "editor.coding_agent.prompt.set" {
@@ -1391,6 +1477,17 @@ impl EditorView<'_> {
                 invalid_invocation:target.invocation().cloned() };
             return RpcReply::plain(response);
         }
+        if let Some((receipt, admitted)) = send_receipt {
+            if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemoteAgentSend::Waiting { deadline, .. } = self.agent_send {
+                    *deadline = Instant::now() + AGENT_SEND_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            *self.agent_send = RemoteAgentSend::Finished { attempt:self.agent_send.attempt(), outcome:AgentSendOutcome::ReplyNotProduced };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, admitted)) = draft_receipt {
             if response.as_ref().is_some_and(|reply| reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == admitted) {
@@ -1468,6 +1565,7 @@ impl EditorView<'_> {
 
     fn quit_work_refusal(&self, controller: &EditorController) -> Option<String> {
         let reason = if *self.closing { "The editor is closing" }
+        else if self.agent_send.pending() { "Quit refused: a coding-agent Send request is pending" }
         else if self.agent_start.pending() { "Quit refused: a coding-agent Start request is pending" }
         else if matches!(&*self.agent_new_session, RemoteAgentLaunch::Reviewing { .. } | RemoteAgentLaunch::Waiting { .. }) {
             "Quit refused: a coding-agent New session request is pending"
@@ -2099,6 +2197,7 @@ impl EditorView<'_> {
                     && self.agent_draft.attempt() != u64::MAX
                     && !matches!(&*self.agent_draft, RemoteAgentDraft::Reviewing { .. } | RemoteAgentDraft::Waiting { .. })},
             "codingAgentDraftEdit": self.agent_draft.state(),
+            "codingAgentSend": self.agent_send.state(),
             "selection": {
                 "nodes": controller.selected_nodes(),
                 "bindings": self.parameters.selected_bindings.iter()
@@ -2179,6 +2278,9 @@ pub struct EditorApp {
     agent_start: RemoteAgentLaunch,
     agent_new_session: RemoteAgentLaunch,
     agent_draft: RemoteAgentDraft,
+    agent_send: RemoteAgentSend,
+    #[cfg(test)]
+    before_send_observer_for_test: Option<Box<dyn FnMut()>>,
     #[cfg(test)]
     hold_quit_receipt_for_test: bool,
     #[cfg(test)]
@@ -2313,6 +2415,9 @@ impl EditorApp {
             agent_start: RemoteAgentLaunch::Idle,
             agent_new_session: RemoteAgentLaunch::Idle,
             agent_draft: RemoteAgentDraft::Idle,
+            agent_send: RemoteAgentSend::Idle,
+            #[cfg(test)]
+            before_send_observer_for_test: None,
             #[cfg(test)]
             hold_quit_receipt_for_test: false,
             #[cfg(test)]
@@ -2719,6 +2824,7 @@ impl EditorApp {
 
     fn begin_closing(&mut self) {
         self.closing = true;
+        self.agent_send.close();
         self.agent_start.close(&mut self.agent);
         self.agent_new_session.close(&mut self.agent);
         let pending = std::mem::replace(&mut self.agent_draft, RemoteAgentDraft::Idle);
@@ -2768,6 +2874,36 @@ impl EditorApp {
         });
         if let Some(review) = review { self.agent.invalidate_draft_review(&review); }
         self.agent_draft = RemoteAgentDraft::Finished { attempt, outcome, invalid_invocation };
+    }
+
+    fn finish_agent_send(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        if let Some(hook) = &mut self.before_send_observer_for_test { hook(); }
+        let closing = self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_))
+            || ctx.input(|input| input.viewport().close_requested());
+        let RemoteAgentSend::Waiting { receipt, deadline, .. } = &mut self.agent_send else { return };
+        let failure = if closing { Some(AgentSendOutcome::EditorClosing) }
+            else if Instant::now() >= *deadline { Some(AgentSendOutcome::ReplyExpired) } else {
+                match receipt.try_recv() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(_)) => Some(AgentSendOutcome::ReplyFailed),
+                    Err(TryRecvError::Disconnected) => Some(AgentSendOutcome::ReplyLost),
+                    Err(TryRecvError::Empty) => {
+                        ctx.request_repaint_after(Duration::from_millis(10));
+                        return;
+                    }
+                }
+            };
+        let pending = std::mem::replace(&mut self.agent_send, RemoteAgentSend::Idle);
+        let RemoteAgentSend::Waiting { attempt, target, .. } = pending else { unreachable!() };
+        let outcome = failure.unwrap_or_else(|| {
+            let briefing = agent_briefing(&self.controller);
+            match self.agent.send_if_current(&target, Some(&briefing)) {
+                Ok(result) => AgentSendOutcome::Sent(result),
+                Err(refusal) => AgentSendOutcome::Refused(refusal),
+            }
+        });
+        self.agent_send = RemoteAgentSend::Finished { attempt, outcome };
     }
 
     fn finish_remote_quit(&mut self, ctx: &egui::Context) {
@@ -7555,6 +7691,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::Start, ctx);
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::NewSession, ctx);
         self.finish_agent_draft(ctx);
+        self.finish_agent_send(ctx);
         self.agent.pump();
         self.observe_remote_quit(ctx);
         let mcp_status = self.mcp_status();
@@ -7591,6 +7728,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::Start, ctx);
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::NewSession, ctx);
         self.finish_agent_draft(ctx);
+        self.finish_agent_send(ctx);
         self.agent.tick(ctx);
         let controller = &mut self.controller;
         let mut view = editor_view!(self, ctx);
@@ -7601,6 +7739,7 @@ impl eframe::App for EditorApp {
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::Start, ctx);
         self.finish_agent_launch(crate::editor_agent::AgentLaunchAction::NewSession, ctx);
         self.finish_agent_draft(ctx);
+        self.finish_agent_send(ctx);
         self.agent.host_approval_window(ctx, approval_path.as_deref());
         self.handle_shortcuts(ctx);
         self.window_chrome(ctx);
@@ -7803,8 +7942,7 @@ impl eframe::App for EditorApp {
                     }
                     ui.separator();
                     ui.collapsing("Coding agent", |ui| {
-                        self.agent.set_briefing(Some(agent_briefing(&self.controller)));
-                        if self.agent.show(ui, &mut self.tools.store, self.controller.snapshot()) {
+                        if self.agent.show(ui, &mut self.tools.store, self.controller.snapshot(), Some(&agent_briefing(&self.controller))) {
                             if let Some(path) = &self.tools.store_path {
                                 if let Err(error) = self.tools.store.save(path) {
                                     self.notice = error;
@@ -16763,10 +16901,17 @@ mod editor_state_tests {
 
     impl LifecyclePeer {
         fn attach(app: &mut EditorApp, endpoint: Option<crate::editor_agent::McpEndpoint>) -> Self {
+            Self::attach_with_capture(app, endpoint, None)
+        }
+
+        fn attach_with_capture(app: &mut EditorApp, endpoint: Option<crate::editor_agent::McpEndpoint>, capture:Option<&Path>) -> Self {
             use std::process::{Command, Stdio};
-            let mut child = Command::new(if cfg!(windows) { "python" } else { "python3" })
-                .args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
-                .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+            if let Some(path) = capture {
+                command.args(["-I", "-c", "import sys\nwith open(sys.argv[1], 'wb') as f:\n for line in sys.stdin.buffer:\n  f.write(line); f.flush()"])
+                    .arg(path);
+            } else { command.args(["-I", "-c", "import sys; sys.stdin.buffer.read()"]); }
+            let mut child = command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             let (frames, reader) = std::sync::mpsc::channel();
             let (queued, acknowledged) = std::sync::mpsc::sync_channel(0);
             let client = soul2d_core::acp::Client::new(LifecycleReader {
@@ -16888,7 +17033,7 @@ mod editor_state_tests {
         let restore = app.tools.prompt.clone();
         let secret = "lifecycle-private-sentinel";
         app.agent.set_prompt_for_test(secret.into());
-        app.agent.set_briefing(Some(secret.into()));
+
         app.tools.store.set("ACP.Command", secret.to_owned()).unwrap();
         app.tools.store.set("ACP.Workdir", secret.to_owned()).unwrap();
         let settings_path = app.tools.store_path.clone().unwrap();
@@ -16946,7 +17091,7 @@ mod editor_state_tests {
         app.agent.pump();
         assert!(app.agent.state().ready && !app.agent.state().turn_active);
         app.agent.set_prompt_for_test("Deterministic lifecycle state".into());
-        app.agent.send();
+        app.agent.send(None);
         assert!(app.agent.state().turn_active);
         peer.enqueue(json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}}));
         app.agent.pump();
@@ -17097,7 +17242,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "permission" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { app.agent.set_prompt_for_test("Owned queued fixture".into()); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued fixture".into()); app.agent.send(None); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "permission" { peer.enqueue(lifecycle_permission()); app.agent.pump(); }
             if case == "closed" {
@@ -17422,7 +17567,7 @@ mod editor_state_tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !app.agent.state().closed { assert!(Instant::now() < deadline); app.agent.pump(); std::thread::yield_now(); }
             let private = "owned-private-restart-sentinel";
-            app.agent.set_prompt_for_test(private.into()); app.agent.set_briefing(Some(private.into()));
+            app.agent.set_prompt_for_test(private.into());
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
             let draft = app.agent.draft_snapshot(); let _ = state(&mut app);
@@ -17901,7 +18046,7 @@ mod editor_state_tests {
                 _ => {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     if case != "decoded_completion" { app.agent.pump(); }
-                    if case == "new_prompt" { app.agent.set_prompt_for_test("Fresh owned fixture turn".into()); app.agent.send(); }
+                    if case == "new_prompt" { app.agent.set_prompt_for_test("Fresh owned fixture turn".into()); app.agent.send(None); }
                 }
             }
             if case == "decoded_completion" {
@@ -17925,7 +18070,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "permission" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { app.agent.set_prompt_for_test("Owned queued fixture".into()); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued fixture".into()); app.agent.send(None); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "permission" { peer.enqueue(lifecycle_permission()); app.agent.pump(); assert!(app.agent.permission().is_some()); }
             if case == "closed" {
@@ -18113,7 +18258,7 @@ mod editor_state_tests {
             std::fs::write(&settings_path, b"{\"DarkMode\":true}").unwrap();
             let mut peer = LifecyclePeer::attach(&mut app, None); lifecycle_prompt(&mut app, &peer);
             let private = "owned-private-restart-sentinel";
-            app.agent.set_prompt_for_test(private.into()); app.agent.set_briefing(Some(private.into()));
+            app.agent.set_prompt_for_test(private.into());
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
             let draft = app.agent.draft_snapshot(); let _ = state(&mut app);
@@ -18162,7 +18307,7 @@ mod editor_state_tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let old = app.agent.owner();
-            app.agent.set_prompt_for_test("Deterministic owned self-restart fixture".into()); app.agent.send();
+            app.agent.set_prompt_for_test("Deterministic owned self-restart fixture".into()); app.agent.send(None);
             let deadline = Instant::now() + Duration::from_secs(15);
             let instance = loop {
                 harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
@@ -18206,6 +18351,324 @@ mod editor_state_tests {
         })();
         app.agent.stop(); assert!(!app.agent.state().has_client);
         assert!(result.is_ok(), "{result:?}"); std::fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    fn send_message(app: &EditorApp) -> Value {
+        json!({"jsonrpc":"2.0", "id":"send-admission", "method":"tools/call",
+            "params":{"name":"editor_coding_agent_send", "arguments":{
+                "expectedDraftIdentity":app.agent.draft_snapshot().identity().unwrap()}}})
+    }
+
+    fn request_agent_send(app: &mut EditorApp) -> RpcReply {
+        let request=send_message(app);
+        CTX.with(|ctx| editor_view!(app,ctx).mcp(&mut app.controller,&request,McpOrigin::Client))
+    }
+
+    fn ready_send_peer(app: &mut EditorApp) -> LifecyclePeer {
+        let peer=LifecyclePeer::attach(app,None);
+        peer.enqueue(lifecycle_initialize()); app.agent.pump();
+        app.agent.set_prompt_for_test("  Owned Send 日本語  ".into());
+        peer
+    }
+
+    fn finish_agent_send(app: &mut EditorApp) { CTX.with(|ctx|app.finish_agent_send(ctx)); }
+
+    #[test]
+    fn coding_agent_send_requires_delivery_and_preserves_document_and_latest_attempt() {
+        let mut app=app("coding-agent-send-delivery"); let mut peer=ready_send_peer(&mut app);
+        let before=app.controller.snapshot().clone(); let settings=app.tools.store.clone();
+        let draft=app.agent.draft_snapshot(); let reply=request_agent_send(&mut app);
+        finish_agent_send(&mut app); assert_eq!(app.agent.draft_snapshot(),draft);
+        assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"waiting_for_reply","attempt":1}));
+        let mut bytes=Vec::new();reply.write_line(&mut bytes).unwrap();
+        let response:Value=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["result"]["structuredContent"]["codingAgentSend"]["state"],"admitted");
+        finish_agent_send(&mut app);
+        assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"local_ok","attempt":1}));
+        assert_eq!(app.agent.prompt_text_for_test(),""); assert!(app.agent.state().turn_active);
+        peer.enqueue(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"owned session failure"}}));
+        app.agent.pump(); finish_agent_send(&mut app);
+        assert_eq!(app.agent.prompt_text_for_test(),"");
+        assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"local_ok","attempt":1}));
+        assert_eq!(app.controller.snapshot(),&before);assert_eq!(app.tools.store,settings);
+        peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_send_failed_lost_expired_and_consumed_replies_never_send() {
+        struct BadFlush;
+        impl std::io::Write for BadFlush {
+            fn write(&mut self,b:&[u8])->std::io::Result<usize>{Ok(b.len())}
+            fn flush(&mut self)->std::io::Result<()>{Err(std::io::ErrorKind::BrokenPipe.into())}
+        }
+        for (case,expected) in [("failed","reply_failed"),("lost","reply_lost"),("consumed","reply_lost"),("expired","reply_expired")] {
+            let mut app=app("coding-agent-send-failure");let mut peer=ready_send_peer(&mut app);
+            let before=app.agent.draft_snapshot();let reply=request_agent_send(&mut app);
+            match case {
+                "failed"=>{assert!(reply.write_line(&mut BadFlush).is_err());},
+                "consumed"=>{let _=reply.into_message();},
+                "expired"=>{if let RemoteAgentSend::Waiting{deadline,..}=&mut app.agent_send{*deadline=Instant::now();}drop(reply);},
+                _=>drop(reply),
+            }
+            finish_agent_send(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":expected,"attempt":1}));
+            assert_eq!(app.agent.draft_snapshot(),before);assert!(!app.agent.state().turn_active);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_held_reply_stales_on_draft_aba_and_closes_without_revival() {
+        for case in ["draft","close"] {
+            let mut app=app("coding-agent-send-stale");let mut peer=ready_send_peer(&mut app);
+            let reply=request_agent_send(&mut app);
+            if case=="draft" { app.agent.set_prompt_for_test("other".into()); app.agent.set_prompt_for_test("  Owned Send 日本語  ".into()); }
+            else { app.begin_closing();app.closing=false; }
+            reply.write_line(&mut Vec::new()).unwrap();finish_agent_send(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSend"]["state"],if case=="draft"{"stale_target"}else{"editor_closing"});
+            assert!(!app.agent.state().turn_active);assert_eq!(app.agent.prompt_text_for_test(),"  Owned Send 日本語  ");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_authentic_acp_refuses_without_review_or_mutation() {
+        use crate::editor_test_support::{has,Harness}; use egui::accesskit::Role;
+        let mut app=app("coding-agent-send-self");let (mut peer,token)=draft_peer(&mut app);
+        app.agent.set_prompt_for_test("private unsent self-Send".into());
+        let before=app.agent.draft_snapshot();let owner=app.agent.owner();let panel=app.agent.state();
+        let stream=draft_http(&app,&token,&send_message(&app));serve_agent_requests(&mut app);
+        let response=lifecycle_http_result(stream,"send-admission");
+        assert_eq!(response["isError"],true);assert!(response["content"][0]["text"].as_str().unwrap().contains("ACP Send"));
+        assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"idle"}));
+        assert_eq!(app.agent.draft_snapshot(),before);assert_eq!(app.agent.owner(),owner);assert_eq!(app.agent.state(),panel);
+        let path=app.tools.store_path.clone();let output=Harness::new().frame(Vec::new(),|ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+        assert!(!has(&output,Role::Button,"Allow once"));peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_send_strict_arguments_ids_internal_notifications_and_exhaustion_refuse() {
+        let mut app=app("coding-agent-send-invalid");let mut peer=ready_send_peer(&mut app);
+        for args in [json!({}),json!({"expectedDraftIdentity":null}),json!({"expectedDraftIdentity":1}),
+            json!({"expectedDraftIdentity":"stale"}),json!({"expectedDraftIdentity":"stale","text":"bypass"})] {
+            let _=refused(&mut app,"editor_coding_agent_send",args);
+        }
+        for bad in ["internal","notification","null_id","array_id","wrong_version"] {
+            let mut request=send_message(&app);
+            match bad { "notification"=>{request.as_object_mut().unwrap().remove("id");},"null_id"=>request["id"]=Value::Null,
+                "array_id"=>request["id"]=json!([]),"wrong_version"=>request["jsonrpc"]=json!("1.0"),_=>{} }
+            CTX.with(|ctx|{let origin=if bad=="internal"{McpOrigin::Internal}else{McpOrigin::Client};
+                let _=editor_view!(app,ctx).mcp(&mut app.controller,&request,origin).into_message();});
+            assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"idle"}));
+        }
+        assert!(!app.agent.state().turn_active);
+        app.agent_send=RemoteAgentSend::Finished{attempt:u64::MAX,outcome:AgentSendOutcome::ReplyLost};
+        let identity=app.agent.draft_snapshot().identity().unwrap().to_owned();
+        assert!(refused(&mut app,"editor_coding_agent_send",json!({"expectedDraftIdentity":identity})).contains("exhausted"));
+        assert_eq!(state(&mut app)["codingAgentSend"]["attempt"],u64::MAX);peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_send_every_actual_update_observer_executes_once_and_close_frames_cancel() {
+        use crate::editor_test_support::Harness;use eframe::App;
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        for phase in 1..=3 {
+            for close in [false,true] {
+                let mut app=app("coding-agent-send-observer");let mut peer=ready_send_peer(&mut app);
+                let mut reply=Some(request_agent_send(&mut app));let count=Arc::new(AtomicUsize::new(0));let observed=count.clone();
+                app.before_send_observer_for_test=Some(Box::new(move||{
+                    if observed.fetch_add(1,Ordering::SeqCst)+1==phase { reply.take().unwrap().write_line(&mut Vec::new()).unwrap(); }
+                }));
+                let mut harness=Harness::new();let mut frame=eframe::Frame::_new_kittest();
+                if close { harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT)
+                    .or_default().events.push(egui::ViewportEvent::Close))); }
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(count.load(Ordering::SeqCst),3);
+                app.before_send_observer_for_test=None;
+                assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":if close{"editor_closing"}else{"local_ok"},"attempt":1}));
+                if !close { assert!(app.agent.state().turn_active);assert_eq!(app.agent.prompt_text_for_test(),""); }
+                peer.finish(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_ordinary_http_delivers_before_owner_action() {
+        use std::io::Write;
+        let mut app=app("coding-agent-send-http");let mut peer=ready_send_peer(&mut app);
+        let settings=McpSettings{enabled:true,host:"127.0.0.1".into(),port:0,auth:true};let token="owned-send-http-token";
+        let server=mcp_listener::McpServer::start(&settings,Some(token.into())).unwrap();
+        let address=server.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap();
+        let mut stream=std::net::TcpStream::connect(address).unwrap();stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body=send_message(&app).to_string();
+        write!(stream,"POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+        app.mcp_server=Some(server);CTX.with(|ctx|app.serve_mcp(ctx));
+        assert_eq!(lifecycle_http_result(stream,"send-admission")["structuredContent"]["codingAgentSend"]["state"],"admitted");
+        assert!(!app.agent.state().turn_active);finish_agent_send(&mut app);
+        assert_eq!(state(&mut app)["codingAgentSend"]["state"],"local_ok");peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_send_stdio_worker_flushes_admission_before_owner_action() {
+        use std::io::Write;use std::sync::{Arc,Mutex};
+        struct Output(Arc<Mutex<Vec<u8>>>,std::sync::mpsc::SyncSender<()>);
+        impl Write for Output {
+            fn write(&mut self,b:&[u8])->std::io::Result<usize>{self.0.lock().unwrap().extend_from_slice(b);Ok(b.len())}
+            fn flush(&mut self)->std::io::Result<()>{self.1.send(()).unwrap();Ok(())}
+        }
+        let mut app=app("coding-agent-send-stdio");let mut peer=ready_send_peer(&mut app);
+        let (reader,mut writer)=std::io::pipe().unwrap();let (host,receive)=sync_channel(1);let(flushed,flush)=sync_channel(1);
+        let bytes=Arc::new(Mutex::new(Vec::new()));let output=Output(bytes.clone(),flushed);
+        let worker=std::thread::spawn(move||crate::editor_stdio::serve_lines(std::io::BufReader::new(reader),output,&host,&egui::Context::default()));
+        app.host_rx=Some(receive);writeln!(writer,"{}",send_message(&app)).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while !app.agent_send.pending(){assert!(Instant::now()<deadline);CTX.with(|ctx|app.drain_host(ctx));std::thread::yield_now();}
+        flush.recv_timeout(Duration::from_secs(5)).unwrap();assert!(!app.agent.state().turn_active);
+        let reply:Value=serde_json::from_slice(&bytes.lock().unwrap()).unwrap();assert_eq!(reply["id"],"send-admission");
+        while app.agent_send.pending(){assert!(Instant::now()<deadline);finish_agent_send(&mut app);std::thread::yield_now();}
+        assert_eq!(state(&mut app)["codingAgentSend"]["state"],"local_ok");drop(writer);worker.join().unwrap();peer.finish(&mut app);
+    }
+
+    #[test]
+    fn coding_agent_send_hidden_panel_uses_fresh_execution_briefing_on_the_actual_wire() {
+        fn frames(path:&Path,count:usize)->Vec<Value>{
+            let deadline=Instant::now()+Duration::from_secs(5);
+            loop {
+                let bytes=std::fs::read(path).unwrap_or_default();
+                let rows:Vec<Value>=bytes.split_inclusive(|b|*b==b'\n').filter(|row|row.ends_with(b"\n"))
+                    .map(|row|serde_json::from_slice(row).unwrap()).collect();
+                if rows.len()>=count{return rows;}
+                assert!(Instant::now()<deadline,"owned wire capture incomplete");std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let mut app=app("coding-agent-send-fresh");let dir=temp_dir("coding-agent-send-wire");let capture=dir.join("wire.jsonl");
+        let mut peer=LifecyclePeer::attach_with_capture(&mut app,None,Some(&capture));
+        peer.enqueue(lifecycle_initialize());app.agent.pump();app.agent.set_prompt_for_test("  Owned wire 日本語  ".into());
+        let reply=request_agent_send(&mut app);let old=agent_briefing(&app.controller);
+        app.command(json!({"op":"new"}));let current=agent_briefing(&app.controller);assert_ne!(old,current);
+        let doc=app.controller.snapshot().clone();reply.write_line(&mut Vec::new()).unwrap();finish_agent_send(&mut app);
+        assert_eq!(frames(&capture,2)[1]["method"],"session/new");
+        peer.enqueue(json!({"jsonrpc":"2.0","id":1,"result":{"sessionId":"owned-wire"}}));app.agent.pump();
+        let rows=frames(&capture,3);assert_eq!(rows[2]["method"],"session/prompt");
+        assert_eq!(rows[2]["params"]["prompt"],json!([{"type":"text","text":"  Owned wire 日本語  "},{"type":"text","text":current}]));
+        assert_eq!(app.controller.snapshot(),&doc);
+        let state=state(&mut app).to_string();assert!(!state.contains("Owned wire")&&!state.contains("Soul2D briefing"));
+        peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}));app.agent.pump();
+        app.agent.set_prompt_for_test("second".into());request_agent_send(&mut app).write_line(&mut Vec::new()).unwrap();finish_agent_send(&mut app);
+        assert_eq!(frames(&capture,4)[3]["params"]["prompt"],json!([{"type":"text","text":"second"}]));
+        peer.finish(&mut app);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn coding_agent_send_matches_native_eligibility_without_launching_or_enabling() {
+        for case in ["initializing","empty","whitespace","queued","running","cancelling","permission","closed","disabled"] {
+            let mut app=app("coding-agent-send-eligibility");let mut peer=LifecyclePeer::attach(&mut app,None);
+            if matches!(case,"running"|"cancelling"|"permission"|"closed"){lifecycle_prompt(&mut app,&peer);}
+            else if case!="initializing"{peer.enqueue(lifecycle_initialize());app.agent.pump();}
+            app.agent.set_prompt_for_test("owned unsent".into());
+            match case {
+                "empty"=>app.agent.set_prompt_for_test(String::new()),"whitespace"=>app.agent.set_prompt_for_test(" \t ".into()),
+                "queued"=>{app.agent.send(None);app.agent.set_prompt_for_test("next".into());},
+                "cancelling"=>{app.agent.cancel();},"permission"=>{peer.enqueue(lifecycle_permission());app.agent.pump();},
+                "closed"=>{peer.frames.take();let end=Instant::now()+Duration::from_secs(5);
+                    while !app.agent.state().closed{assert!(Instant::now()<end);app.agent.pump();std::thread::yield_now();}},
+                "disabled"=>{app.agent.set_enabled(false);},_=>{}
+            }
+            let before=app.agent.draft_snapshot();let panel=app.agent.state();let request=send_message(&app);
+            let response=CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&request,McpOrigin::Client)).into_message().unwrap();
+            assert_eq!(response["result"]["isError"],true,"{case}");
+            assert_eq!(app.agent.state(),panel);assert_eq!(app.agent.draft_snapshot(),before);
+            assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"idle"}));peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_duplicates_and_launches_exclude_pending_without_erasing_results() {
+        {
+        let mut app=app("coding-agent-send-pending");let mut peer=ready_send_peer(&mut app);
+        let held=request_agent_send(&mut app);
+        let args=send_message(&app)["params"]["arguments"].clone();
+        assert!(refused(&mut app,"editor_coding_agent_send",args).contains("already pending"));
+        for name in ["editor_coding_agent_start","editor_coding_agent_new_session"] {let _=refused(&mut app,name,json!({}));}
+        assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"waiting_for_reply","attempt":1}));
+        drop(held);finish_agent_send(&mut app);peer.finish(&mut app);
+        }
+        for start in [false,true] {
+            let mut app=app("coding-agent-send-pending-launch");app.agent.set_enabled(true);
+            let held=if start{request_agent_start(&mut app)}else{request_agent_new_session(&mut app)};
+            let mut peer=ready_send_peer(&mut app);let args=send_message(&app)["params"]["arguments"].clone();
+            assert!(refused(&mut app,"editor_coding_agent_send",args).contains("launch"));
+            drop(held);if start{finish_agent_start(&mut app)}else{finish_agent_new_session(&mut app)};
+            drop(request_agent_send(&mut app));finish_agent_send(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSend"],json!({"state":"reply_lost","attempt":1}));peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_prior_controls_invalidate_target_but_noop_draft_survives() {
+        for case in ["stop","disable","draft","noop"] {
+            let mut app=app("coding-agent-send-prior");let mut peer=ready_send_peer(&mut app);let held=request_agent_send(&mut app);
+            match case {
+                "stop"=>{request_agent_stop(&mut app).write_line(&mut Vec::new()).unwrap();finish_agent_stop(&mut app);},
+                "disable"=>{request_agent_set(&mut app,false).write_line(&mut Vec::new()).unwrap();finish_agent_set(&mut app);},
+                _=>{let text=if case=="noop"{"  Owned Send 日本語  "}else{"replacement"};
+                    request_agent_draft(&mut app,text).write_line(&mut Vec::new()).unwrap();finish_agent_draft(&mut app);}
+            }
+            held.write_line(&mut Vec::new()).unwrap();finish_agent_send(&mut app);
+            assert_eq!(app.agent.state().turn_active,case=="noop");
+            if case=="noop" {assert_eq!(state(&mut app)["codingAgentSend"]["state"],"local_ok");}
+            else {assert_ne!(state(&mut app)["codingAgentSend"]["state"],"local_ok");
+                assert_eq!(app.agent.prompt_text_for_test(),if case=="draft"{"replacement"}else{"  Owned Send 日本語  "});}
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_and_quit_preserve_both_ordering_boundaries() {
+        for send_first in [false,true] {
+            let mut app=app("coding-agent-send-quit");
+            let mut quit=(!send_first).then(||request_quit(&mut app));
+            let mut peer=ready_send_peer(&mut app);let send=request_agent_send(&mut app);
+            if send_first {
+                let response=request_quit(&mut app).into_message().unwrap();
+                assert_eq!(response["result"]["isError"],true);
+                assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("Send"));
+            }else{assert_eq!(state(&mut app)["quit"]["state"],"cancelled");}
+            drop(quit.take());drop(send);finish_agent_send(&mut app);
+            assert!(!app.closing&&!app.agent.state().turn_active);peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn coding_agent_send_preserves_actual_inx_cmo3_can3_history_drafts_settings_and_dialogs() {
+        for format in ["inx","live2d.cmo3","live2d.can3"] {
+            let mut app=match format{"live2d.cmo3"=>runtime_export_app("send-preserve-cmo3",false),
+                "live2d.can3"=>can3_scene_app("send-preserve-can3"),_=>app("send-preserve-inx")};
+            let mut models=vec![app.controller.snapshot()["model"].clone()];
+            for name in ["First","Second"] {
+                let rev=app.controller.snapshot()["revision"].clone();let edit=match format{
+                    "inx"=>json!({"op":"node.rename","id":2,"name":name}),
+                    "live2d.cmo3"=>json!({"op":"live2d.rename","guid":"parameter-guid","name":name,"expectedRevision":rev}),
+                    _=>json!({"op":"live2d.animation.scene.set","sceneGuid":"scene-guid","name":name,"expectedRevision":rev})};
+                assert_eq!(app.controller.core_request(&edit)["succeeded"],true);models.push(app.controller.snapshot()["model"].clone());
+            }
+            assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+            if format=="inx"{app.select_node_draft(2);app.controller.set_draft_name("Retained Send document draft".into());}
+            app.unsaved=Some(unsaved_dialog());app.tools.prompt=Some(restore_prompt());
+            let dialog=app.unsaved.as_ref().unwrap().dialog.clone();let restore=app.tools.prompt.clone();
+            let mut peer=ready_send_peer(&mut app);let _=state(&mut app);
+            let before=app.controller.snapshot().clone();let settings=app.tools.store.clone();
+            let path=app.controller.project_path().unwrap().to_owned();let bytes=std::fs::read(&path).unwrap();
+            request_agent_send(&mut app).write_line(&mut Vec::new()).unwrap();finish_agent_send(&mut app);
+            assert_eq!(state(&mut app)["codingAgentSend"]["state"],"local_ok");
+            assert_eq!(app.controller.snapshot(),&before);assert_eq!(app.tools.store,settings);assert_eq!(std::fs::read(path).unwrap(),bytes);
+            assert_eq!(app.unsaved.as_ref().unwrap().dialog,dialog);assert_eq!(app.tools.prompt,restore);
+            if format=="inx"{assert!(matches!(app.controller.draft_view(),Some(DraftView::NodeName{value,..})if value=="Retained Send document draft"));app.controller.discard_draft();}
+            for (op,model) in [("redo",&models[2]),("undo",&models[1]),("undo",&models[0])]{
+                assert_eq!(app.controller.core_request(&json!({"op":op}))["succeeded"],true);assert_eq!(&app.controller.snapshot()["model"],model);
+            }
+            peer.finish(&mut app);
+        }
     }
 
     fn draft_message(app: &EditorApp, text: &str) -> Value {
@@ -18837,7 +19300,7 @@ mod editor_state_tests {
                     if case != "decoded_completion" { app.agent.pump(); }
                     if case == "new_prompt" {
                         app.agent.set_prompt_for_test("New independently sent fixture turn".into());
-                        app.agent.send();
+                        app.agent.send(None);
                     }
                 }
             }
@@ -18862,7 +19325,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(None); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "closed" {
                 peer.frames.take();
@@ -19042,7 +19505,7 @@ mod editor_state_tests {
             lifecycle_prompt(&mut app, &peer);
             let private = "stop-private-unsent-sentinel";
             app.agent.set_prompt_for_test(private.into());
-            app.agent.set_briefing(Some(private.into()));
+
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
             let _ = state(&mut app);
@@ -19112,7 +19575,7 @@ mod editor_state_tests {
             lifecycle_prompt(&mut app, &peer);
             let private = "stop-private-unsent-sentinel";
             app.agent.set_prompt_for_test(private.into());
-            app.agent.set_briefing(Some(private.into()));
+
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
             let _ = state(&mut app);
@@ -19422,7 +19885,7 @@ mod editor_state_tests {
                     if case != "decoded_completion" { app.agent.pump(); }
                     if case == "new_prompt" {
                         app.agent.set_prompt_for_test("New independently sent fixture turn".into());
-                        app.agent.send();
+                        app.agent.send(None);
                     }
                 }
             }
@@ -19447,7 +19910,7 @@ mod editor_state_tests {
             let mut peer = LifecyclePeer::attach(&mut app, None);
             if matches!(case, "running" | "cancelling" | "closed") { lifecycle_prompt(&mut app, &peer); }
             else if case != "initializing" { peer.enqueue(lifecycle_initialize()); app.agent.pump(); }
-            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(); }
+            if case == "queued" { app.agent.set_prompt_for_test("Owned queued turn".into()); app.agent.send(None); }
             if case == "cancelling" { app.agent.cancel(); }
             if case == "closed" {
                 peer.frames.take();
@@ -19517,7 +19980,7 @@ mod editor_state_tests {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     app.agent.pump();
                     app.agent.set_prompt_for_test("New owned fixture turn".into());
-                    app.agent.send();
+                    app.agent.send(None);
                 }
             }
             reply.write_line(&mut Vec::new()).unwrap();
@@ -19636,7 +20099,7 @@ mod editor_state_tests {
             lifecycle_prompt(&mut app, &peer);
             let private = "stop-private-unsent-sentinel";
             app.agent.set_prompt_for_test(private.into());
-            app.agent.set_briefing(Some(private.into()));
+
             app.tools.store.set("ACP.Command", private.to_owned()).unwrap();
             app.tools.store.set("ACP.Workdir", private.to_owned()).unwrap();
             let _ = state(&mut app);
@@ -19955,7 +20418,7 @@ mod editor_state_tests {
                     peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}}));
                     app.agent.pump();
                     app.agent.set_prompt_for_test("New turn".into());
-                    app.agent.send();
+                    app.agent.send(None);
                 }
                 _ => { app.agent.cancel(); }
             }
@@ -19975,7 +20438,7 @@ mod editor_state_tests {
         peer.enqueue(lifecycle_initialize());
         app.agent.pump();
         app.agent.set_prompt_for_test("Queued local fixture".into());
-        app.agent.send();
+        app.agent.send(None);
         assert!(app.agent.state().turn_active && app.agent.state().ready);
         let reply = request_agent_cancel(&mut app);
         reply.write_line(&mut Vec::new()).unwrap();
@@ -20133,7 +20596,7 @@ mod editor_state_tests {
             peer.enqueue(lifecycle_initialize());
             app.agent.pump();
             app.agent.set_prompt_for_test("Queued local fixture".into());
-            app.agent.send();
+            app.agent.send(None);
             let ready = json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}});
             if before_second {
                 peer.before_tick(&mut app, ready);
@@ -20173,7 +20636,7 @@ mod editor_state_tests {
         peer.enqueue(lifecycle_initialize());
         app.agent.pump();
         app.agent.set_prompt_for_test("Queued local fixture".into());
-        app.agent.send();
+        app.agent.send(None);
         let reply = request_agent_cancel(&mut app);
         peer.enqueue(json!({"jsonrpc":"2.0", "id":1, "result":{"sessionId":"lifecycle-session"}}));
         app.agent.pump();
@@ -20217,7 +20680,7 @@ mod editor_state_tests {
             lifecycle_prompt(&mut app, &peer);
             let private = "cancel-private-unsent-prompt";
             app.agent.set_prompt_for_test(private.into());
-            app.agent.set_briefing(Some(private.into()));
+
             let before = app.controller.snapshot().clone();
             let reply = request_agent_cancel(&mut app);
             let mut bytes = Vec::new();
@@ -24019,7 +24482,7 @@ mod editor_state_tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             app.agent.set_prompt_for_test("Deterministic lifecycle review check".into());
-            app.agent.send();
+            app.agent.send(None);
             let deadline = Instant::now() + Duration::from_secs(15);
             let instance = loop {
                 harness.frame(Vec::new(), |ctx| app.update(ctx, &mut frame));
