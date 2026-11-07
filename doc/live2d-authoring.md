@@ -1425,6 +1425,17 @@ Add/Delete key operate on the stored object and keep pending metadata on the
 original object. A copy does not inherit that unapplied input. Delete waits
 until the object's pending input is applied or explicitly discarded.
 
+Parameter range fields retain unfinished text after focus moves or another
+group is applied. Apply range requires all three fields to parse as finite
+numbers before dispatch; one invalid field refuses the entire group. Empty
+text, incomplete exponents, NaN and infinity remain pending input. Valid
+alternative spellings that represent the stored value remain clean, including
+scientific notation, whitespace and the Unicode minus sign. Typing retains its
+precision. Dragging and arrow-key steps use the last finite value entered in
+that field; this interaction value never substitutes for invalid request data.
+Reload/discard and clean model refresh also replace the old field's editing
+state, so previous text does not cover a newly loaded value.
+
 An external edit or Undo/Redo preserves pending input and its loaded identity
 and revision. Stale or missing objects cannot be applied or silently replaced by
 another selection. Missing relationship choices show their retained GUIDs.

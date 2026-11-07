@@ -1,6 +1,78 @@
 use eframe::egui;
 use serde_json::{json, Value};
 use soul2d_core::editor_controller::EditorController;
+use std::cell::RefCell;
+
+const RANGE_FIELDS: [(&str, &str); 3] = [("minimum", "Minimum"), ("maximum", "Maximum"), ("default", "Default")];
+
+fn parse_range_number(raw: &str) -> Option<f64> {
+    raw.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '−' { '-' } else { c })
+        .collect::<String>().parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+struct RangeNumberInput {
+    raw: String,
+    interaction_seed: f64,
+}
+
+impl RangeNumberInput {
+    fn new(value: f64) -> Self { Self { raw: value.to_string(), interaction_seed: value } }
+
+    fn set_text(&mut self, text: &str) -> Option<f64> {
+        self.raw = text.to_owned();
+        let value = parse_range_number(text);
+        if let Some(value) = value { self.interaction_seed = value; }
+        value
+    }
+
+    fn set_number(&mut self, value: f64) {
+        if value.is_finite() { self.interaction_seed = value; }
+        if parse_range_number(&self.raw) != Some(value) { self.raw = value.to_string(); }
+    }
+}
+
+struct RangeDraft {
+    fields: [RangeNumberInput; 3],
+    original: [f64; 3],
+}
+
+impl RangeDraft {
+    fn new(original: [f64; 3]) -> Self { Self { fields: original.map(RangeNumberInput::new), original } }
+
+    fn values(&self) -> Result<[f64; 3], String> {
+        let mut values = [0.0; 3];
+        for (index, field) in self.fields.iter().enumerate() {
+            values[index] = parse_range_number(&field.raw)
+                .ok_or_else(|| format!("Parameter {} must be a finite number", RANGE_FIELDS[index].1))?;
+        }
+        Ok(values)
+    }
+
+    fn dirty(&self) -> bool { self.values().map_or(true, |values| values != self.original) }
+
+    fn accept(&mut self, fresh: [f64; 3], applied: bool) -> bool {
+        if applied || !self.dirty() { *self = Self::new(fresh); true } else { false }
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) {
+        for ((_, caption), field) in RANGE_FIELDS.into_iter().zip(self.fields.iter_mut()) {
+            ui.horizontal(|ui| {
+                let caption = ui.label(caption);
+                range_drag_value(ui, field).labelled_by(caption.id);
+            });
+        }
+    }
+}
+
+fn range_drag_value(ui: &mut egui::Ui, field: &mut RangeNumberInput) -> egui::Response {
+    let field = RefCell::new(field);
+    ui.add(egui::DragValue::from_get_set(|value| {
+        let mut field = field.borrow_mut();
+        if let Some(value) = value { field.set_number(value); }
+        field.interaction_seed
+    }).custom_parser(|text| field.borrow_mut().set_text(text))
+        .custom_formatter(|_, _| field.borrow().raw.clone()).speed(0.1).max_decimals(4))
+}
 
 fn objects(model: &Value) -> Vec<(&Value, bool)> {
     let list = |name: &str, parameter: bool| {
@@ -50,7 +122,7 @@ enum ObjectDetails {
         parent: Option<FieldDraft<String>>,
         rotation: Option<FieldDraft<Option<String>>>,
     },
-    Parameter { range: FieldDraft<[f64; 3]> },
+    Parameter { range: RangeDraft },
 }
 
 struct LoadedObject {
@@ -77,7 +149,7 @@ impl LoadedObject {
         let kind = entry["data"]["type"].as_str().unwrap_or_default().to_owned();
         let details = if parameter {
             ObjectDetails::Parameter {
-                range: FieldDraft::new(["minimum", "maximum", "default"].map(|key| entry[key].as_f64().unwrap_or_default())),
+                range: RangeDraft::new(RANGE_FIELDS.map(|(key, _)| entry[key].as_f64().unwrap_or_default())),
             }
         } else {
             ObjectDetails::Source {
@@ -123,26 +195,29 @@ impl LoadedObject {
         }
     }
 
-    fn accept(&mut self, action: ObjectAction, entry: &Value, revision: u64) {
+    fn accept(&mut self, action: ObjectAction, entry: &Value, revision: u64) -> bool {
         let fresh = Self::from_entry(entry, self.parameter(), revision);
         self.name.accept(fresh.name.value, matches!(action, ObjectAction::ApplyName));
         self.id.accept(fresh.id.value, matches!(action, ObjectAction::ApplyId));
-        match (&mut self.details, fresh.details) {
+        let range_replaced = match (&mut self.details, fresh.details) {
             (ObjectDetails::Parameter { range }, ObjectDetails::Parameter { range: fresh }) =>
-                range.accept(fresh.value, matches!(action, ObjectAction::ApplyRange)),
+                range.accept(fresh.original, matches!(action, ObjectAction::ApplyRange)),
             (ObjectDetails::Source { parent, rotation, .. }, ObjectDetails::Source { parent: new_parent, rotation: new_rotation, .. }) => {
                 accept_optional(parent, new_parent, matches!(action, ObjectAction::Move));
                 accept_optional(rotation, new_rotation, matches!(action, ObjectAction::Retarget));
+                false
             }
             _ => unreachable!("accepted object kind was checked before incorporation"),
-        }
+        };
         self.revision = revision;
+        range_replaced
     }
 }
 
 #[derive(Default)]
 pub struct ObjectEditor {
     loaded: Option<LoadedObject>,
+    range_widget_epoch: u64,
     axis: String,
     key: f64,
     status: String,
@@ -151,8 +226,16 @@ pub struct ObjectEditor {
 
 impl ObjectEditor {
     pub fn new() -> Self { Self::default() }
-    pub fn reset(&mut self) { *self = Self::default(); }
+    pub fn reset(&mut self) {
+        let range_widget_epoch = self.range_widget_epoch;
+        *self = Self { range_widget_epoch, ..Self::default() };
+        self.advance_range_widgets();
+    }
     pub fn has_draft(&self) -> bool { self.loaded.as_ref().is_some_and(LoadedObject::has_draft) }
+
+    fn advance_range_widgets(&mut self) {
+        self.range_widget_epoch = self.range_widget_epoch.checked_add(1).expect("Object range widget identities exhausted");
+    }
 
     fn normalize_axis(&mut self, entry: &Value) {
         let axes = entry["grid"]["axes"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -162,6 +245,7 @@ impl ObjectEditor {
     }
 
     fn load(&mut self, entry: &Value, parameter: bool, revision: u64) {
+        self.advance_range_widgets();
         self.loaded = Some(LoadedObject::from_entry(entry, parameter, revision));
         self.normalize_axis(entry);
     }
@@ -211,8 +295,7 @@ impl ObjectEditor {
             }
             ObjectAction::ApplyRange => {
                 let ObjectDetails::Parameter { range } = &loaded.details else { return Err("This object is not a parameter".into()) };
-                if !range.value.iter().all(|value| value.is_finite()) { return Err("Parameter range values must be finite".into()); }
-                let [minimum, maximum, default] = range.value;
+                let [minimum, maximum, default] = range.values()?;
                 json!({"op":"live2d.parameter.edit","guid":loaded.guid,"minimum":minimum,"maximum":maximum,"default":default})
             }
             ObjectAction::Duplicate => json!({"op":"live2d.duplicate","guid":loaded.guid}),
@@ -257,7 +340,9 @@ impl ObjectEditor {
             let snapshot = controller.snapshot().clone();
             let entry = self.loaded.as_ref().and_then(|loaded| loaded.find(&snapshot["model"]));
             if let Some(entry) = entry {
-                self.loaded.as_mut().unwrap().accept(action, entry, snapshot["revision"].as_u64().unwrap_or(before));
+                if self.loaded.as_mut().unwrap().accept(action, entry, snapshot["revision"].as_u64().unwrap_or(before)) {
+                    self.advance_range_widgets();
+                }
                 self.normalize_axis(entry);
             } else {
                 self.error = "The action succeeded but its object is unavailable. Pending input is preserved.".into();
@@ -321,12 +406,7 @@ impl ObjectEditor {
         let sources = model["sources"].as_array().map(Vec::as_slice).unwrap_or_default();
         match &mut loaded.details {
             ObjectDetails::Parameter { range } => {
-                for (caption, value) in ["Minimum", "Maximum", "Default"].into_iter().zip(range.value.iter_mut()) {
-                    ui.horizontal(|ui| {
-                        let text = ui.label(caption);
-                        ui.add(egui::DragValue::new(value).speed(0.1).max_decimals(4)).labelled_by(text.id);
-                    });
-                }
+                ui.push_id(("object_parameter_range", self.range_widget_epoch, &guid), |ui| range.show(ui));
                 if ui.add_enabled(current, egui::Button::new("Apply range")).clicked() { action = Some(ObjectAction::ApplyRange); }
             }
             ObjectDetails::Source { parent, rotation, .. } => {
@@ -431,8 +511,9 @@ mod tests {
         assert!(!editor.has_draft());
         editor.load(&json!({"guid":"parameter","name":"Name","id":"ID","minimum":-1,"maximum":1,"default":0}),true,1);
         for index in 0..3 {
-            range_mut(&mut editor).value[index] += 0.5; assert!(editor.has_draft());
-            let original = range_mut(&mut editor).original; range_mut(&mut editor).value = original;
+            let range = range_mut(&mut editor);
+            range.fields[index].set_number(range.original[index] + 0.5); assert!(editor.has_draft());
+            let original = range_mut(&mut editor).original; *range_mut(&mut editor) = RangeDraft::new(original);
         }
         assert!(!editor.has_draft());
         draft_mut(&mut editor).name.value.push('x'); draft_mut(&mut editor).revision += 1;
@@ -458,7 +539,7 @@ mod tests {
     fn rotation_mut(editor: &mut ObjectEditor) -> &mut FieldDraft<Option<String>> {
         let ObjectDetails::Source { rotation:Some(rotation),.. } = &mut draft_mut(editor).details else { panic!("expected Rotation destination") }; rotation
     }
-    fn range_mut(editor: &mut ObjectEditor) -> &mut FieldDraft<[f64;3]> {
+    fn range_mut(editor: &mut ObjectEditor) -> &mut RangeDraft {
         let ObjectDetails::Parameter { range } = &mut draft_mut(editor).details else { panic!("expected parameter range") }; range
     }
 
@@ -467,7 +548,9 @@ mod tests {
         let mut out = json!({"name":{"value":loaded.name.value,"original":loaded.name.original},
             "id":{"value":loaded.id.value,"original":loaded.id.original}});
         match &loaded.details {
-            ObjectDetails::Parameter { range } => out["range"] = json!({"value":range.value,"original":range.original}),
+            ObjectDetails::Parameter { range } => out["range"] = json!({"value":range.values().ok(),"original":range.original,
+                "raw":range.fields.each_ref().map(|field|field.raw.clone()),
+                "interaction":range.fields.each_ref().map(|field|field.interaction_seed)}),
             ObjectDetails::Source { parent,rotation,.. } => {
                 if let Some(parent) = parent { out["parent"] = json!({"value":parent.value,"original":parent.original}); }
                 if let Some(rotation) = rotation { out["rotation"] = json!({"value":rotation.value,"original":rotation.original}); }
@@ -494,6 +577,17 @@ mod tests {
             harness.frame(events,|ctx| {
                 egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,controller); });
             });
+        }
+    }
+
+    fn number_text(harness: &mut Harness, editor: &mut ObjectEditor, controller: &mut EditorController, label: &str, value: &str) {
+        harness.click(Role::SpinButton,label,|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,controller); });
+        });
+        let key = |pressed| egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,
+            modifiers:egui::Modifiers::COMMAND};
+        for events in [vec![key(true),egui::Event::Text(value.to_owned()),key(false)],Vec::new()] {
+            harness.frame(events,|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,controller); }); });
         }
     }
 
@@ -611,7 +705,7 @@ mod tests {
                         drag_number(&mut harness,&mut editor,&mut controller,name,dx);
                     }
                     let range = range_mut(&mut editor);
-                    assert!(range.value.iter().zip(range.original).all(|(value,original)|*value != original));
+                    assert!(range.values().unwrap().iter().zip(range.original).all(|(value,original)|*value != original));
                 } else {
                     choose(&mut harness,&mut editor,&mut controller,"Parent Part","Arm [Part]");
                     choose(&mut harness,&mut editor,&mut controller,"Rotation destination","NewChild [Rotation]");
@@ -749,12 +843,167 @@ mod tests {
     fn object_drafts_nonfinite_range_refuses_the_whole_group_before_json() {
         let (mut controller,mut editor,mut harness) = open("objects-nonfinite-range");
         choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
-        range_mut(&mut editor).value = [f64::NAN,2.5,0.5];
+        for (field, text) in range_mut(&mut editor).fields.iter_mut().zip(["NaN","2.5","0.5"]) { field.set_text(text); }
         let before = controller.snapshot().clone();
         assert!(!editor.dispatch(ObjectAction::ApplyRange,&mut controller));
         assert!(editor.error.contains("finite")); assert_eq!(controller.snapshot(),&before);
-        assert!(range_mut(&mut editor).value[0].is_nan());
-        assert_eq!(range_mut(&mut editor).value[1..],[2.5,0.5]); assert!(editor.has_draft());
+        assert_eq!(range_mut(&mut editor).fields.each_ref().map(|field|field.raw.as_str()),["NaN","2.5","0.5"]);
+        assert!(editor.has_draft());
+    }
+
+    #[test]
+    fn object_raw_range_siblings_keep_text_seeds_and_baselines_through_noops_stale_and_missing() {
+        let xml = crate::editor_test_support::artpath_cmo3_xml().replace("<CParameterSource>",
+            "<CParameterSource><s xs.n='name'>ParamTest</s>");
+        let (mut controller,mut editor,mut harness,_) = open_rotation("objects-range-sibling-state",&xml);
+        choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+        text(&mut harness,&mut editor,&mut controller,"Name","Kept Parameter");
+        text(&mut harness,&mut editor,&mut controller,"ID","ParamKept");
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","-0.5");
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","1e");
+        number_text(&mut harness,&mut editor,&mut controller,"Maximum","2.5000000000000004");
+        number_text(&mut harness,&mut editor,&mut controller,"Default","0.375");
+        let pending = pairs(&editor)["range"].clone(); let guid = draft(&editor).guid.clone();
+        for button in ["Apply name","Apply ID","Apply ID"] {
+            let mut accepted = false;
+            harness.click(Role::Button,button,|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| {
+                    if editor.show(ui,&mut controller) {
+                        accepted=true; assert_eq!(pairs(&editor)["range"],pending);
+                    }
+                });
+            });
+            assert!(accepted,"{button}: {}",editor.error);
+            assert_eq!(pairs(&editor)["range"],pending);
+            assert_eq!(draft(&editor).guid,guid);
+        }
+        let before = controller.snapshot().clone();
+        assert!(!editor.dispatch(ObjectAction::Delete,&mut controller));
+        assert_eq!(controller.snapshot(),&before);
+        let loaded_revision = draft(&editor).revision;
+        let changed = controller.core_request(&json!({"op":"live2d.set_id","guid":guid,"id":"ExternalParameter",
+            "expectedRevision":controller.snapshot()["revision"]}));
+        assert_eq!(changed["succeeded"],true,"{changed}");
+        for op in [None,Some("undo"),Some("redo")] {
+            if let Some(op) = op { assert_eq!(controller.core_request(&json!({"op":op}))["succeeded"],true); }
+            let before = controller.snapshot().clone();
+            harness.frame(Vec::new(),|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); }); });
+            assert_eq!(pairs(&editor)["range"],pending);
+            assert_eq!((draft(&editor).guid.as_str(),draft(&editor).revision),(guid.as_str(),loaded_revision));
+            assert!(!editor.dispatch(ObjectAction::ApplyRange,&mut controller));
+            assert_eq!(controller.snapshot(),&before);
+        }
+        let deleted = controller.core_request(&json!({"op":"live2d.parameter.delete","guid":guid,
+            "expectedRevision":controller.snapshot()["revision"]}));
+        assert_eq!(deleted["succeeded"],true,"{deleted}");
+        let before = controller.snapshot().clone();
+        harness.frame(Vec::new(),|ctx| { egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); }); });
+        assert_eq!(pairs(&editor)["range"],pending); assert!(editor.has_draft());
+        assert_eq!((draft(&editor).guid.as_str(),draft(&editor).revision),(guid.as_str(),loaded_revision));
+        click(&mut harness,&mut editor,&mut controller,"Reload and discard all object edits");
+        assert!(!editor.has_draft()); assert_eq!(controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn object_raw_range_reset_same_owner_and_discard_do_not_reuse_old_keyboard_text() {
+        let (mut controller,mut editor,mut harness) = open("objects-range-reset-text");
+        let entry = controller.snapshot()["model"]["parameters"][0].clone();
+        let revision = controller.snapshot()["revision"].as_u64().unwrap();
+        editor.load(&entry,true,revision);
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","pending-invalid-range");
+        assert!(editor.has_draft()); let before = controller.snapshot().clone();
+        editor.reset(); editor.load(&entry,true,revision);
+        let output = harness.frame(Vec::new(),|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert!(!editor.has_draft());
+        assert!(!crate::editor_test_support::texts(&output).iter().any(|text|text=="pending-invalid-range"));
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","-");
+        click(&mut harness,&mut editor,&mut controller,"Reload and discard all object edits");
+        assert!(!editor.has_draft());
+        choose(&mut harness,&mut editor,&mut controller,"Object","mesh [ArtMesh]");
+        choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+        harness.click(Role::SpinButton,"Minimum",|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert_eq!(range_mut(&mut editor).fields[0].raw,"-1");
+        assert_eq!(range_mut(&mut editor).fields[0].interaction_seed,-1.0);
+        assert!(!editor.has_draft()); assert_eq!(controller.snapshot(),&before);
+        number_text(&mut harness,&mut editor,&mut controller,"Minimum","1e");
+        let pending = pairs(&editor)["range"].clone();
+        assert_eq!(controller.core_request(&json!({"op":"new"}))["succeeded"],true);
+        let empty = controller.snapshot().clone();
+        harness.frame(Vec::new(),|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert!(editor.has_draft()); assert_eq!(pairs(&editor)["range"],pending);
+        click(&mut harness,&mut editor,&mut controller,"Reload and discard all object edits");
+        assert!(editor.loaded.is_none()); assert!(!editor.has_draft());
+        assert_eq!(controller.snapshot(),&empty);
+    }
+
+    #[test]
+    fn object_raw_range_real_keyboard_accessibility_and_shift_drag_keep_numeric_interactions() {
+        let (mut controller,mut editor,mut harness) = open("objects-range-keyboard-actions");
+        choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+        let before = controller.snapshot().clone();
+        for (action,data,expected) in [
+            (egui::accesskit::Action::SetValue,Some(egui::accesskit::ActionData::NumericValue(2.5)),2.5),
+            (egui::accesskit::Action::Increment,None,2.6),
+            (egui::accesskit::Action::Decrement,None,2.5),
+        ] {
+            let output = harness.frame(Vec::new(),|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+            });
+            let target = output.iter().find(|(_,node)| node.role()==Role::SpinButton &&
+                crate::editor_test_support::name_of(&output,node).as_deref()==Some("Maximum")).unwrap().0;
+            harness.frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {action,target,data})],|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+            });
+            assert_eq!(range_mut(&mut editor).values().unwrap()[1],expected);
+        }
+        harness.click(Role::SpinButton,"Minimum",|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        let key = |key,pressed,modifiers| egui::Event::Key {key,physical_key:None,pressed,repeat:false,modifiers};
+        harness.frame(vec![key(egui::Key::Tab,true,egui::Modifiers::NONE),key(egui::Key::Tab,false,egui::Modifiers::NONE)],|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        harness.frame(vec![key(egui::Key::A,true,egui::Modifiers::COMMAND),egui::Event::Text("2.75".into()),
+            key(egui::Key::A,false,egui::Modifiers::COMMAND)],|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert_eq!(range_mut(&mut editor).fields[1].raw,"2.75");
+        harness.frame(vec![key(egui::Key::ArrowLeft,true,egui::Modifiers::NONE),key(egui::Key::ArrowLeft,false,egui::Modifiers::NONE),
+            egui::Event::Text("0".into())],|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert_eq!(range_mut(&mut editor).fields[1].raw,"2.705");
+        assert_eq!(controller.snapshot(),&before);
+        let mut deltas = Vec::new();
+        for (name,shift) in [("objects-range-drag-normal",false),("objects-range-drag-fine",true)] {
+            let (mut controller,mut editor,mut harness) = open(name);
+            choose(&mut harness,&mut editor,&mut controller,"Object","ParamTest [Parameter]");
+            let before = controller.snapshot().clone();
+            let output = harness.frame(Vec::new(),|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+            });
+            let from = crate::editor_test_support::center(&output,Role::SpinButton,"Default");
+            let modifiers = if shift {egui::Modifiers::SHIFT} else {egui::Modifiers::NONE};
+            let press = |pos,pressed| egui::Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers};
+            for events in [vec![egui::Event::PointerMoved(from),press(from,true)],
+                vec![egui::Event::PointerMoved(from+egui::vec2(10.0,0.0))],
+                vec![egui::Event::PointerMoved(from+egui::vec2(20.0,0.0))],
+                vec![press(from+egui::vec2(20.0,0.0),false)],Vec::new()] {
+                harness.next_input=Some(Box::new(move |input| input.modifiers=modifiers));
+                harness.frame(events,|ctx| {
+                    egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+                });
+            }
+            deltas.push(range_mut(&mut editor).values().unwrap()[2]);
+            assert_eq!(controller.snapshot(),&before);
+        }
+        assert!(deltas[0]>0.0 && deltas[1]>0.0 && deltas[1]<deltas[0],"Shift must retain finer drag control: {deltas:?}");
     }
 
     #[test]
@@ -1012,7 +1261,7 @@ mod tests {
                 editor.show(ui, &mut controller);
             });
         });
-        range_mut(&mut editor).value = [-1.0, 2.0, 0.5];
+        for (field, value) in range_mut(&mut editor).fields.iter_mut().zip([-1.0,2.0,0.5]) { field.set_number(value); }
         click(&mut harness, &mut editor, &mut controller, "Apply range");
         let edited = &controller.snapshot()["model"]["parameters"][0];
         assert_eq!((edited["maximum"].as_f64(), edited["default"].as_f64()), (Some(2.0), Some(0.5)), "{}", editor.error);

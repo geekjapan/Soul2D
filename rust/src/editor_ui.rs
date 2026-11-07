@@ -16634,9 +16634,11 @@ mod shell_flow_tests {
         assert_eq!(app.controller.snapshot(),&before); assert!(app.objects.has_draft());
     }
 
-    fn object_draft_during_pending_dialog(close: bool) {
-        let (mut app,_,mut harness) = object_draft_app(if close {"objects-late-close"} else {"objects-late-new"});
-        app.objects.reset();
+    fn object_draft_during_pending_dialog(close: bool, raw_range: bool) {
+        let (mut app,_,mut harness) = if raw_range {
+            object_range_app(if close {"objects-range-late-close"} else {"objects-range-late-new"})
+        } else { object_draft_app(if close {"objects-late-close"} else {"objects-late-new"}) };
+        if !raw_range { app.objects.reset(); }
         app.command(json!({"op":"live2d.set_id","guid":"mesh-guid","id":"StoredID",
             "expectedRevision":app.controller.snapshot()["revision"]}));
         assert!(modified(&app));
@@ -16646,7 +16648,9 @@ mod shell_flow_tests {
             egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
             app.draw_unsaved(ctx);
         }
-        harness.text("Name","Object input after the dialog opened",|ctx| draw(&mut app,ctx));
+        if raw_range {
+            object_number_text(&mut harness,"Minimum","Object input after the dialog opened",|ctx| draw(&mut app,ctx));
+        } else { harness.text("Name","Object input after the dialog opened",|ctx| draw(&mut app,ctx)); }
         assert!(app.objects.has_draft());
         let before = app.controller.snapshot().clone();
         harness.click(Role::Button,"Don't Save",|ctx| draw(&mut app,ctx));
@@ -16657,22 +16661,23 @@ mod shell_flow_tests {
 
     #[test]
     fn object_drafts_late_dialog_input_blocks_closing() {
-        object_draft_during_pending_dialog(true);
+        object_draft_during_pending_dialog(true,false);
     }
 
     #[test]
     fn object_drafts_late_dialog_input_blocks_replacement() {
-        object_draft_during_pending_dialog(false);
+        object_draft_during_pending_dialog(false,false);
     }
 
-    fn object_draft_during_restore_prompt(choice: PromptChoice) {
+    fn object_draft_during_restore_prompt(choice: PromptChoice, raw_range: bool) {
         let name = match choice {
             PromptChoice::Restore => "objects-late-restore",
             PromptChoice::Discard => "objects-late-discard",
             PromptChoice::Cancel => "objects-late-cancel",
         };
-        let (mut app,dir,mut harness) = object_draft_app(name);
-        app.objects.reset();
+        let (mut app,dir,mut harness) = if raw_range { object_range_app(&format!("raw-{name}")) }
+            else { object_draft_app(name) };
+        if !raw_range { app.objects.reset(); }
         let target = dir.join("target.cmo3");
         std::fs::copy(dir.join("object.cmo3"),&target).unwrap();
         let now = Now { mono_secs:0,unix_secs:7 };
@@ -16689,7 +16694,9 @@ mod shell_flow_tests {
                 if let Some(choice) = draw_restore_prompt(ctx,&prompt) { app.resolve_prompt(choice); }
             }
         }
-        harness.text("Name","Object input after Restore Autosave opened",|ctx| draw(&mut app,ctx));
+        if raw_range {
+            object_number_text(&mut harness,"Minimum","Object input after Restore Autosave opened",|ctx| draw(&mut app,ctx));
+        } else { harness.text("Name","Object input after Restore Autosave opened",|ctx| draw(&mut app,ctx)); }
         assert!(app.objects.has_draft());
         let before = app.controller.snapshot().clone();
         let button = match choice { PromptChoice::Restore => "Restore",PromptChoice::Discard => "Discard",PromptChoice::Cancel => "Cancel" };
@@ -16699,7 +16706,7 @@ mod shell_flow_tests {
         assert_eq!(std::fs::read(&backup).unwrap(),backup_bytes);
         assert!(autosave::unclean_exit(&dir,&target));
         let output = harness.frame(Vec::new(),|ctx| draw(&mut app,ctx));
-        assert!(output.iter().any(|(_,node)| node.value() == Some("Object input after Restore Autosave opened")));
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text=="Object input after Restore Autosave opened"));
         if choice == PromptChoice::Cancel {
             assert!(app.tools.prompt.is_none());
             assert!(!app.discarding);
@@ -16719,17 +16726,17 @@ mod shell_flow_tests {
 
     #[test]
     fn object_drafts_late_autosave_restore_preserves_input_and_backup() {
-        object_draft_during_restore_prompt(PromptChoice::Restore);
+        object_draft_during_restore_prompt(PromptChoice::Restore,false);
     }
 
     #[test]
     fn object_drafts_late_autosave_discard_preserves_input_and_backup() {
-        object_draft_during_restore_prompt(PromptChoice::Discard);
+        object_draft_during_restore_prompt(PromptChoice::Discard,false);
     }
 
     #[test]
     fn object_drafts_late_autosave_cancel_preserves_input_and_backup() {
-        object_draft_during_restore_prompt(PromptChoice::Cancel);
+        object_draft_during_restore_prompt(PromptChoice::Cancel,false);
     }
 
     #[test]
@@ -16783,9 +16790,14 @@ mod shell_flow_tests {
 
     #[test]
     fn object_drafts_actual_http_save_refuses_until_the_native_discard() {
+        let (app,dir,harness) = object_draft_app("objects-http-save");
+        object_draft_http_save(app,dir,harness);
+    }
+
+    fn object_draft_http_save(mut app: EditorApp,dir: PathBuf,mut harness: Harness) {
         use std::io::{Read,Write};
         use std::net::{Shutdown,TcpStream};
-        let (mut app,dir,mut harness) = object_draft_app("objects-http-save");
+        assert!(app.objects.has_draft());
         let server = mcp_listener::McpServer::start(&McpSettings {
             enabled:true,host:"127.0.0.1".into(),port:0,auth:true,
         },Some("owned-object-draft-token".into())).unwrap();
@@ -16842,12 +16854,21 @@ mod shell_flow_tests {
     }
 
     fn object_range_text(app: &mut EditorApp,harness: &mut Harness,label: &str,value: &str) {
-        harness.click(Role::SpinButton,label,|ctx| object_range_draw(app,ctx));
+        let output = object_number_text(harness,label,value,|ctx| object_range_draw(app,ctx));
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains(value)),"the raw input must be visible");
+    }
+
+    fn object_number_text(harness: &mut Harness,label: &str,value: &str,mut draw: impl FnMut(&egui::Context)) -> crate::editor_test_support::Out {
+        harness.click(Role::SpinButton,label,&mut draw);
         let key = |pressed| egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,
             modifiers:egui::Modifiers::COMMAND};
-        harness.frame(vec![key(true),egui::Event::Text(value.to_owned()),key(false)],|ctx| object_range_draw(app,ctx));
-        let output = harness.frame(Vec::new(),|ctx| object_range_draw(app,ctx));
-        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains(value)),"the raw input must be visible");
+        let events = if value.is_empty() {
+            let backspace = |pressed| egui::Event::Key {key:egui::Key::Backspace,physical_key:None,pressed,repeat:false,
+                modifiers:egui::Modifiers::NONE};
+            vec![key(true),key(false),backspace(true),backspace(false)]
+        } else { vec![key(true),egui::Event::Text(value.to_owned()),key(false)] };
+        harness.frame(events,&mut draw);
+        harness.frame(Vec::new(),draw)
     }
 
     #[test]
@@ -16916,6 +16937,131 @@ mod shell_flow_tests {
         assert!(!crate::editor_test_support::texts(&output).iter().any(|text|text=="-1.0"),
             "clean model refresh must not leave the prior owner's keyboard text visible");
         assert!(!app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_raw_range_all_fields_refuse_invalid_text_without_losing_redo_or_source() {
+        let (mut app,dir,mut harness) = object_range_app("objects-range-invalid-matrix");
+        let original_bytes = std::fs::read(dir.join("object.cmo3")).unwrap();
+        let renamed = app.controller.core_request(&json!({"op":"live2d.set_id","guid":"parameter-guid","id":"RedoID",
+            "expectedRevision":app.controller.snapshot()["revision"]}));
+        assert_eq!(renamed["succeeded"],true);
+        assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+        let before = app.controller.snapshot().clone(); assert_eq!(before["canRedo"],true);
+        for caption in ["Minimum","Maximum","Default"] {
+            for raw in ["","-","1e","NaN","-inf","Infinity","1e999","2px"] {
+                object_range_text(&mut app,&mut harness,caption,raw);
+                assert!(app.objects.has_draft(),"{caption}={raw:?} must be retained pending input");
+                harness.click(Role::Button,"Apply range",|ctx| object_range_draw(&mut app,ctx));
+                assert_eq!(app.controller.snapshot(),&before,"refuse {caption}={raw:?} atomically, including Redo");
+                assert!(app.objects.has_draft());
+                let output = harness.frame(Vec::new(),|ctx| object_range_draw(&mut app,ctx));
+                if !raw.is_empty() { assert!(crate::editor_test_support::texts(&output).iter().any(|text|text==raw)); }
+                harness.click(Role::Button,"Reload and discard all object edits",|ctx| object_range_draw(&mut app,ctx));
+                assert!(!app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
+            }
+        }
+        let target = dir.join("unchanged.cmo3"); app.command(json!({"op":"save","path":target}));
+        assert_eq!(std::fs::read(target).unwrap(),original_bytes);
+    }
+
+    #[test]
+    fn object_raw_range_preserves_clean_spellings_precision_and_single_undo_persistence() {
+        let (mut app,dir,mut harness) = object_range_app("objects-range-spelling-persistence");
+        let original_bytes = std::fs::read(dir.join("object.cmo3")).unwrap();
+        let before = app.controller.snapshot().clone();
+        for (caption,raw) in [("Minimum","−1e0"),("Maximum","1  . 0"),("Default","−0e0")] {
+            object_range_text(&mut app,&mut harness,caption,raw);
+            assert!(!app.objects.has_draft(),"equivalent {caption}={raw:?} is semantically clean");
+        }
+        app.sync_panel_drafts(); assert!(!app.controller.panel_drafts);
+        assert_eq!(app.controller.snapshot(),&before);
+        let target = dir.join("clean.cmo3"); app.command(json!({"op":"save","path":target}));
+        assert_eq!(std::fs::read(&target).unwrap(),original_bytes,"spelling-only input must not block or rewrite Save");
+        let before = app.controller.snapshot().clone();
+        object_range_text(&mut app,&mut harness,"Maximum","1.0000000000000002");
+        let output = harness.click(Role::Button,"Apply name",|ctx| object_range_draw(&mut app,ctx));
+        assert!(app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
+        assert!(crate::editor_test_support::texts(&output).iter().any(|text|text=="1.0000000000000002"));
+        let number = crate::editor_test_support::find(&output,Role::SpinButton,"Maximum").unwrap().numeric_value();
+        assert_eq!(number,Some(1.0000000000000002),"typing and sibling no-op must not round to drag display precision");
+        harness.click(Role::Button,"Reload and discard all object edits",|ctx| object_range_draw(&mut app,ctx));
+        let before = app.controller.snapshot().clone();
+        for (caption,raw) in [("Minimum","-1.5"),("Maximum","2.5"),("Default","0.5")] {
+            object_range_text(&mut app,&mut harness,caption,raw);
+        }
+        harness.click(Role::Button,"Apply range",|ctx| object_range_draw(&mut app,ctx));
+        assert!(!app.objects.has_draft());
+        let after = app.controller.snapshot().clone();
+        assert_eq!(after["revision"].as_u64(),Some(before["revision"].as_u64().unwrap()+1));
+        let parameter = &after["model"]["parameters"][0];
+        assert_eq!((parameter["minimum"].as_f64(),parameter["maximum"].as_f64(),parameter["default"].as_f64()),
+            (Some(-1.5),Some(2.5),Some(0.5)));
+        assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+        assert_eq!(app.controller.snapshot()["model"],before["model"]);
+        assert_eq!(app.controller.core_request(&json!({"op":"redo"}))["succeeded"],true);
+        assert_eq!(app.controller.snapshot()["model"],after["model"]);
+        let target = dir.join("edited.cmo3"); app.command(json!({"op":"save","path":target}));
+        let mut reopened = EditorController::new();
+        assert_eq!(reopened.core_request(&json!({"op":"open","path":target}))["succeeded"],true);
+        assert_eq!(reopened.snapshot()["model"],after["model"]);
+    }
+
+    #[test]
+    fn object_raw_range_blocks_observation_replacement_close_quit_and_genuine_eof() {
+        let (mut app,dir,mut harness) = object_range_app("objects-range-lifecycle");
+        let ctx = egui::Context::default();
+        let quit = json!({"jsonrpc":"2.0","id":"range-quit","method":"tools/call",
+            "params":{"name":"editor_quit","arguments":{}}});
+        let admitted = editor_view!(app,&ctx).mcp(&mut app.controller,&quit,McpOrigin::Client);
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        let before = app.controller.snapshot().clone();
+        admitted.write_line(&mut Vec::new()).unwrap();
+        harness.frame(Vec::new(),|ctx| app.finish_remote_quit(ctx));
+        assert!(!app.closing && harness.close_requests==0);
+        app.sync_panel_drafts(); assert!(app.controller.panel_drafts);
+        let message = json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
+            "params":{"uri":"resource://soul2d/editor/state"}});
+        let reply = editor_view!(app,&ctx).mcp(&mut app.controller,&message,McpOrigin::Client).into_message().unwrap();
+        let state: Value = serde_json::from_str(reply["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(state["drafts"]["panels"],true); assert!(!reply.to_string().contains("pending-invalid-range"));
+        let target = dir.join("blocked.cmo3");
+        assert!(app.save_for_dialog(target.to_str().unwrap()).is_err());
+        app.command(json!({"op":"new"})); assert!(app.unsaved.is_none());
+        for (name,arguments) in [("new",json!({})),("open",json!({"path":dir.join("object.cmo3")})),
+            ("save",json!({"path":target})),("editor_quit",json!({}))] {
+            let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+            let reply = editor_view!(app,&ctx).mcp(&mut app.controller,&call,McpOrigin::Client).into_message().unwrap();
+            assert_eq!(reply["result"]["isError"],true,"{reply}");
+        }
+        assert!(!target.exists()); assert_eq!(app.controller.snapshot(),&before);
+        harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close)));
+        harness.frame(Vec::new(),|ctx| app.handle_close_request(ctx));
+        assert!(app.close_blocked && !app.closing && harness.close_requests==0);
+        let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx=Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| app.drain_host(ctx));
+        assert!(app.stdin_closed && app.close_blocked && !app.closing && harness.close_requests==0);
+        assert!(app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn object_raw_range_actual_http_save_waits_for_native_discard() {
+        let (mut app,dir,mut harness) = object_range_app("objects-range-http-save");
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        object_draft_http_save(app,dir,harness);
+    }
+
+    #[test]
+    fn object_raw_range_late_unsaved_dialog_choices_preserve_input() {
+        for close in [true,false] { object_draft_during_pending_dialog(close,true); }
+    }
+
+    #[test]
+    fn object_raw_range_late_autosave_choices_preserve_input_and_backups() {
+        for choice in [PromptChoice::Restore,PromptChoice::Discard,PromptChoice::Cancel] {
+            object_draft_during_restore_prompt(choice,true);
+        }
     }
 
     #[test]
