@@ -16888,6 +16888,21 @@ mod shell_flow_tests {
     }
 
     #[test]
+    fn object_range_interaction_steps_from_the_last_valid_pending_number_after_invalid_text() {
+        let (mut app,_,mut harness) = object_range_app("objects-range-last-valid-step");
+        let before = app.controller.snapshot().clone();
+        object_range_text(&mut app,&mut harness,"Minimum","-0.5");
+        object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
+        let key = |pressed| egui::Event::Key {key:egui::Key::ArrowUp,physical_key:None,pressed,repeat:false,
+            modifiers:egui::Modifiers::NONE};
+        harness.frame(vec![key(true),key(false)],|ctx| object_range_draw(&mut app,ctx));
+        let output = harness.frame(Vec::new(),|ctx| object_range_draw(&mut app,ctx));
+        let value = crate::editor_test_support::find(&output,Role::SpinButton,"Minimum").unwrap().numeric_value();
+        assert_eq!(value,Some(-0.4),"stepping must keep its last parsed pending value rather than reverting to the saved baseline");
+        assert_eq!(app.controller.snapshot(),&before);
+    }
+
+    #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
         app.window.observe(Some((900.0, 700.0)), Some(false));
