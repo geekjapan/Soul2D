@@ -20434,6 +20434,59 @@ mod editor_state_tests {
         }
     }
 
+    fn queued_endpoint_connection(address: &str) -> std::net::TcpStream {
+        let stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let live = stream.peek(&mut [0_u8; 1]);
+        assert!(matches!(&live, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock), "{live:?}");
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+    }
+
+    fn endpoint_connection_closed(outcome: &std::io::Result<usize>) -> bool {
+        matches!(outcome, Ok(0)) || matches!(outcome, Err(error)
+            if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted))
+    }
+
+    #[test]
+    fn coding_agent_stop_original_endpoint_probe_requires_queued_connection_release() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut original = queued_endpoint_connection(&listener.local_addr().unwrap().to_string());
+        original.set_nonblocking(true).unwrap();
+        let live = original.peek(&mut [0_u8; 1]);
+        assert!(matches!(&live, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(!endpoint_connection_closed(&live));
+        original.set_nonblocking(false).unwrap();
+        drop(listener);
+        let closed = original.read(&mut [0_u8; 1]);
+        assert!(endpoint_connection_closed(&closed), "{closed:?}");
+        assert!(!endpoint_connection_closed(&Ok(1)));
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused, std::io::ErrorKind::PermissionDenied] {
+            assert!(!endpoint_connection_closed(&Err(std::io::Error::from(kind))));
+        }
+    }
+
+    #[test]
+    fn coding_agent_stop_original_endpoint_probe_ignores_fresh_connections_on_the_same_listener() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut original = queued_endpoint_connection(&address);
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+        let fresh = queued_endpoint_connection(&address);
+        let (_fresh_peer, _) = listener.accept().unwrap();
+        let closed = original.read(&mut [0_u8; 1]);
+        assert!(endpoint_connection_closed(&closed), "{closed:?}");
+        fresh.set_nonblocking(true).unwrap();
+        let live = fresh.peek(&mut [0_u8; 1]);
+        assert!(matches!(&live, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(!endpoint_connection_closed(&live));
+    }
+
     #[test]
     fn coding_agent_set_external_drain_releases_endpoint_before_the_existing_second_pump() {
         use crate::editor_test_support::Harness;
@@ -20443,6 +20496,7 @@ mod editor_state_tests {
         app.tools.store.set("Outline.visible", false).unwrap();
         let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
         let agent_address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let mut original = queued_endpoint_connection(&agent_address);
         let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
         lifecycle_prompt(&mut app, &peer);
         let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
@@ -20458,7 +20512,8 @@ mod editor_state_tests {
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
         app.agent.before_next_tick_for_test(move || {
-            assert!(std::net::TcpStream::connect(&agent_address).is_err(), "Stop must release the agent endpoint before tick pumps");
+            let outcome = std::io::Read::read(&mut original, &mut [0_u8; 1]);
+            assert!(endpoint_connection_closed(&outcome), "Set must release the original agent endpoint before tick pumps: {outcome:?}");
             observed.store(true, Ordering::SeqCst);
         });
         let mut frame = eframe::Frame::_new_kittest();
@@ -20966,6 +21021,7 @@ mod editor_state_tests {
         app.tools.store.set("Outline.visible", false).unwrap();
         let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
         let agent_address = endpoint.url().strip_prefix("http://").unwrap().strip_suffix("/mcp").unwrap().to_owned();
+        let mut original = queued_endpoint_connection(&agent_address);
         let mut peer = LifecyclePeer::attach(&mut app, Some(endpoint));
         lifecycle_prompt(&mut app, &peer);
         let settings = McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true };
@@ -20981,7 +21037,8 @@ mod editor_state_tests {
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
         app.agent.before_next_tick_for_test(move || {
-            assert!(std::net::TcpStream::connect(&agent_address).is_err(), "Stop must release the agent endpoint before tick pumps");
+            let outcome = std::io::Read::read(&mut original, &mut [0_u8; 1]);
+            assert!(endpoint_connection_closed(&outcome), "Stop must release the original agent endpoint before tick pumps: {outcome:?}");
             observed.store(true, Ordering::SeqCst);
         });
         let mut frame = eframe::Frame::_new_kittest();
