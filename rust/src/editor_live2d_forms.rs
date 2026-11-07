@@ -1363,6 +1363,132 @@ mod tests {
         assert_eq!(glue.intensity, 0.5);
     }
 
+    #[test]
+    fn forms_raw_all_numeric_fields_preserve_unfinished_input_as_drafts() {
+        let cases=[("mesh","Source X"),("mesh","Source Y"),("opacity","Opacity"),("mesh","Draw order"),
+            ("mesh","Multiply color R"),("mesh","Multiply color G"),("mesh","Multiply color B"),("mesh","Multiply color A"),
+            ("mesh","Screen color R"),("mesh","Screen color G"),("mesh","Screen color B"),("mesh","Screen color A"),
+            ("rotation","Angle"),("rotation","Origin X"),("rotation","Origin Y"),("rotation","Scale"),("artpath","Division count")];
+        for (kind,label) in cases {
+            let name=format!("forms-raw-widget-{kind}-{label}");
+            let mut rig=if kind=="artpath" {Rig::artpath(&name,&crate::editor_test_support::artpath_cmo3_xml())} else {Rig::new(&name)};
+            rig.harness.screen=egui::vec2(1300.0,2600.0);
+            if kind=="rotation" {
+                let path=temp_dir(&name).join("rotation.cmo3");
+                std::fs::write(&path,crate::editor_test_support::caff_with_xml(include_str!("../tests/fixtures/rotation-reparent.xml"))).unwrap();
+                assert_eq!(rig.controller.core_request(&json!({"op":"open","path":path}))["succeeded"],true);
+                rig.editor.reset();rig.draw();rig.choose("Source","Old [Rotation]");
+            } else {rig.draw();}
+            if kind=="opacity" {rig.click(Role::CheckBox,"Edit opacity");}
+            let before=rig.draw();
+            let number=crate::editor_test_support::find(&before,Role::SpinButton,label).expect(label).numeric_value();
+            let snapshot=rig.controller.snapshot().clone();assert!(!rig.editor.has_draft());
+            let output=rig.number_text(label,"unfinished-forms-number");
+            let visible=texts(&output).iter().any(|text|text.contains("unfinished-forms-number"));
+            let after=crate::editor_test_support::find(&output,Role::SpinButton,label).unwrap().numeric_value();
+            assert!(visible);assert_eq!(number,after);assert_eq!(rig.controller.snapshot(),&snapshot);
+            let dirty=rig.editor.has_draft();
+            let focus=rig.harness.ctx.memory(|memory|memory.focused()).unwrap();
+            rig.harness.ctx.memory_mut(|memory|memory.surrender_focus(focus));let blurred=rig.frame(Vec::new());
+            assert!(dirty,"{kind} {label}: visible unparsed input is a draft");
+            assert!(texts(&blurred).iter().any(|text|text.contains("unfinished-forms-number")),"{kind} {label}: blur preserves raw input");
+            assert_eq!(rig.controller.snapshot(),&snapshot);
+        }
+        let mut stored=Stored::default();stored.form=FormSettings::from_form(&json!({"data":{"type":"Glue","intensity":1.5}}));
+        stored.form_original=stored.form.clone();let mut harness=Harness::new();
+        let mut draw=|ctx:&egui::Context| {egui::CentralPanel::default().show(ctx,|ui|form_fields(ui,"Glue",&mut stored.form));};
+        harness.click(Role::SpinButton,"Intensity",&mut draw);
+        let key=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+        harness.frame(vec![key(true),key(false),egui::Event::Text("unfinished-forms-number".into())],&mut draw);
+        let output=harness.frame(Vec::new(),&mut draw);
+        assert!(texts(&output).iter().any(|text|text.contains("unfinished-forms-number")));
+        assert_eq!(stored.form.intensity,1.5);
+        assert!(stored.is_dirty(),"Glue intensity: actual field input participates in Stored draft detection");
+    }
+
+    #[test]
+    fn forms_raw_each_apply_owner_refuses_partial_commit_and_preserves_input() {
+        for owner in ["main","form","source"] {
+            let mut rig=if owner=="source" {Rig::artpath("forms-raw-partial-source",&crate::editor_test_support::artpath_cmo3_xml())}
+                else {Rig::new(&format!("forms-raw-partial-{owner}"))};
+            rig.harness.screen=egui::vec2(1300.0,2600.0);rig.draw();
+            let (invalid,button)=match owner {
+                "main"=>{rig.number_text("Source Y","9.5");("Source X","Apply vertex")}
+                "form"=>{rig.number_text("Multiply color G","0.5");("Draw order","Apply form settings")}
+                _=>{rig.click(Role::CheckBox,"Closed");("Division count","Apply source settings")}
+            };
+            let shown=rig.number_text(invalid,"unfinished-forms-number");
+            assert!(texts(&shown).iter().any(|text|text.contains("unfinished-forms-number")));assert!(rig.editor.has_draft());
+            let before=rig.controller.snapshot().clone();rig.click(Role::Button,button);
+            assert_eq!(rig.controller.snapshot(),&before,"{owner} must validate its complete pending group");
+            assert!(rig.editor.has_draft());assert!(!rig.editor.error.is_empty());
+            assert!(texts(&rig.frame(Vec::new())).iter().any(|text|text.contains("unfinished-forms-number")));
+        }
+    }
+
+    #[test]
+    fn forms_raw_clean_refresh_replaces_previous_keyboard_text() {
+        let mut rig=Rig::new("forms-clean-widget-refresh");rig.draw();
+        let shown=rig.number_text("Source X","1.0000000000000");
+        assert!(texts(&shown).iter().any(|value|value=="1.0000000000000"));assert!(!rig.editor.has_draft());
+        let revision=rig.controller.snapshot()["revision"].clone();
+        assert_eq!(rig.controller.core_request(&json!({"op":"live2d.form.set_vertex","sourceGuid":"mesh-guid","formGuid":"form-guid",
+            "coordinateType":"Canvas","vertexIndex":0,"position":[9.5,2.0],"expectedRevision":revision}))["succeeded"],true);
+        let snapshot=rig.controller.snapshot().clone();let refreshed=rig.draw();
+        assert!(!texts(&refreshed).iter().any(|value|value=="1.0000000000000"),"clean refresh must replace the prior editing buffer");
+        assert_eq!(rig.vertex(),[9.5,2.0]);assert!(!rig.editor.has_draft());
+        rig.click(Role::SpinButton,"Source X");
+        let key=|pressed|egui::Event::Key {key:egui::Key::End,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::NONE};
+        rig.frame(vec![key(true),key(false),egui::Event::Text("0".into())]);
+        assert_eq!(rig.vertex(),[9.5,2.0]);assert!(!rig.editor.has_draft());assert_eq!(rig.controller.snapshot(),&snapshot);
+    }
+
+    #[test]
+    fn forms_raw_numeric_grammar_preserves_finite_casts_and_refuses_nonfinite() {
+        let cases=[("mesh","Draw order","5e2"),("mesh","Draw order","500.75"),("mesh","Draw order"," 5 0 0 "),
+            ("mesh","Draw order","−10"),("mesh","Draw order","5000"),("mesh","Draw order","NaN"),
+            ("artpath","Division count","3.75"),("artpath","Division count","1e2"),("artpath","Division count"," 2 0 "),
+            ("artpath","Division count","−1"),("artpath","Division count","4294967296"),("artpath","Division count","NaN"),
+            ("mesh","Multiply color R","0.1234567890123456"),("mesh","Multiply color R","1.75"),
+            ("mesh","Multiply color R","NaN"),("mesh","Multiply color R","inf"),
+            ("opacity","Opacity","-2.5"),("opacity","Opacity","1.00005"),("opacity","Opacity","NaN"),
+            ("opacity","Opacity","inf"),("opacity","Opacity"," 0 . 7 5 ")];
+        let expected=[500.0,500.0,500.0,0.0,1000.0,0.0,3.0,100.0,20.0,0.0,u32::MAX as f64,0.0,
+            0.1234567890123456,1.0,0.0,0.0,-2.5,1.00005,0.0,0.0,0.75];
+        for (at,(kind,label,text)) in cases.into_iter().enumerate() {
+            let name=format!("forms-number-grammar-{at}");
+            let mut rig=if kind=="artpath" {Rig::artpath(&name,&crate::editor_test_support::artpath_cmo3_xml())}else{Rig::new(&name)};
+            rig.harness.screen=egui::vec2(1300.0,2600.0);rig.draw();
+            if kind=="opacity" {rig.click(Role::CheckBox,"Edit opacity");}
+            let original=crate::editor_test_support::find(&rig.draw(),Role::SpinButton,label).unwrap().numeric_value().unwrap();
+            let before=rig.controller.snapshot().clone();let output=rig.number_text(label,text);
+            assert_eq!(rig.controller.snapshot(),&before);
+            if matches!(text,"NaN"|"inf") {
+                assert!(rig.editor.has_draft());
+                rig.click(Role::Button,match label {"Opacity"=>"Apply opacity","Division count"=>"Apply source settings",_=>"Apply form settings"});
+                assert_eq!(rig.controller.snapshot(),&before,"{label} {text}: nonfinite raw must not become a clamped value");
+                assert!(rig.editor.has_draft() && !rig.editor.error.is_empty());
+                assert!(texts(&rig.frame(Vec::new())).iter().any(|value|value==text));
+            } else {
+                assert_eq!(crate::editor_test_support::find(&output,Role::SpinButton,label).unwrap().numeric_value(),Some(expected[at]),"{label} {text}");
+                assert_eq!(rig.editor.has_draft(),expected[at]!=original,"{label} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn forms_raw_loaded_legacy_numbers_keep_precision_and_unchanged_members() {
+        let mut settings=FormSettings::from_form(&mesh_form());
+        settings.draw_order=9_007_199_254_740_993;settings.multiply[0]=0.1234567890123456;settings.multiply[3]=2.25;
+        let original=settings.clone();let mut harness=Harness::new();harness.screen=egui::vec2(1200.0,1800.0);
+        for _ in 0..3 {harness.frame(Vec::new(),|ctx| {egui::CentralPanel::default().show(ctx,|ui|form_fields(ui,"ArtMesh",&mut settings));});}
+        assert!(settings==original,"rendering must not round i64, precision or legacy alpha through the widget f64 bridge");
+        settings.multiply[1]=0.75;
+        let request=form_set_request("mesh-guid","form-guid","Canvas","ArtMesh",&settings,&original,1).unwrap();
+        assert_eq!(request["multiplyColor"],json!([0.1234567890123456,0.75,0.25]));
+        assert!(request.get("drawOrder").is_none());
+    }
+
     fn form_opacity(editor: &FormEditor) -> f64 {
         match &editor.main {
             MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft,
@@ -1398,6 +1524,13 @@ mod tests {
             self.harness.text(label, value, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| { editor.show(ui, controller); });
             });
+        }
+
+        fn number_text(&mut self, label: &str, value: &str) -> crate::editor_test_support::Out {
+            self.click(Role::SpinButton,label);
+            let key=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+            self.frame(vec![key(true),key(false),egui::Event::Text(value.to_owned())]);
+            self.frame(Vec::new())
         }
 
         fn point_input(&self) -> &PointInput {
