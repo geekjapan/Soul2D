@@ -16783,6 +16783,115 @@ mod shell_flow_tests {
         assert_eq!(app.controller.snapshot(), &before);
     }
 
+    fn forms_raw_full_app_case(action: &str, input: &str) -> Value {
+        let (mut app,dir)=app(&format!("forms-raw-{action}-{input}"));
+        let source=dir.join("source.cmo3");
+        let original=crate::editor_test_support::cmo3_bytes();
+        std::fs::write(&source,&original).unwrap();
+        app.command(json!({"op":"open","path":source}));
+        let target=dir.join("output.cmo3");
+        app.file_path=target.to_string_lossy().into_owned();
+        let mut harness=Harness::new();harness.screen=egui::vec2(1800.0,2600.0);
+        let mut frame=eframe::Frame::_new_kittest();
+        harness.click(Role::Button,"Live2D source forms",|ctx|app.update(ctx,&mut frame));
+        if input!="clean" {
+            object_number_text(&mut harness,"Source X",if input=="valid"{"1.75"}else{"forms-unparsed-probe"},
+                |ctx|app.update(ctx,&mut frame));
+        }
+        let shown=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert_eq!(texts(&shown).iter().any(|text|text.contains("forms-unparsed-probe")),input=="invalid");
+        assert_eq!(crate::editor_test_support::find(&shown,Role::SpinButton,"Source X").unwrap().numeric_value(),
+            Some(if input=="valid"{1.75}else{1.0}));
+        let before=app.controller.snapshot().clone();
+        let mut response=None;
+        let after=match action {
+            "save_as"=>harness.click(Role::Button,"Save As",|ctx|app.update(ctx,&mut frame)),
+            "new"=>harness.click(Role::Button,"New",|ctx|app.update(ctx,&mut frame)),
+            "mcp_save"=>{
+                let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);
+                let (reply,written)=sync_channel(1);
+                sender.send(HostMessage::Rpc {request:json!({"jsonrpc":"2.0","id":"forms-raw-save","method":"tools/call",
+                    "params":{"name":"save","arguments":{"path":target}}}),reply}).unwrap();
+                let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                response=written.try_recv().unwrap().into_message();output
+            }
+            "blur"=>{
+                let focus=harness.ctx.memory(|memory|memory.focused()).expect("focused numeric input");
+                harness.ctx.memory_mut(|memory|memory.surrender_focus(focus));
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame))
+            }
+            "native_close"|"eof"=>{
+                if action=="native_close" {
+                    harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                        .events.push(egui::ViewportEvent::Close)));
+                } else {
+                    let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);
+                    sender.send(HostMessage::StdinClosed).unwrap();
+                }
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame))
+            }
+            _=>panic!("unknown Forms raw-input action"),
+        };
+        assert_eq!(std::fs::read(&source).unwrap(),original);
+        json!({"rawAfter":texts(&after).iter().any(|text|text.contains("forms-unparsed-probe")),
+            "fileWritten":target.exists(),"snapshotSame":app.controller.snapshot()==&before,
+            "formatAfter":app.controller.snapshot()["documentFormat"],"closeCommands":harness.close_requests,
+            "draftAfter":app.forms.has_draft(),"mcpError":response.as_ref().map(|reply|reply["result"]["isError"].clone())})
+    }
+
+    fn assert_forms_raw_preserved(action: &str) {
+        let observed=forms_raw_full_app_case(action,"invalid");
+        assert_eq!(observed["fileWritten"],false,"{action}: {observed}");
+        assert_eq!(observed["formatAfter"],"live2d.cmo3","{action}: {observed}");
+        assert_eq!(observed["closeCommands"],0,"{action}: {observed}");
+        assert_eq!(observed["rawAfter"],true,"{action}: {observed}");
+        assert_eq!(observed["draftAfter"],true,"{action}: {observed}");
+        assert_eq!(observed["snapshotSame"],true,"{action}: {observed}");
+        if action=="mcp_save" { assert_eq!(observed["mcpError"],true); }
+    }
+
+    #[test]
+    fn forms_raw_native_save_preserves_visible_unparsed_input() { assert_forms_raw_preserved("save_as"); }
+
+    #[test]
+    fn forms_raw_native_replacement_preserves_visible_unparsed_input() { assert_forms_raw_preserved("new"); }
+
+    #[test]
+    fn forms_raw_mcp_save_preserves_visible_unparsed_input() { assert_forms_raw_preserved("mcp_save"); }
+
+    #[test]
+    fn forms_raw_native_close_preserves_visible_unparsed_input() { assert_forms_raw_preserved("native_close"); }
+
+    #[test]
+    fn forms_raw_eof_preserves_visible_unparsed_input() { assert_forms_raw_preserved("eof"); }
+
+    #[test]
+    fn forms_raw_blur_preserves_visible_unparsed_input() { assert_forms_raw_preserved("blur"); }
+
+    #[test]
+    fn forms_raw_clean_controls_keep_save_replacement_and_close_available() {
+        for action in ["save_as","new","mcp_save","native_close","eof"] {
+            let observed=forms_raw_full_app_case(action,"clean");
+            assert_eq!(observed["fileWritten"],matches!(action,"save_as"|"mcp_save"),"{action}: {observed}");
+            assert_eq!(observed["closeCommands"],usize::from(matches!(action,"native_close"|"eof")),"{action}: {observed}");
+            assert_eq!(observed["formatAfter"],if action=="new"{"inx"}else{"live2d.cmo3"});
+            if action=="mcp_save" { assert_eq!(observed["mcpError"],false); }
+        }
+    }
+
+    #[test]
+    fn forms_raw_valid_numeric_controls_keep_existing_draft_guards() {
+        for action in ["save_as","new","mcp_save","native_close","eof"] {
+            let observed=forms_raw_full_app_case(action,"valid");
+            assert_eq!(observed["fileWritten"],false,"{action}: {observed}");
+            assert_eq!(observed["closeCommands"],0,"{action}: {observed}");
+            assert_eq!(observed["formatAfter"],"live2d.cmo3");
+            assert_eq!(observed["snapshotSame"],true);
+            assert_eq!(observed["draftAfter"],true);
+            if action=="mcp_save" { assert_eq!(observed["mcpError"],true); }
+        }
+    }
+
     fn object_draft_app(name: &str) -> (EditorApp, PathBuf, Harness) {
         let (mut app, dir) = app(name);
         let source = dir.join("object.cmo3");
