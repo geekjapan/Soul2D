@@ -16652,6 +16652,73 @@ mod shell_flow_tests {
         object_draft_during_pending_dialog(false);
     }
 
+    fn object_draft_during_restore_prompt(choice: PromptChoice) {
+        let name = match choice {
+            PromptChoice::Restore => "objects-late-restore",
+            PromptChoice::Discard => "objects-late-discard",
+            PromptChoice::Cancel => "objects-late-cancel",
+        };
+        let (mut app,dir,mut harness) = object_draft_app(name);
+        app.objects.reset();
+        let target = dir.join("target.cmo3");
+        std::fs::copy(dir.join("object.cmo3"),&target).unwrap();
+        let now = Now { mono_secs:0,unix_secs:7 };
+        let mut autosave = Autosave::new(&dir,now);
+        autosave.set_project(Some(target.clone()),now);
+        let backup = autosave.autosave_now(&autosave::Settings::new(true,1,3),now,
+            |path| std::fs::copy(&target,path).map(drop).map_err(|error| error.to_string())).unwrap();
+        let backup_bytes = std::fs::read(&backup).unwrap();
+        app.request_open(target.to_str().unwrap());
+        assert!(app.tools.prompt.is_some());
+        fn draw(app: &mut EditorApp,ctx: &egui::Context) {
+            egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+            if let Some(prompt) = app.tools.prompt.clone() {
+                if let Some(choice) = draw_restore_prompt(ctx,&prompt) { app.resolve_prompt(choice); }
+            }
+        }
+        harness.text("Name","Object input after Restore Autosave opened",|ctx| draw(&mut app,ctx));
+        assert!(app.objects.has_draft());
+        let before = app.controller.snapshot().clone();
+        let button = match choice { PromptChoice::Restore => "Restore",PromptChoice::Discard => "Discard",PromptChoice::Cancel => "Cancel" };
+        harness.click(Role::Button,button,|ctx| draw(&mut app,ctx));
+        assert!(app.objects.has_draft(),"the deferred autosave choice must preserve late object input");
+        assert_eq!(app.controller.snapshot(),&before);
+        assert_eq!(std::fs::read(&backup).unwrap(),backup_bytes);
+        assert!(autosave::unclean_exit(&dir,&target));
+        let output = harness.frame(Vec::new(),|ctx| draw(&mut app,ctx));
+        assert!(output.iter().any(|(_,node)| node.value() == Some("Object input after Restore Autosave opened")));
+        if choice == PromptChoice::Cancel {
+            assert!(app.tools.prompt.is_none());
+            assert!(!app.discarding);
+            return;
+        }
+        assert!(app.tools.prompt.is_some(),"a refused choice must leave recovery available");
+        harness.click(Role::Button,"Reload and discard all object edits",|ctx| draw(&mut app,ctx));
+        assert!(!app.objects.has_draft());
+        assert_eq!(app.controller.snapshot(),&before);
+        harness.click(Role::Button,button,|ctx| draw(&mut app,ctx));
+        assert!(app.tools.prompt.is_none());
+        assert_eq!(app.controller.project_path(),Some(target.canonicalize().unwrap().as_path()));
+        assert!(!app.objects.has_draft());
+        assert_eq!(std::fs::read(&target).unwrap(),backup_bytes);
+        assert_eq!(backup.exists(),choice == PromptChoice::Restore);
+    }
+
+    #[test]
+    fn object_drafts_late_autosave_restore_preserves_input_and_backup() {
+        object_draft_during_restore_prompt(PromptChoice::Restore);
+    }
+
+    #[test]
+    fn object_drafts_late_autosave_discard_preserves_input_and_backup() {
+        object_draft_during_restore_prompt(PromptChoice::Discard);
+    }
+
+    #[test]
+    fn object_drafts_late_autosave_cancel_preserves_input_and_backup() {
+        object_draft_during_restore_prompt(PromptChoice::Cancel);
+    }
+
     #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
