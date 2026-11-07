@@ -1489,6 +1489,27 @@ mod tests {
         assert!(request.get("drawOrder").is_none());
     }
 
+    #[test]
+    fn forms_raw_pristine_legacy_focus_keeps_exact_loaded_values() {
+        for label in ["Draw order", "Multiply color R", "Multiply color A"] {
+            let mut settings = FormSettings::from_form(&mesh_form());
+            settings.draw_order = 9_007_199_254_740_993;
+            settings.multiply[0] = 0.1234567890123456;
+            settings.multiply[3] = 2.25;
+            let original = settings.clone();
+            let mut harness = Harness::new();
+            harness.screen = egui::vec2(1200.0, 1800.0);
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| form_fields(ui, "ArtMesh", &mut settings));
+            };
+            harness.click(Role::SpinButton, label, &mut draw);
+            let focus = harness.ctx.memory(|memory| memory.focused()).unwrap();
+            harness.ctx.memory_mut(|memory| memory.surrender_focus(focus));
+            harness.frame(Vec::new(), &mut draw);
+            assert!(settings == original, "{label}: focus alone must not round or clamp a loaded value");
+        }
+    }
+
     fn form_opacity(editor: &FormEditor) -> f64 {
         match &editor.main {
             MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft,
