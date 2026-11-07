@@ -1,15 +1,4 @@
-//! The Live2D source-form editor of a CMO3 document (port of `drawLive2dAuthoringEditor` and
-//! `ngRustCoreLive2d{Vertex,Opacity}EditRequest` in `panels/rustcore.d`): pick an ArtMesh or Warp source and
-//! one of its primary forms, then edit one vertex position or the form opacity (also for ArtPath). Each Apply is one
-//! `live2d.form.set_vertex` / `live2d.form.set_opacity` request guarded by `expectedRevision`, so a document
-//! that changed since the draft was loaded is refused instead of overwritten.
-//!
-//! The same panel edits the stored settings of the selected source and form (issue #144): draw order and colours
-//! (`live2d.form.set`), rotation angle, origin, scale and reflection, Glue intensity, and the blend mode, clipping
-//! inversion, offscreen drawing and clipping masks of the source (`live2d.source.set`). ArtPath stored metadata
-//! includes closure, division count, listed brush, clipping and primary-form draw order and opacity, without point editing.
-//! A request names only the
-//! settings that differ from the loaded ones, so the file is asked to store nothing the user did not change.
+//! Revision-guarded drafts for the Live2D source-form editor.
 
 use eframe::egui;
 use serde_json::{json, Map, Value};
@@ -22,7 +11,7 @@ const COLOR_COMPOSITIONS: [&str; 17] = [
 ];
 const ALPHA_COMPOSITIONS: [&str; 5] = ["OVER", "ATOP", "OUT", "CONJOINT", "DISJOINT"];
 
-/// ArtMesh and Warp sources have vertices to edit; ArtPath has form opacity; other kinds have stored settings only.
+/// A supported source need not have an editable primary form.
 pub fn editable_source(source: &Value) -> bool {
     matches!(source["data"]["type"].as_str(), Some("ArtMesh" | "Warp" | "Part" | "Rotation" | "Glue" | "ArtPath"))
 }
@@ -308,12 +297,222 @@ enum Half {
     Source,
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+struct FormKey {
+    source: String,
+    form: String,
+    coordinate: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainChoice {
+    Vertex(usize),
+    FormOpacity,
+    ArtPathPoint(usize),
+}
+
+#[derive(Clone, PartialEq)]
+struct PointValues {
+    position: [f64; 2],
+    start_velocity: [f64; 2],
+    end_velocity: [f64; 2],
+    width: f64,
+    opacity: f64,
+    color: [f64; 4],
+    corner: bool,
+}
+
+impl PointValues {
+    fn from_point(point: &Value) -> Result<Self, String> {
+        let number = |value: &Value, name: &str| value.as_f64().filter(|value| value.is_finite())
+            .ok_or_else(|| format!("ArtPath point {name} must be a stored finite number"));
+        let pair = |name: &str| -> Result<[f64; 2], String> {
+            let values = point[name].as_array().filter(|values| values.len() == 2)
+                .ok_or_else(|| format!("ArtPath point {name} must contain two stored numbers"))?;
+            Ok([number(&values[0], name)?, number(&values[1], name)?])
+        };
+        let channels = point["color"].as_array().filter(|values| values.len() == 4)
+            .ok_or("ArtPath point color must contain four stored numbers")?;
+        Ok(Self {
+            position: pair("position")?, start_velocity: pair("startVelocity")?, end_velocity: pair("endVelocity")?,
+            width: number(&point["width"], "width")?, opacity: number(&point["opacity"], "opacity")?,
+            color: [number(&channels[0], "color R")?, number(&channels[1], "color G")?,
+                number(&channels[2], "color B")?, number(&channels[3], "color A")?],
+            corner: point["corner"].as_bool().ok_or("ArtPath point corner must be a stored boolean")?,
+        })
+    }
+
+    fn changes(&self, original: &Self) -> Result<Map<String, Value>, String> {
+        let mut changes = Map::new();
+        for (key, current, before) in [("position", self.position, original.position),
+            ("startVelocity", self.start_velocity, original.start_velocity), ("endVelocity", self.end_velocity, original.end_velocity)] {
+            if current != before {
+                if !current.iter().all(|value| (*value as f32).is_finite()) {
+                    return Err(format!("{key} must contain two finite f32 values"));
+                }
+                changes.insert(key.into(), json!(current));
+            }
+        }
+        for (key, current, before, maximum) in [("width", self.width, original.width, 1.0e6),
+            ("opacity", self.opacity, original.opacity, 1.0)] {
+            if current != before {
+                if !current.is_finite() || !(0.0..=maximum).contains(&current) {
+                    return Err(format!("ArtPath point {key} must be in 0..={maximum}"));
+                }
+                changes.insert(key.into(), json!(current));
+            }
+        }
+        if self.color != original.color {
+            let count = if self.color[3] == original.color[3] { 3 } else { 4 };
+            if !self.color[..count].iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)) {
+                return Err("ArtPath point color channels must be in 0..=1".into());
+            }
+            changes.insert("color".into(), json!(&self.color[..count]));
+        }
+        if self.corner != original.corner {
+            changes.insert("corner".into(), json!(self.corner));
+        }
+        Ok(changes)
+    }
+}
+
+struct PointInput {
+    position: [String; 2],
+    start_velocity: [String; 2],
+    end_velocity: [String; 2],
+    width: String,
+    opacity: String,
+    color: [String; 4],
+    corner: bool,
+}
+
+impl PointInput {
+    fn from_values(values: &PointValues) -> Self {
+        Self {
+            position: values.position.map(|value| value.to_string()),
+            start_velocity: values.start_velocity.map(|value| value.to_string()),
+            end_velocity: values.end_velocity.map(|value| value.to_string()),
+            width: values.width.to_string(), opacity: values.opacity.to_string(),
+            color: values.color.map(|value| value.to_string()), corner: values.corner,
+        }
+    }
+
+    fn values(&self) -> Result<PointValues, String> {
+        let number = |text: &str, name: &str| text.trim().parse::<f64>().ok().filter(|value| value.is_finite())
+            .ok_or_else(|| format!("ArtPath point {name} must be a finite number"));
+        let pair = |values: &[String; 2], name: &str| -> Result<[f64; 2], String> {
+            Ok([number(&values[0], name)?, number(&values[1], name)?])
+        };
+        Ok(PointValues {
+            position: pair(&self.position, "position")?, start_velocity: pair(&self.start_velocity, "start velocity")?,
+            end_velocity: pair(&self.end_velocity, "end velocity")?, width: number(&self.width, "width")?,
+            opacity: number(&self.opacity, "opacity")?, color: [number(&self.color[0], "color R")?,
+                number(&self.color[1], "color G")?, number(&self.color[2], "color B")?, number(&self.color[3], "color A")?],
+            corner: self.corner,
+        })
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        fn input(ui: &mut egui::Ui, label: &str, text: &mut String) -> bool {
+            ui.horizontal(|ui| {
+                let caption = ui.label(label);
+                ui.add(egui::TextEdit::singleline(text).desired_width(150.0)).labelled_by(caption.id).changed()
+            }).inner
+        }
+        let mut changed = false;
+        for (prefix, pair) in [("Position", &mut self.position), ("Start velocity", &mut self.start_velocity),
+            ("End velocity", &mut self.end_velocity)] {
+            for (axis, text) in ["X", "Y"].into_iter().zip(pair.iter_mut()) {
+                changed |= input(ui, &format!("{prefix} {axis}"), text);
+            }
+        }
+        changed |= input(ui, "Point width", &mut self.width);
+        changed |= input(ui, "Point opacity", &mut self.opacity);
+        for (channel, text) in ["R", "G", "B", "A"].into_iter().zip(self.color.iter_mut()) {
+            changed |= input(ui, &format!("Point color {channel}"), text);
+        }
+        changed | ui.checkbox(&mut self.corner, "Corner").changed()
+    }
+}
+
+enum MainValues {
+    Vertex { index: usize, original: [f64; 2], draft: [f64; 2] },
+    FormOpacity { original: f64, draft: f64 },
+    ArtPathPoint { index: usize, original: PointValues, input: PointInput },
+}
+
+struct MainEdit {
+    key: FormKey,
+    revision: u64,
+    values: MainValues,
+}
+
+enum MainDraft {
+    Unloaded(MainChoice),
+    Unavailable { choice: MainChoice, message: String },
+    Loaded(MainEdit),
+}
+
+impl Default for MainDraft {
+    fn default() -> Self { Self::Unloaded(MainChoice::Vertex(0)) }
+}
+
+impl MainDraft {
+    fn revision(&self) -> Option<u64> {
+        match self { Self::Loaded(edit) => Some(edit.revision), _ => None }
+    }
+
+    fn choice(&self) -> MainChoice {
+        match self {
+            Self::Unloaded(choice) | Self::Unavailable { choice, .. } => *choice,
+            Self::Loaded(edit) => match &edit.values {
+                MainValues::Vertex { index, .. } => MainChoice::Vertex(*index),
+                MainValues::FormOpacity { .. } => MainChoice::FormOpacity,
+                MainValues::ArtPathPoint { index, .. } => MainChoice::ArtPathPoint(*index),
+            },
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        matches!(self, Self::Loaded(edit) if match &edit.values {
+            MainValues::Vertex { original, draft, .. } => draft != original,
+            MainValues::FormOpacity { original, draft } => draft != original,
+            MainValues::ArtPathPoint { original, input, .. } => input.values().map_or(true, |values| values != *original),
+        })
+    }
+
+    fn rebase(&mut self, revision: u64) {
+        if let Self::Loaded(edit) = self { edit.revision = revision; }
+    }
+
+    fn request(&self) -> Result<Option<Value>, String> {
+        let Self::Loaded(edit) = self else { return Err("No editable form value is loaded".into()) };
+        if !self.is_dirty() { return Ok(None) }
+        let key = &edit.key;
+        match &edit.values {
+            MainValues::Vertex { index, draft, .. } =>
+                vertex_request(&key.source, &key.form, &key.coordinate, *index, *draft, edit.revision).map(Some),
+            MainValues::FormOpacity { draft, .. } =>
+                opacity_request(&key.source, &key.form, &key.coordinate, *draft, edit.revision).map(Some),
+            MainValues::ArtPathPoint { index, original, input } => {
+                check_identity(&key.source, &key.form, &key.coordinate)?;
+                let changes = input.values()?.changes(original)?;
+                if changes.is_empty() { return Ok(None) }
+                let mut request = json!({"op":"live2d.artpath.point.set", "sourceGuid":key.source, "formGuid":key.form,
+                    "coordinateType":key.coordinate, "index":index, "expectedRevision":edit.revision});
+                request.as_object_mut().unwrap().extend(changes);
+                Ok(Some(request))
+            }
+        }
+    }
+}
+
 /// The drafts of the stored settings of the selected source and form. The two halves are applied separately and
 /// share the revision they were loaded at.
 #[derive(Default)]
 struct Stored {
     /// The selection the drafts were loaded for: source, form and coordinate type.
-    key: String,
+    key: FormKey,
     loaded: bool,
     revision: u64,
     form: FormSettings,
@@ -343,18 +542,11 @@ pub struct FormEditor {
     source: String,
     form: String,
     coordinate: String,
-    vertex: usize,
-    loaded: bool,
-    dirty: bool,
+    last_vertex: usize,
+    last_point: usize,
+    main: MainDraft,
     conflict: bool,
     error: String,
-    /// The revision the draft was loaded at; Apply sends it as `expectedRevision`.
-    revision: u64,
-    opacity_mode: bool,
-    position: [f64; 2],
-    original_position: [f64; 2],
-    opacity: f64,
-    original_opacity: f64,
     status: String,
     stored: Stored,
 }
@@ -370,12 +562,7 @@ impl FormEditor {
     }
 
     pub fn has_draft(&self) -> bool {
-        self.dirty || self.stored.is_dirty()
-    }
-
-    #[cfg(test)]
-    pub fn mark_dirty_for_test(&mut self) {
-        self.dirty = true;
+        self.main.is_dirty() || self.stored.is_dirty()
     }
 
     #[cfg(test)]
@@ -385,59 +572,111 @@ impl FormEditor {
 
     #[cfg(test)]
     pub fn state(&self) -> (bool, bool, &str) {
-        (self.dirty, self.conflict, self.error.as_str())
+        (self.main.is_dirty(), self.conflict, self.error.as_str())
     }
 
     fn load_draft(&mut self, form: &Value, revision: u64) {
-        self.error.clear();
-        if form["data"]["type"] == "ArtPath" {
-            self.opacity_mode = true;
-        } else {
-            let positions = form["data"]["positions"].as_array().filter(|p| !p.is_empty() && p.len() % 2 == 0);
-            let Some(positions) = positions else {
-                self.loaded = false;
-                self.error = "This form has no editable vertex positions".into();
-                return;
-            };
-            self.vertex = self.vertex.min(positions.len() / 2 - 1);
-            let at = self.vertex * 2;
-            let (Some(x), Some(y)) = (positions[at].as_f64(), positions[at + 1].as_f64()) else {
-                self.loaded = false;
-                self.error = "This form has invalid vertex coordinates".into();
-                return;
-            };
-            (self.position, self.original_position) = ([x, y], [x, y]);
-        }
-        let Some(opacity) = form["opacity"].as_f64().filter(|o| o.is_finite()) else {
-            self.loaded = false;
-            self.error = "This form has invalid opacity".into();
+        if self.main.is_dirty() {
+            self.error = "Apply or discard the current form edit before loading another value".into();
             return;
-        };
-        (self.opacity, self.original_opacity) = (opacity, opacity);
-        self.revision = revision;
-        self.loaded = true;
-        self.dirty = false;
-        self.conflict = false;
+        }
+        let mut choice = self.main.choice();
+        if form["data"]["type"] == "ArtPath" && matches!(choice, MainChoice::Vertex(_)) {
+            choice = MainChoice::FormOpacity;
+        }
+        let values = (|| -> Result<MainValues, String> {
+            match choice {
+                MainChoice::Vertex(index) => {
+                    let positions = form["data"]["positions"].as_array().filter(|p| !p.is_empty() && p.len() % 2 == 0)
+                        .ok_or("This form has no editable vertex positions")?;
+                    let index = index.min(positions.len() / 2 - 1);
+                    let at = index * 2;
+                    let x = positions[at].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid vertex coordinates")?;
+                    let y = positions[at + 1].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid vertex coordinates")?;
+                    self.last_vertex = index;
+                    Ok(MainValues::Vertex { index, original: [x, y], draft: [x, y] })
+                }
+                MainChoice::FormOpacity => {
+                    let opacity = form["opacity"].as_f64().filter(|value| value.is_finite()).ok_or("This form has invalid opacity")?;
+                    Ok(MainValues::FormOpacity { original: opacity, draft: opacity })
+                }
+                MainChoice::ArtPathPoint(index) => {
+                    if form["data"]["type"] != "ArtPath" {
+                        return Err("Control points require an ArtPath form".into());
+                    }
+                    let point = form["data"]["points"].as_array().and_then(|points| points.get(index))
+                        .ok_or("Selected ArtPath point is unavailable")?;
+                    let original = PointValues::from_point(point)?;
+                    let input = PointInput::from_values(&original);
+                    self.last_point = index;
+                    Ok(MainValues::ArtPathPoint { index, original, input })
+                }
+            }
+        })();
+        match values {
+            Ok(values) => {
+                self.main = MainDraft::Loaded(MainEdit { key: self.form_key(), revision, values });
+                if !(self.stored.loaded && self.stored.is_dirty() && self.stored.revision != revision) {
+                    self.error.clear();
+                    self.conflict = false;
+                }
+            }
+            Err(message) => {
+                self.error = message.clone();
+                self.main = MainDraft::Unavailable { choice, message };
+            }
+        }
+    }
+
+    fn form_key(&self) -> FormKey {
+        FormKey { source: self.source.clone(), form: self.form.clone(), coordinate: self.coordinate.clone() }
+    }
+
+    fn choose_main(&mut self, choice: MainChoice) -> Result<(), String> {
+        if self.main.is_dirty() || self.conflict {
+            return Err("Apply or discard the current form edit before changing its mode or index".into());
+        }
+        match choice {
+            MainChoice::Vertex(index) => self.last_vertex = index,
+            MainChoice::ArtPathPoint(index) => self.last_point = index,
+            MainChoice::FormOpacity => {}
+        }
+        self.main = MainDraft::Unloaded(choice);
+        self.error.clear();
+        self.status.clear();
+        Ok(())
     }
 
     fn select_source(&mut self, guid: &str) {
+        if self.has_draft() || self.conflict {
+            self.error = "Apply or discard the current edits before changing source".into();
+            return;
+        }
         self.source = guid.to_owned();
         self.form.clear();
         self.coordinate.clear();
-        self.vertex = 0;
-        self.opacity_mode = false;
-        self.loaded = false;
-        self.dirty = false;
+        self.last_vertex = 0;
+        self.last_point = 0;
+        self.main = MainDraft::default();
         self.conflict = false;
         self.error.clear();
     }
 
     fn select_form(&mut self, guid: &str, coordinate: &str) {
+        if self.has_draft() || self.conflict {
+            self.error = "Apply or discard the current edits before changing form".into();
+            return;
+        }
+        let choice = match self.main.choice() {
+            MainChoice::Vertex(_) => MainChoice::Vertex(0),
+            MainChoice::FormOpacity => MainChoice::FormOpacity,
+            MainChoice::ArtPathPoint(_) => MainChoice::ArtPathPoint(0),
+        };
         self.form = guid.to_owned();
         self.coordinate = coordinate.to_owned();
-        self.vertex = 0;
-        self.loaded = false;
-        self.dirty = false;
+        self.last_vertex = 0;
+        self.last_point = 0;
+        self.main = MainDraft::Unloaded(choice);
         self.conflict = false;
         self.error.clear();
     }
@@ -457,12 +696,13 @@ impl FormEditor {
             ui.label("No editable ArtMesh, Warp, Part, Rotation, Glue or ArtPath sources are available");
             return false;
         }
-        if self.loaded && self.revision != revision {
-            if self.dirty {
+        let stale_main = self.main.revision().is_some_and(|loaded| loaded != revision);
+        if stale_main {
+            if self.main.is_dirty() {
                 self.conflict = true;
                 self.error = "Document changed elsewhere. Your draft is preserved; reload before applying.".into();
             } else {
-                self.loaded = false;
+                self.main = MainDraft::Unloaded(self.main.choice());
                 self.error.clear();
             }
         }
@@ -472,7 +712,7 @@ impl FormEditor {
             .map(|s| (s["guid"].as_str().unwrap_or_default().to_owned(), source_name(s).to_owned()))
             .collect();
         let brushes = model["brushes"].as_array().map(Vec::as_slice).unwrap_or_default();
-        let editing = self.dirty || self.stored.is_dirty();
+        let editing = self.has_draft();
         let mut selected = sources.iter().copied().find(|s| s["guid"].as_str() == Some(self.source.as_str()));
         if selected.is_none() {
             if editing {
@@ -537,78 +777,137 @@ impl FormEditor {
             self.notices(ui);
             // Source settings do not require a primary form.
             let changed = selected.is_some_and(|source| self.stored_ui(ui, controller, source, None, revision, &masks, brushes));
+            if self.has_draft() {
+                ui.label("Reload discards the main edit, form settings and source settings.");
+            }
             if ui.button("Reload forms").clicked() {
                 self.reset();
             }
             return changed;
         };
-        // ArtPath opacity is independent of its control points.
         let artpath = form["data"]["type"] == "ArtPath";
         let vertex_form = form["data"].get("positions").is_some();
-        if (vertex_form || artpath) && !self.loaded {
+        if (vertex_form || artpath) && !matches!(self.main, MainDraft::Loaded(_)) {
             self.load_draft(form, revision);
         }
-        self.notices(ui);
         let mut changed = false;
         let mut apply_main = false;
-        if self.loaded {
+        if vertex_form || artpath {
             let artmesh = selected.is_some_and(|s| s["data"]["type"] == "ArtMesh");
-            if !artmesh && !artpath && !self.dirty {
-                self.opacity_mode = false;
-            }
-            if !artpath {
-                ui.add_enabled_ui(!self.dirty && !self.conflict && artmesh, |ui| {
-                    ui.checkbox(&mut self.opacity_mode, "Edit opacity");
-                });
-                let count = form["data"]["positions"].as_array().map_or(0, |p| p.len() / 2);
-                ui.add_enabled_ui(!self.dirty && !self.conflict && !self.opacity_mode, |ui| {
-                    let mut index = self.vertex as i64;
+            let previous = self.main.choice();
+            let mut choice = previous;
+            ui.add_enabled_ui(!self.main.is_dirty() && !self.conflict, |ui| {
+                if artpath {
                     ui.horizontal(|ui| {
-                        let caption = ui.label("Vertex index");
-                        let range = 0..=(count.max(1) as i64 - 1);
-                        if ui.add(egui::DragValue::new(&mut index).range(range)).labelled_by(caption.id).changed() {
-                            self.vertex = index.max(0) as usize;
-                            self.loaded = false;
-                            self.load_draft(form, revision);
-                        }
+                        ui.radio_value(&mut choice, MainChoice::FormOpacity, "Form opacity");
+                        ui.radio_value(&mut choice, MainChoice::ArtPathPoint(self.last_point), "Control point");
                     });
-                });
-            }
-            ui.add_enabled_ui(!self.conflict, |ui| {
-                if self.opacity_mode {
-                    ui.horizontal(|ui| {
-                        let caption = ui.label("Opacity");
-                        let response = ui.add(egui::DragValue::new(&mut self.opacity).speed(0.01).max_decimals(6)).labelled_by(caption.id);
-                        if response.changed() {
-                            self.dirty = self.opacity != self.original_opacity;
-                            self.error.clear();
-                        }
-                    });
-                } else {
-                    for (axis, label) in [(0, "Source X"), (1, "Source Y")] {
-                        ui.horizontal(|ui| {
-                            let caption = ui.label(label);
-                            let response =
-                                ui.add(egui::DragValue::new(&mut self.position[axis]).speed(0.01).max_decimals(4)).labelled_by(caption.id);
-                            if response.changed() {
-                                self.dirty = self.position != self.original_position;
-                                self.error.clear();
-                            }
-                        });
+                } else if artmesh {
+                    let mut opacity = choice == MainChoice::FormOpacity;
+                    if ui.checkbox(&mut opacity, "Edit opacity").changed() {
+                        choice = if opacity { MainChoice::FormOpacity } else { MainChoice::Vertex(self.last_vertex) };
                     }
                 }
             });
-            let apply = if self.opacity_mode { "Apply opacity" } else { "Apply vertex" };
-            if ui.add_enabled(self.dirty && !self.conflict, egui::Button::new(apply)).clicked() {
-                apply_main = true;
+            if choice != previous {
+                if let Err(message) = self.choose_main(choice) { self.error = message; }
+                self.load_draft(form, revision);
+            }
+            if let MainChoice::ArtPathPoint(index) = self.main.choice() {
+                let points = form["data"]["points"].as_array().map(Vec::as_slice).unwrap_or_default();
+                let mut selected = index;
+                ui.add_enabled_ui(!self.main.is_dirty() && !self.conflict, |ui| {
+                    egui::ComboBox::from_label("Point index").selected_text(index.to_string()).show_ui(ui, |ui| {
+                        for (at, point) in points.iter().enumerate() {
+                            let label = point["guid"].as_str().map_or_else(|| at.to_string(), |guid| format!("{at}: {guid}"));
+                            ui.selectable_value(&mut selected, at, label);
+                        }
+                    });
+                });
+                if selected != index {
+                    if let Err(message) = self.choose_main(MainChoice::ArtPathPoint(selected)) { self.error = message; }
+                    self.load_draft(form, revision);
+                }
+            } else if let MainChoice::Vertex(index) = self.main.choice() {
+                let count = form["data"]["positions"].as_array().map_or(0, |p| p.len() / 2);
+                let mut selected = index as i64;
+                let mut selected_changed = false;
+                ui.add_enabled_ui(!self.main.is_dirty() && !self.conflict, |ui| {
+                    ui.horizontal(|ui| {
+                        let caption = ui.label("Vertex index");
+                        let range = 0..=(count.max(1) as i64 - 1);
+                        selected_changed = ui.add(egui::DragValue::new(&mut selected).range(range)).labelled_by(caption.id).changed();
+                    });
+                });
+                if selected_changed && selected.max(0) as usize != index {
+                    if let Err(message) = self.choose_main(MainChoice::Vertex(selected.max(0) as usize)) { self.error = message; }
+                    self.load_draft(form, revision);
+                }
+            }
+            let mut input_changed = false;
+            if let MainDraft::Loaded(edit) = &mut self.main {
+                ui.add_enabled_ui(!self.conflict, |ui| {
+                    match &mut edit.values {
+                        MainValues::FormOpacity { draft, .. } => {
+                            ui.horizontal(|ui| {
+                                let caption = ui.label("Opacity");
+                                let mut value = *draft;
+                                if ui.add(egui::DragValue::new(&mut value).speed(0.01).max_decimals(6)).labelled_by(caption.id).changed() {
+                                    *draft = value;
+                                    input_changed = true;
+                                }
+                            });
+                        }
+                        MainValues::Vertex { draft, .. } => {
+                            for (axis, label) in [(0, "Source X"), (1, "Source Y")] {
+                                ui.horizontal(|ui| {
+                                    let caption = ui.label(label);
+                                    let mut value = draft[axis];
+                                    if ui.add(egui::DragValue::new(&mut value).speed(0.01).max_decimals(4)).labelled_by(caption.id).changed() {
+                                        draft[axis] = value;
+                                        input_changed = true;
+                                    }
+                                });
+                            }
+                        }
+                        MainValues::ArtPathPoint { input, .. } => input_changed = input.show(ui),
+                    }
+                });
+                let label = match &edit.values {
+                    MainValues::Vertex { .. } => "Apply vertex",
+                    MainValues::FormOpacity { .. } => "Apply opacity",
+                    MainValues::ArtPathPoint { .. } => "Apply point",
+                };
+                if ui.add_enabled(self.main.is_dirty() && !self.conflict, egui::Button::new(label)).clicked() {
+                    apply_main = true;
+                }
+            } else if let MainDraft::Unavailable { message, .. } = &self.main {
+                ui.colored_label(egui::Color32::LIGHT_RED, message);
+            }
+            if input_changed {
+                self.error.clear();
+                self.status.clear();
+            }
+            if self.main.is_dirty() {
+                ui.label("Apply or discard this edit before changing its mode or index.");
+            }
+            if ui.add_enabled(self.main.is_dirty(), egui::Button::new("Discard main edit")).clicked() {
+                self.main = MainDraft::Unloaded(self.main.choice());
+                self.conflict = self.stored.loaded && self.stored.is_dirty() && self.stored.revision != revision;
+                if !self.conflict { self.error.clear(); }
+                self.status.clear();
+                apply_main = false;
             }
         }
+        self.notices(ui);
         if let Some(source) = selected {
             changed |= self.stored_ui(ui, controller, source, Some(form), revision, &masks, brushes);
         }
+        if self.has_draft() {
+            ui.label("Reload discards the main edit, form settings and source settings.");
+        }
         if ui.button("Reload form").clicked() {
-            self.loaded = false;
-            self.dirty = false;
+            self.main = MainDraft::Unloaded(self.main.choice());
             self.conflict = false;
             self.error.clear();
             self.status.clear();
@@ -634,7 +933,7 @@ impl FormEditor {
     /// Loads the drafts of the stored settings when the selection changed, or when the document did and no draft
     /// would be lost; a draft the document outran is kept and marked as a conflict.
     fn sync_stored(&mut self, source: &Value, form: Option<&Value>, revision: u64) {
-        let key = format!("{}|{}|{}", self.source, self.form, self.coordinate);
+        let key = self.form_key();
         let stored = &mut self.stored;
         if stored.loaded && stored.key == key && stored.revision != revision && stored.is_dirty() {
             self.conflict = true;
@@ -704,10 +1003,7 @@ impl FormEditor {
                 // The edit was guarded by the loaded revision, so only the applied half has to be read back; the
                 // other half keeps its draft on the new revision.
                 let snapshot = controller.snapshot().clone();
-                // The vertex/opacity draft is untouched by a settings edit; keep it on the new revision.
-                if self.loaded {
-                    self.revision = snapshot["revision"].as_u64().unwrap_or(0);
-                }
+                self.main.rebase(snapshot["revision"].as_u64().unwrap_or(0));
                 let source = snapshot["model"]["sources"].as_array().into_iter().flatten().find(|s| s["guid"].as_str() == Some(self.source.as_str()));
                 if let Some(source) = source {
                     match half {
@@ -735,20 +1031,25 @@ impl FormEditor {
     }
 
     fn apply(&mut self, controller: &mut EditorController) -> bool {
-        let request = if self.opacity_mode {
-            opacity_request(&self.source, &self.form, &self.coordinate, self.opacity, self.revision)
-        } else {
-            vertex_request(&self.source, &self.form, &self.coordinate, self.vertex, self.position, self.revision)
+        let request = match self.main.request() {
+            Ok(Some(request)) => Ok(request),
+            Ok(None) => return false,
+            Err(message) => Err(message),
         };
         match send(controller, request) {
             Ok(()) => {
-                self.revision = controller.snapshot()["revision"].as_u64().unwrap_or(0);
-                self.loaded = false;
-                self.dirty = false;
+                let snapshot = controller.snapshot().clone();
+                let revision = snapshot["revision"].as_u64().unwrap_or(0);
+                self.main = MainDraft::Unloaded(self.main.choice());
                 self.conflict = false;
-                // A settings draft is untouched by a vertex/opacity edit; keep it on the new revision.
                 if self.stored.loaded {
-                    self.stored.revision = self.revision;
+                    self.stored.revision = revision;
+                }
+                let source = snapshot["model"]["sources"].as_array().into_iter().flatten()
+                    .find(|source| source["guid"].as_str() == Some(self.source.as_str()));
+                if let Some(form) = source.and_then(|source| editable_forms(source).into_iter()
+                    .find(|form| same_form(form, &self.form, &self.coordinate))) {
+                    self.load_draft(form, revision);
                 }
                 self.error.clear();
                 self.status = "Live2D form updated".into();
@@ -1062,6 +1363,13 @@ mod tests {
         assert_eq!(glue.intensity, 0.5);
     }
 
+    fn form_opacity(editor: &FormEditor) -> f64 {
+        match &editor.main {
+            MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft,
+            _ => panic!("expected a loaded opacity draft"),
+        }
+    }
+
     struct Rig {
         controller: EditorController,
         editor: FormEditor,
@@ -1069,6 +1377,43 @@ mod tests {
     }
 
     impl Rig {
+        fn vertex(&self) -> [f64; 2] {
+            match &self.editor.main {
+                MainDraft::Loaded(MainEdit { values: MainValues::Vertex { draft, .. }, .. }) => *draft,
+                _ => panic!("expected a loaded vertex draft"),
+            }
+        }
+
+        fn edit_vertex(&mut self, value: [f64; 2]) {
+            match &mut self.editor.main {
+                MainDraft::Loaded(MainEdit { values: MainValues::Vertex { draft, .. }, .. }) => *draft = value,
+                _ => panic!("expected a loaded vertex draft"),
+            }
+        }
+
+        fn opacity(&self) -> f64 { form_opacity(&self.editor) }
+
+        fn text(&mut self, label: &str, value: &str) {
+            let (editor, controller) = (&mut self.editor, &mut self.controller);
+            self.harness.text(label, value, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { editor.show(ui, controller); });
+            });
+        }
+
+        fn point_input(&self) -> &PointInput {
+            match &self.editor.main {
+                MainDraft::Loaded(MainEdit { values: MainValues::ArtPathPoint { input, .. }, .. }) => input,
+                _ => panic!("expected a loaded point draft"),
+            }
+        }
+
+        fn edit_opacity(&mut self, value: f64) {
+            match &mut self.editor.main {
+                MainDraft::Loaded(MainEdit { values: MainValues::FormOpacity { draft, .. }, .. }) => *draft = value,
+                _ => panic!("expected a loaded opacity draft"),
+            }
+        }
+
         fn frame(&mut self, events: Vec<egui::Event>) -> crate::editor_test_support::Out {
             let (editor, controller) = (&mut self.editor, &mut self.controller);
             self.harness.frame(events, |ctx| {
@@ -1166,6 +1511,302 @@ mod tests {
     }
 
     #[test]
+    fn artpath_point_editor_exposes_named_controls_for_all_existing_point_settings() {
+        let mut rig = Rig::artpath("forms-point-controls", &crate::editor_test_support::artpath_cmo3_xml());
+        let output = rig.draw();
+        assert!(has(&output, Role::RadioButton, "Control point"), "ArtPath control-point mode is not offered");
+        rig.click(Role::RadioButton, "Control point");
+        let output = rig.draw();
+        assert!(has(&output, Role::ComboBox, "Point index"));
+        for label in ["Position X", "Position Y", "Start velocity X", "Start velocity Y", "End velocity X",
+            "End velocity Y", "Point width", "Point opacity", "Point color R", "Point color G", "Point color B", "Point color A"] {
+            assert!(has(&output, Role::TextInput, label), "missing {label}");
+        }
+        assert!(has(&output, Role::CheckBox, "Corner"));
+        assert!(has(&output, Role::Button, "Apply point"));
+        assert!(assert_all_named(&output, "ArtPath point editor") >= 18);
+        assert!(!rig.editor.has_draft());
+        let before = rig.controller.snapshot().clone();
+        rig.draw();
+        assert_eq!(rig.controller.snapshot(), &before, "drawing controls changes no document state");
+    }
+
+    #[test]
+    fn artpath_point_editor_all_settings_target_only_the_selected_point_and_coordinate_with_history_and_reopen() {
+        let mut xml = crate::editor_test_support::artpath_cmo3_xml();
+        let start = xml.find("<CArtPathForm>").unwrap();
+        let end = start + xml[start..].find("</CArtPathForm>").unwrap() + "</CArtPathForm>".len();
+        let other = xml[start..end].replace("<s xs.n='coordName'>Canvas</s>", "<s xs.n='coordName'>DeformerLocal</s>");
+        xml.insert_str(end, &other);
+        xml = xml.replace("<carray_list xs.n='keyforms' count='1'><CArtPathForm>",
+            "<carray_list xs.n='keyforms' count='2'><CArtPathForm>");
+        for coordinate in ["Canvas", "DeformerLocal"] {
+            for index in 0..2 {
+                let name = format!("forms-point-all-{coordinate}-{index}");
+                let mut rig = Rig::artpath(&name, &xml);
+                rig.draw();
+                rig.choose("Form", &format!("path-form ({coordinate})"));
+                rig.click(Role::RadioButton, "Control point");
+                rig.choose("Point index", if index == 0 { "0: point-a" } else { "1: point-b" });
+                let before = rig.controller.snapshot().clone();
+                for (label, value) in [("Position X", "-8.25"), ("Position Y", "7.5"),
+                    ("Start velocity X", "1.25"), ("Start velocity Y", "-2.5"),
+                    ("End velocity X", "3.5"), ("End velocity Y", "-4.25"), ("Point width", "6.5"),
+                    ("Point opacity", "0.375"), ("Point color R", "0.125"), ("Point color G", "0.25"),
+                    ("Point color B", "0.5"), ("Point color A", "0.75")] {
+                    rig.text(label, value);
+                }
+                rig.click(Role::CheckBox, "Corner");
+                assert_eq!(rig.controller.snapshot(), &before, "typing does not apply");
+                let mut expected = before["model"].clone();
+                let path = expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap();
+                let form = path["forms"].as_array_mut().unwrap().iter_mut().find(|f| f["coordinateType"] == coordinate).unwrap();
+                let point = &mut form["data"]["points"][index];
+                for (key, value) in [("position", json!([-8.25,7.5])), ("startVelocity", json!([1.25,-2.5])),
+                    ("endVelocity", json!([3.5,-4.25])), ("width", json!(6.5)), ("opacity", json!(0.375)),
+                    ("color", json!([0.125,0.25,0.5,0.75])), ("corner", json!(true))] { point[key] = value; }
+                rig.click(Role::Button, "Apply point");
+                assert!(rig.editor.error.is_empty(), "{}", rig.editor.error);
+                assert!(!rig.editor.has_draft());
+                assert_eq!(rig.controller.snapshot()["model"], expected);
+                assert_eq!(rig.revision(), before["revision"].as_u64().unwrap() + 1);
+                assert_eq!(rig.controller.snapshot()["history"]["count"].as_u64().unwrap(), before["history"]["count"].as_u64().unwrap() + 1);
+                rig.controller.core_request(&json!({"op":"undo"}));
+                assert_eq!(rig.controller.snapshot()["model"], before["model"]);
+                rig.controller.core_request(&json!({"op":"redo"}));
+                assert_eq!(rig.controller.snapshot()["model"], expected);
+                let saved = temp_dir(&format!("{name}-saved")).join("saved.cmo3");
+                assert_eq!(rig.controller.core_request(&json!({"op":"save","path":saved}))["succeeded"], true);
+                let mut reopened = EditorController::new();
+                assert_eq!(reopened.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+                assert_eq!(reopened.snapshot()["model"], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn artpath_point_editor_requests_preserve_untouched_precision_and_validate_only_changed_settings() {
+        let mut rig = Rig::artpath("forms-point-requests", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton, "Control point");
+        let mut form = rig.controller.snapshot()["model"]["sources"].as_array().unwrap().iter()
+            .find(|s| s["guid"] == "path-guid").unwrap()["forms"][0].clone();
+        let original = &mut form["data"]["points"][0];
+        original["position"][1] = json!(0.1234567890123456);
+        original["width"] = json!(-3.0);
+        original["color"][3] = json!(1.125);
+        rig.editor.main = MainDraft::Unloaded(MainChoice::ArtPathPoint(0));
+        rig.editor.load_draft(&form, rig.revision());
+        rig.draw();
+        assert!(!rig.editor.has_draft(), "readable legacy values outside setter ranges are not edits");
+        assert_eq!(rig.editor.main.request().unwrap(), None);
+        rig.text("Position X", "3.125");
+        let request = rig.editor.main.request().unwrap().unwrap();
+        assert_eq!(request, json!({"op":"live2d.artpath.point.set", "sourceGuid":"path-guid", "formGuid":"path-form",
+            "coordinateType":"Canvas", "index":0,"expectedRevision":rig.revision(), "position":[3.125,0.1234567890123456]}));
+        rig.text("Position X", "1.000");
+        assert!(!rig.editor.has_draft());
+        rig.text("Point color R", "0.1234567890123456");
+        let request = rig.editor.main.request().unwrap().unwrap();
+        assert_eq!(request["color"], json!([0.1234567890123456,1.0,1.0]));
+        assert!(request.get("width").is_none());
+        rig.text("Point color A", "0.25");
+        assert_eq!(rig.editor.main.request().unwrap().unwrap()["color"], json!([0.1234567890123456,1.0,1.0,0.25]));
+    }
+
+    #[test]
+    fn artpath_point_editor_invalid_input_retains_raw_text_history_and_selection_until_discarded() {
+        let mut rig = Rig::artpath("forms-point-invalid", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::CheckBox,"Closed"); rig.click(Role::Button,"Apply source settings");
+        assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+        rig.draw(); rig.click(Role::RadioButton, "Control point");
+        let before = rig.controller.snapshot().clone();
+        for (label, bad) in [("Position X","-"), ("Position X","NaN"), ("Position X","inf"),
+            ("Position X","1e40"), ("Point width","-1"), ("Point width","1000001"),
+            ("Point opacity","1.01"), ("Point color R","-0.01")] {
+            rig.text(label, bad);
+            let output = rig.draw();
+            assert!(rig.editor.has_draft());
+            assert!(crate::editor_test_support::find(&output, Role::TextInput, label).unwrap().value().unwrap().contains(bad));
+            for (role, label) in [(Role::ComboBox,"Source"), (Role::ComboBox,"Form"),
+                (Role::ComboBox,"Point index"), (Role::RadioButton,"Form opacity")] {
+                assert!(crate::editor_test_support::find(&output,role,label).unwrap().is_disabled(), "{label}");
+            }
+            rig.click(Role::Button,"Apply point");
+            assert!(!rig.editor.error.is_empty() && !rig.editor.conflict);
+            assert_eq!(rig.controller.snapshot(), &before);
+            assert!(rig.editor.choose_main(MainChoice::ArtPathPoint(1)).is_err());
+            rig.editor.select_source("mesh-guid");
+            assert_eq!(rig.editor.source,"path-guid");
+            rig.click(Role::Button,"Discard main edit"); rig.draw();
+            assert!(!rig.editor.has_draft());
+        }
+        rig.text("Point width","4.5"); rig.text("Point width","3.000");
+        assert!(!rig.editor.has_draft());
+        rig.click(Role::Button,"Apply point");
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn artpath_point_editor_three_apply_owners_preserve_originals_and_raw_inputs_in_the_event_and_next_frame() {
+        for first in ["Apply point","Apply form settings","Apply source settings"] {
+            let mut rig = Rig::artpath(&format!("forms-point-three-{first}"), &crate::editor_test_support::artpath_cmo3_xml());
+            rig.draw(); rig.click(Role::RadioButton,"Control point");
+            rig.text("Point width","4.25"); rig.drag("Draw order",-10.0); rig.click(Role::CheckBox,"Closed");
+            let before = rig.revision();
+            let form_original = rig.editor.stored.form_original.clone();
+            let source_original = rig.editor.stored.source_original.clone();
+            let mut observed = false;
+            rig.click_observing(first, |editor,controller| {
+                if controller.snapshot()["revision"].as_u64().unwrap() == before + 1 {
+                    observed = true;
+                    assert!(!editor.conflict);
+                    assert_eq!(editor.main.revision(), Some(before + 1));
+                    assert_eq!(editor.stored.revision, before + 1);
+                    assert_eq!(editor.main.is_dirty(), first != "Apply point");
+                    if first != "Apply form settings" { assert!(editor.stored.form_original == form_original); }
+                    if first != "Apply source settings" { assert!(editor.stored.source_original == source_original); }
+                    if let MainDraft::Loaded(MainEdit { values: MainValues::ArtPathPoint { original,input,.. },.. }) = &editor.main {
+                        assert_eq!(input.width,"4.25");
+                        assert_eq!(original.width,if first == "Apply point" {4.25} else {3.0});
+                    } else { panic!("point draft lost"); }
+                }
+            });
+            assert!(observed);
+            rig.draw();
+            assert_eq!(rig.point_input().width,"4.25");
+            for next in ["Apply point","Apply form settings","Apply source settings"] {
+                if next != first { rig.click(Role::Button,next); }
+            }
+            assert_eq!(rig.revision(),before+3);
+            assert!(!rig.editor.has_draft());
+        }
+        let mut rig = Rig::artpath("forms-point-raw-rebase", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton,"Control point");
+        rig.text("Point width","-"); rig.click(Role::CheckBox,"Closed");
+        rig.click(Role::Button,"Apply source settings"); rig.draw();
+        assert_eq!(rig.point_input().width,"-");
+        assert!(rig.editor.has_draft() && !rig.editor.conflict);
+        rig.controller.core_request(&json!({"op":"undo"})); rig.draw();
+        assert!(rig.editor.conflict);
+        assert_eq!(rig.point_input().width,"-");
+        rig.click(Role::Button,"Apply point");
+        assert_eq!(rig.point_input().width,"-");
+    }
+
+    #[test]
+    fn artpath_point_editor_discard_and_reload_explicitly_preserve_or_drop_the_three_drafts() {
+        let mut rig = Rig::artpath("forms-point-discard", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton,"Control point");
+        rig.text("Point width","4.25"); rig.drag("Draw order",-10.0); rig.click(Role::CheckBox,"Closed");
+        let before = rig.controller.snapshot().clone();
+        let form = rig.editor.stored.form.clone(); let source = rig.editor.stored.source.clone();
+        assert!(texts(&rig.draw()).contains(&"Reload discards the main edit, form settings and source settings.".into()));
+        rig.click(Role::Button,"Discard main edit"); rig.draw();
+        assert!(!rig.editor.main.is_dirty() && rig.editor.stored.is_dirty());
+        assert!(rig.editor.stored.form == form && rig.editor.stored.source == source);
+        rig.text("Point width","5.25");
+        let changed = rig.controller.core_request(&json!({"op":"live2d.source.set","guid":"path-guid",
+            "closed":true,"expectedRevision":rig.revision()}));
+        assert_eq!(changed["succeeded"],true,"{changed}"); rig.draw();
+        assert!(rig.editor.conflict);
+        rig.click(Role::Button,"Discard main edit"); rig.draw();
+        assert!(rig.editor.conflict && rig.editor.stored.is_dirty(),"main-only discard must not clear a sibling conflict");
+        assert!(rig.editor.stored.form == form && rig.editor.stored.source == source);
+        let after_external = rig.controller.snapshot().clone();
+        rig.click(Role::Button,"Reload form"); rig.draw();
+        assert!(!rig.editor.has_draft() && !rig.editor.conflict);
+        assert_eq!(rig.point_input().width,"3");
+        assert_eq!(rig.editor.stored.form.draw_order,950);
+        assert!(rig.editor.stored.source.closed);
+        assert_eq!(rig.controller.snapshot(),&after_external);
+        assert_ne!(after_external["model"],before["model"]);
+
+        let mut xml = crate::editor_test_support::artpath_cmo3_xml();
+        let start = xml.find("<carray_list xs.n='keyforms' count='1'><CArtPathForm>").unwrap();
+        let end = start+xml[start..].find("</CArtPathForm></carray_list>").unwrap()+"</CArtPathForm></carray_list>".len();
+        xml.replace_range(start..end,"<carray_list xs.n='keyforms' count='0'/>");
+        let mut rig = Rig::artpath("forms-point-reload-no-form",&xml);
+        rig.draw(); rig.click(Role::CheckBox,"Closed");
+        let before = rig.controller.snapshot().clone();
+        assert!(texts(&rig.draw()).contains(&"Reload discards the main edit, form settings and source settings.".into()));
+        rig.click(Role::Button,"Reload forms"); rig.draw();
+        assert!(!rig.editor.has_draft());
+        assert_eq!(rig.controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn artpath_point_editor_missing_ambiguous_and_removed_targets_never_retarget_pending_input() {
+        for case in ["source", "index", "ambiguous"] {
+            let base = crate::editor_test_support::artpath_cmo3_xml();
+            let mut xml = base.clone();
+            if case == "ambiguous" {
+                let start = xml.find("<CArtPathForm>").unwrap();
+                let end = start+xml[start..].find("</CArtPathForm>").unwrap()+"</CArtPathForm>".len();
+                let duplicate = xml[start..end].to_owned(); xml.insert_str(end,&duplicate);
+                xml = xml.replace("<carray_list xs.n='keyforms' count='1'><CArtPathForm>",
+                    "<carray_list xs.n='keyforms' count='2'><CArtPathForm>");
+            }
+            let mut rig = Rig::artpath(&format!("forms-point-target-{case}"),&base);
+            rig.draw(); rig.click(Role::RadioButton,"Control point"); rig.choose("Point index","1: point-b");
+            rig.text("Point width","4.25");
+            let request = rig.editor.main.request().unwrap().unwrap();
+            if case == "ambiguous" {
+                let path = temp_dir("forms-point-target-ambiguous").join("ambiguous.cmo3");
+                std::fs::write(&path,crate::editor_test_support::caff_with_xml(&xml)).unwrap();
+                let before = rig.controller.snapshot().clone();
+                let response = rig.controller.core_request(&json!({"op":"open","path":path}));
+                assert_eq!(response["succeeded"],false);
+                assert!(response["message"].as_str().unwrap().contains("duplicate authoring form GUID and coordinate type"));
+                assert_eq!(rig.controller.snapshot(),&before,"an ambiguous source never enters the active Session");
+            } else {
+                let operation = if case == "source" { json!({"op":"live2d.delete","guid":"path-guid",
+                    "expectedRevision":rig.revision()}) } else { json!({"op":"live2d.artpath.point.delete",
+                    "sourceGuid":"path-guid","index":1,"expectedRevision":rig.revision()}) };
+                let response = rig.controller.core_request(&operation);
+                assert_eq!(response["succeeded"],true,"{case}: {response}");
+            }
+            let before = rig.controller.snapshot().clone();
+            rig.draw();
+            if case == "ambiguous" {
+                assert!(!rig.editor.conflict && rig.editor.error.is_empty());
+            } else { assert!(rig.editor.conflict); }
+            assert!(rig.editor.has_draft());
+            assert_eq!(rig.point_input().width,"4.25");
+            assert_eq!(rig.editor.main.request().unwrap().unwrap(),request);
+            assert_eq!(rig.controller.snapshot(),&before);
+        }
+    }
+
+    #[test]
+    fn artpath_point_editor_malformed_projection_is_unavailable_and_real_storage_refusal_preserves_redo() {
+        let xml = crate::editor_test_support::artpath_cmo3_xml()
+            .replace("<f xs.n='width'>3</f>","<f xs.n='width'><![CDATA[3]]></f>");
+        let mut rig = Rig::artpath("forms-point-storage-refusal", &xml);
+        rig.draw(); rig.click(Role::CheckBox,"Closed"); rig.click(Role::Button,"Apply source settings");
+        rig.controller.core_request(&json!({"op":"undo"})); rig.draw();
+        rig.click(Role::RadioButton,"Control point"); rig.text("Point width","4.25");
+        let before = rig.controller.snapshot().clone();
+        rig.click(Role::Button,"Apply point");
+        assert!(!rig.editor.error.is_empty() && !rig.editor.conflict);
+        assert_eq!(rig.point_input().width,"4.25");
+        assert_eq!(rig.controller.snapshot(), &before);
+        assert_eq!(rig.controller.core_request(&json!({"op":"redo"}))["succeeded"],true);
+        rig.draw(); assert!(rig.editor.conflict);
+        rig.click(Role::Button,"Reload form"); rig.draw();
+        let source = rig.controller.snapshot()["model"]["sources"].as_array().unwrap().iter()
+            .find(|s|s["guid"] == "path-guid").unwrap().clone();
+        for (key,value) in [("position",json!([1])),("color",json!([1,1,1])),("corner",Value::Null),
+            ("width",json!("bad"))] {
+            let mut form = source["forms"][0].clone(); form["data"]["points"][0][key] = value;
+            rig.editor.main = MainDraft::Unloaded(MainChoice::ArtPathPoint(0));
+            rig.editor.load_draft(&form,rig.revision());
+            assert!(matches!(rig.editor.main,MainDraft::Unavailable{..}));
+            assert!(!rig.editor.has_draft());
+            assert!(rig.editor.main.request().is_err());
+        }
+    }
+
+    #[test]
     fn the_editor_lists_the_source_and_form_with_named_controls_and_loads_the_first_vertex() {
         let mut rig = Rig::new("forms-names");
         let output = rig.draw();
@@ -1181,8 +1822,8 @@ mod tests {
             assert!(texts(&output).iter().any(|t| t == label), "{label}");
         }
         assert!(assert_all_named(&output, "form editor") >= 6);
-        assert_eq!(rig.editor.position, [1.0, 2.0]);
-        assert_eq!((rig.editor.opacity, rig.editor.coordinate.as_str()), (0.75, "Canvas"));
+        assert_eq!(rig.vertex(), [1.0, 2.0]);
+        assert_eq!((rig.form()["opacity"].as_f64().unwrap(), rig.editor.coordinate.as_str()), (0.75, "Canvas"));
         assert!(!rig.editor.has_draft());
     }
 
@@ -1191,12 +1832,10 @@ mod tests {
         let mut rig = Rig::new("forms-apply");
         rig.draw();
         let start = rig.revision();
-        rig.editor.vertex = 1;
-        rig.editor.loaded = false;
+        rig.editor.choose_main(MainChoice::Vertex(1)).unwrap();
         rig.draw();
-        assert_eq!(rig.editor.position, [3.0, 4.0], "vertex 1 of the form");
-        rig.editor.position = [30.25, -40.5];
-        rig.editor.dirty = true;
+        assert_eq!(rig.vertex(), [3.0, 4.0], "vertex 1 of the form");
+        rig.edit_vertex([30.25, -40.5]);
         rig.click(Role::Button, "Apply vertex");
         assert_eq!(rig.editor.status, "Live2D form updated", "{}", rig.editor.error);
         assert_eq!(rig.revision(), start + 1);
@@ -1207,9 +1846,8 @@ mod tests {
 
         rig.draw();
         rig.click(Role::CheckBox, "Edit opacity");
-        assert!(rig.editor.opacity_mode);
-        rig.editor.opacity = 0.5;
-        rig.editor.dirty = true;
+        assert_eq!(rig.editor.main.choice(), MainChoice::FormOpacity);
+        rig.edit_opacity(0.5);
         let before = rig.revision();
         rig.click(Role::Button, "Apply opacity");
         assert_eq!(rig.form()["opacity"], 0.5, "{}", rig.editor.error);
@@ -1220,8 +1858,7 @@ mod tests {
     fn a_change_elsewhere_makes_the_draft_a_conflict_and_the_backend_refuses_a_stale_revision() {
         let mut rig = Rig::new("forms-conflict");
         rig.draw();
-        rig.editor.position = [9.0, 9.0];
-        rig.editor.dirty = true;
+        rig.edit_vertex([9.0, 9.0]);
         let loaded_at = rig.revision();
         let changed = rig.controller.core_request(&json!({"op": "live2d.form.set_vertex", "sourceGuid": "mesh-guid", "formGuid": "form-guid",
             "coordinateType": "Canvas", "vertexIndex": 2, "position": [7.0, 7.0], "expectedRevision": loaded_at}));
@@ -1244,7 +1881,7 @@ mod tests {
         rig.click(Role::Button, "Reload form");
         let (dirty, conflict, error) = rig.editor.state();
         assert!(!dirty && !conflict && error.is_empty());
-        assert_eq!(rig.editor.position, [1.0, 2.0]);
+        assert_eq!(rig.vertex(), [1.0, 2.0]);
     }
 
     #[test]
@@ -1319,8 +1956,7 @@ mod tests {
 
         // The reverse: a vertex apply must not make a dirty settings draft look stale.
         rig.editor.stored.form.multiply[0] = 0.25;
-        rig.editor.position = [9.0, 9.0];
-        rig.editor.dirty = true;
+        rig.edit_vertex([9.0, 9.0]);
         rig.click(Role::Button, "Apply vertex");
         assert_eq!(rig.editor.status, "Live2D form updated", "{}", rig.editor.error);
         rig.draw();
@@ -1334,8 +1970,7 @@ mod tests {
         rig.draw();
         rig.editor.stored.form.multiply[0] = 0.25;
         rig.editor.stored.source.invert_clipping_mask = true;
-        rig.editor.position = [9.0, 9.0];
-        rig.editor.dirty = true;
+        rig.edit_vertex([9.0, 9.0]);
         let form_draft = rig.editor.stored.form.clone();
         let source_draft = rig.editor.stored.source.clone();
         let form_original = rig.editor.stored.form_original.clone();
@@ -1382,8 +2017,8 @@ mod tests {
             rig.draw();
             let before = rig.controller.snapshot().clone();
             rig.drag("Opacity", -150.0);
-            assert!(rig.editor.opacity < 0.0, "authored opacity is not clamped");
-            let opacity = rig.editor.opacity;
+            assert!(rig.opacity() < 0.0, "authored opacity is not clamped");
+            let opacity = rig.opacity();
             let mut expected = before["model"].clone();
             expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap()
                 ["forms"][0]["opacity"] = json!(opacity);
@@ -1404,8 +2039,7 @@ mod tests {
             assert!(crate::editor_test_support::find(&rig.draw(), Role::Button, "Apply opacity").unwrap().is_disabled());
             rig.click(Role::Button, "Apply opacity");
             assert_eq!(rig.controller.snapshot(), &unchanged);
-            rig.editor.opacity = 1.00005;
-            rig.editor.dirty = true;
+            rig.edit_opacity(1.00005);
             rig.click(Role::Button, "Apply opacity");
             expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap()
                 ["forms"][0]["opacity"] = json!(1.00005);
@@ -1424,7 +2058,7 @@ mod tests {
             let mut rig = Rig::artpath(&format!("forms-opacity-three-{first}"), &crate::editor_test_support::artpath_cmo3_xml());
             rig.draw();
             rig.drag("Opacity", -25.0);
-            let opacity = rig.editor.opacity;
+            let opacity = rig.opacity();
             rig.drag("Draw order", -10.0);
             let order = rig.editor.stored.form.draw_order;
             rig.click(Role::CheckBox, "Closed");
@@ -1435,12 +2069,12 @@ mod tests {
                 assert!(!editor.conflict, "{first}: {}", editor.error);
                 if revision > start {
                     applied += 1;
-                    assert_eq!(editor.revision, revision);
+                    assert_eq!(editor.main.revision(), Some(revision));
                     assert_eq!(editor.stored.revision, revision);
-                    assert_eq!(editor.opacity, opacity);
+                    assert_eq!(form_opacity(editor), opacity);
                     assert_eq!(editor.stored.form.draw_order, order);
                     assert!(editor.stored.source.closed);
-                    assert_eq!(editor.dirty, first != "Apply opacity");
+                    assert_eq!(editor.main.is_dirty(), first != "Apply opacity");
                     assert_eq!(editor.stored.form != editor.stored.form_original, first != "Apply form settings");
                     assert_eq!(editor.stored.source != editor.stored.source_original, first != "Apply source settings");
                 }
@@ -1468,28 +2102,28 @@ mod tests {
         rig.controller.core_request(&json!({"op":"undo"}));
         rig.draw();
         rig.drag("Opacity", -25.0);
-        let opacity = rig.editor.opacity;
+        let opacity = rig.opacity();
         let before = rig.controller.snapshot().clone();
         rig.click(Role::Button, "Apply opacity");
         assert_eq!(rig.controller.snapshot(), &before);
-        assert!(rig.editor.dirty && !rig.editor.conflict && !rig.editor.error.is_empty());
-        assert_eq!(rig.editor.opacity, opacity);
+        assert!(rig.editor.main.is_dirty() && !rig.editor.conflict && !rig.editor.error.is_empty());
+        assert_eq!(rig.opacity(), opacity);
         let error = rig.editor.error.clone();
         assert!(texts(&rig.draw()).contains(&error));
         rig.controller.core_request(&json!({"op":"redo"}));
         rig.draw();
-        assert!(rig.editor.conflict && rig.editor.dirty);
-        assert_eq!(rig.editor.opacity, opacity);
+        assert!(rig.editor.conflict && rig.editor.main.is_dirty());
+        assert_eq!(rig.opacity(), opacity);
         rig.click(Role::Button, "Reload form");
         let output = rig.draw();
         assert!(!rig.editor.has_draft() && !rig.editor.conflict);
-        assert_eq!(rig.editor.opacity, 1.0);
+        assert_eq!(rig.opacity(), 1.0);
         assert!(has(&output, Role::CheckBox, "Closed"));
         rig.choose("Source", "Mesh [ArtMesh]");
-        assert!(!rig.editor.opacity_mode);
+        assert!(matches!(rig.editor.main.choice(), MainChoice::Vertex(_)));
         assert!(has(&rig.draw(), Role::Button, "Apply vertex"));
         rig.choose("Source", "Path [ArtPath]");
-        assert!(rig.editor.opacity_mode);
+        assert_eq!(rig.editor.main.choice(), MainChoice::FormOpacity);
         assert!(has(&rig.draw(), Role::Button, "Apply opacity"));
     }
 
@@ -1510,7 +2144,7 @@ mod tests {
         let path = expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap();
         assert_eq!(path["forms"].as_array().unwrap().len(), 2);
         path["forms"].as_array_mut().unwrap().iter_mut().find(|f| f["coordinateType"] == "DeformerLocal").unwrap()
-            ["opacity"] = json!(rig.editor.opacity);
+            ["opacity"] = json!(rig.opacity());
         rig.click(Role::Button, "Apply opacity");
         assert!(rig.editor.error.is_empty(), "{}", rig.editor.error);
         assert_eq!(rig.controller.snapshot()["model"], expected);
@@ -1525,10 +2159,11 @@ mod tests {
         for value in [Value::Null, json!("bad"), json!([])] {
             let mut form = source["forms"][0].clone();
             form["opacity"] = value;
-            rig.editor.opacity = 0.75;
+            let before = rig.controller.snapshot().clone();
+            rig.editor.main = MainDraft::Unloaded(MainChoice::FormOpacity);
             rig.editor.load_draft(&form, rig.revision());
-            assert!(!rig.editor.loaded && !rig.editor.error.is_empty());
-            assert_eq!(rig.editor.opacity, 0.75, "no invented editable zero");
+            assert!(matches!(rig.editor.main, MainDraft::Unavailable { .. }) && !rig.editor.error.is_empty());
+            assert_eq!(rig.controller.snapshot(), &before, "invalid projection creates no editable zero or document change");
             let (editor, controller) = (&mut rig.editor, &mut rig.controller);
             let revision = controller.snapshot()["revision"].as_u64().unwrap();
             let output = rig.harness.frame(Vec::new(), |ctx| {

@@ -16487,20 +16487,66 @@ mod shell_flow_tests {
     }
 
     #[test]
-    fn saving_is_refused_while_a_motion3_or_live2d_form_draft_is_open() {
+    fn artpath_point_editor_blocks_save_and_replacement_over_real_input() {
         let (mut app, dir) = app("flow-save-drafts");
-        edit(&mut app, "Edited");
-        let target = dir.join("blocked.inx");
-        app.forms.mark_dirty_for_test();
+        let source = dir.join("path.cmo3");
+        std::fs::write(&source, crate::editor_test_support::caff_with_xml(
+            &crate::editor_test_support::artpath_cmo3_xml())).unwrap();
+        app.command(json!({"op":"open", "path":source}));
+        assert_eq!(app.controller.snapshot()["documentFormat"], "live2d.cmo3");
+        let ctx = egui::Context::default();
+        let quit = json!({"jsonrpc":"2.0", "id":"point-quit", "method":"tools/call",
+            "params":{"name":"editor_quit", "arguments":{}}});
+        app.sync_panel_drafts();
+        let pending_quit = editor_view!(app, &ctx).mcp(&mut app.controller, &quit, McpOrigin::Client);
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1600.0, 4000.0);
+        fn draw(app: &mut EditorApp, ctx: &egui::Context) {
+            egui::CentralPanel::default().show(ctx, |ui| { app.forms.show(ui, &mut app.controller); });
+        }
+        let output = harness.click(Role::ComboBox, "Source", |ctx| draw(&mut app, ctx));
+        let role = output.iter().find(|(_, node)| crate::editor_test_support::name_of(&output, node).as_deref()
+            == Some("Path [ArtPath]")).map(|(_, node)| node.role()).unwrap();
+        harness.click(role, "Path [ArtPath]", |ctx| draw(&mut app, ctx));
+        harness.click(Role::RadioButton, "Control point", |ctx| draw(&mut app, ctx));
+        harness.text("Point width", "4.25", |ctx| draw(&mut app, ctx));
+        assert!(app.forms.has_draft());
+        pending_quit.write_line(&mut Vec::new()).unwrap();
+        harness.frame(Vec::new(), |ctx| app.finish_remote_quit(ctx));
+        assert!(!app.closing && harness.close_requests == 0, "input invalidates an already admitted Quit");
+        let before = app.controller.snapshot().clone();
+        let target = dir.join("blocked.cmo3");
         app.command(json!({"op": "save", "path": target.to_str().unwrap()}));
         assert_eq!(app.notice, FORM_DRAFT_MESSAGE);
-        assert!(!target.exists() && modified(&app));
-        // The dialog's Save is refused the same way, and the replacement stays pending.
+        assert!(!target.exists() && !modified(&app));
         app.command(json!({"op": "new"}));
         assert!(app.unsaved.is_none(), "a draft blocks the replacement before the dialog");
         assert_eq!(app.notice, DRAFT_BLOCKS_MESSAGE);
         assert_eq!(app.save_for_dialog(target.to_str().unwrap()), Err(FORM_DRAFT_MESSAGE.to_owned()));
+        for action in [PendingAction::Request(json!({"op":"open","path":source})), PendingAction::ImportLayers,
+            PendingAction::Close] {
+            app.guard_replace(action);
+            assert!(app.unsaved.is_none() && !app.closing);
+            assert_eq!(app.controller.snapshot(), &before);
+        }
+        app.handle_drop(&[source.clone(), dir.join("layers.psd")]);
+        assert_eq!(app.controller.snapshot(), &before);
+        app.sync_panel_drafts();
+        for (name,args) in [("save",json!({"path":target})), ("new",json!({})), ("editor_quit",json!({}))] {
+            let message = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":name,"arguments":args}});
+            let reply = editor_view!(app, &ctx).mcp(&mut app.controller, &message, McpOrigin::Client).into_message().unwrap();
+            assert_eq!(reply["result"]["isError"],true,"{reply}");
+        }
+        harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close)));
+        harness.frame(Vec::new(), |ctx| app.handle_close_request(ctx));
+        assert!(app.close_blocked && !app.closing && harness.close_requests == 0);
+        let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap();
+        harness.frame(Vec::new(), |ctx| app.drain_host(ctx));
+        assert!(!app.closing && harness.close_requests == 0 && app.forms.has_draft());
         assert!(!target.exists());
+        assert_eq!(app.controller.snapshot(), &before);
     }
 
     #[test]

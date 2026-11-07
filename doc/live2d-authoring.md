@@ -1496,8 +1496,24 @@ identity. **Apply opacity** uses the existing guarded `live2d.form.set_opacity` 
 it changes form opacity independently of control-point opacity and requires no vertices.
 Each Apply retains the existing revision guard, changed-fields-only
 request, refusal message and separate Undo step. Missing private storage can still
-refuse a projected setting. This adds no ArtPath vertex, colour, creation
-or rendering controls; native and vendor acceptance remain separate evidence.
+refuse a projected setting.
+
+Choose **Control point**, then **Point index**, to edit an existing point's
+position, start/end velocity, width, point opacity, RGB/RGBA colour and corner flag.
+**Apply point** uses `live2d.artpath.point.set` for that exact primary form,
+coordinate and index. Only changed settings are sent; unchanged colour alpha is
+omitted. Coordinates must fit finite native floats, width is `0..1000000`, and
+point opacity and colour channels are `0..1`. Opening the controls changes no
+stored value. Incomplete or invalid numeric text remains a draft; a refusal
+retains it. Apply or **Discard main edit** before changing mode or point.
+Applying point, form settings or source settings retains the other drafts and
+advances their revision guards; an external change instead requires Reload.
+**Discard main edit** keeps the form/source settings drafts. **Reload form**
+(**Reload forms** when the selected form is unavailable) discards all three drafts;
+the panel states this beside the action. Neither action edits the document.
+Pending point input blocks Save, document replacement and Quit. Point creation,
+brush creation and stroke rendering remain separate work, as do physical native
+input and vendor acceptance.
 
 The metadata phase's focused panel checks pass 17 tests, including actual egui choices, numeric
 drags, checkboxes and Apply buttons. The full suite passes 2,880 tests, with zero

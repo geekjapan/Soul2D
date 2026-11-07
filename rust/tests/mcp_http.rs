@@ -11,6 +11,9 @@ use std::thread::{self, JoinHandle};
 #[path = "common/authoring_fixture.rs"]
 mod authoring_fixture;
 
+#[path = "common/artpath_fixture.rs"]
+mod artpath_fixture;
+
 /// Serve exactly `connections` connections with a fresh session, then hand back its final snapshot (Session is not Send).
 fn start(bearer: Option<&str>, connections: usize) -> (u16, JoinHandle<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -184,6 +187,85 @@ fn sound_fixed_volume_edits_over_http_preserve_refusals_history_and_reopen() {
     assert_eq!(snapshot()["model"], expected);
     assert_eq!(server.join().unwrap()["model"], expected);
     assert_eq!(std::fs::read(source).unwrap(), original);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn artpath_point_editor_tool_over_http_preserves_refusals_history_resources_and_reopen() {
+    let directory = std::env::temp_dir().join(format!("soul2d-point-http-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("source.cmo3");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 0, 0, 255])))
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let xml = artpath_fixture::with_artpath(&authoring_fixture::native_artmesh_xml("<f xs.n='opacity'>1</f>"));
+    let original = authoring_fixture::authoring_bytes_with_pngs(&xml, &[png.into_inner()]);
+    std::fs::write(&source, &original).unwrap();
+    let (port, server) = start(None, 15);
+    let rpc = |method: &str, params: Value| {
+        let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let response = raw(port, &post(&body));
+        let (status, body) = split(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let reply: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply.get("error").is_none(), "{reply}");
+        reply
+    };
+    let call = |name: &str, arguments: Value| {
+        let reply = rpc("tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        serde_json::from_str::<Value>(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let snapshot = || {
+        let reply = rpc("resources/read", json!({"uri":"resource://vsoul/snapshot"}));
+        serde_json::from_str::<Value>(reply["result"]["contents"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    call("open", json!({"path":source}));
+    let baseline = snapshot();
+    let listed = rpc("tools/list", json!({}));
+    assert!(listed["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "live2d_artpath_point_set"));
+    let changed = call("live2d_artpath_point_set", json!({"sourceGuid":"path-guid", "formGuid":"path-form",
+        "coordinateType":"Canvas", "index":1, "position":[-2.5,2.0], "width":6.25, "color":[0.25,0.5,0.75],
+        "corner":true, "expectedRevision":baseline["revision"]}));
+    let mut expected = baseline["model"].clone();
+    let point = &mut expected["sources"].as_array_mut().unwrap().iter_mut()
+        .find(|s|s["guid"] == "path-guid").unwrap()["forms"][0]["data"]["points"][1];
+    point["position"] = json!([-2.5,2.0]); point["width"] = json!(6.25);
+    point["color"] = json!([0.25,0.5,0.75,1.0]); point["corner"] = json!(true);
+    assert_eq!(changed["model"], expected);
+    let before_refusal = snapshot();
+    for (width, revision) in [(json!(-1),before_refusal["revision"].clone()), (json!(5),baseline["revision"].clone())] {
+        let refused = rpc("tools/call", json!({"name":"live2d_artpath_point_set", "arguments":{
+            "sourceGuid":"path-guid", "formGuid":"path-form", "coordinateType":"Canvas", "index":1,
+            "width":width,"expectedRevision":revision}}));
+        assert_eq!(refused["result"]["isError"],true);
+        assert_eq!(snapshot(),before_refusal);
+    }
+    call("undo",json!({})); assert_eq!(snapshot()["model"],baseline["model"]);
+    call("redo",json!({}));
+    let saved = directory.join("saved.cmo3");
+    call("save",json!({"path":saved})); call("open",json!({"path":saved}));
+    assert_eq!(snapshot()["model"],expected);
+    assert_eq!(server.join().unwrap()["model"],expected);
+    let before = soul2d_core::caff::CaffDocument::parse(&original).unwrap();
+    let after = soul2d_core::caff::CaffDocument::parse(&std::fs::read(saved).unwrap()).unwrap();
+    for entry in before.entries().iter().filter(|entry|entry.alias != "main_xml") {
+        assert_eq!(after.entry_data(&entry.name),before.entry_data(&entry.name));
+    }
+    let written = String::from_utf8(after.main_xml()).unwrap();
+    let start = xml.find("<CArtPathPoint><CArtPathPointGuid xs.n='ctrlPtId' uuid='point-b'/>").unwrap();
+    let end = start+xml[start..].find("</CArtPathPoint>").unwrap()+"</CArtPathPoint>".len();
+    let point = xml[start..end].replace("<f xs.n='x'>5</f>","<f xs.n='x'>-2.5</f>")
+        .replace("<f xs.n='width'>3</f>","<f xs.n='width'>6.25</f>")
+        .replace("<f xs.n='colorRed'>1</f>","<f xs.n='colorRed'>0.25</f>")
+        .replace("<f xs.n='colorGreen'>1</f>","<f xs.n='colorGreen'>0.5</f>")
+        .replace("<f xs.n='colorBlue'>1</f>","<f xs.n='colorBlue'>0.75</f>")
+        .replace("<b xs.n='isCorner'>false</b>","<b xs.n='isCorner'>true</b>");
+    let mut expected_xml = xml.clone(); expected_xml.replace_range(start..end,&point);
+    assert_eq!(written,expected_xml,"every unrelated XML byte and untouched point component survives");
+    assert_eq!(std::fs::read(source).unwrap(),original);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

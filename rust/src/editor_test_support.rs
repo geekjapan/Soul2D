@@ -6,6 +6,9 @@ use eframe::egui;
 use egui::accesskit::{Node, NodeId, Role};
 use std::collections::HashMap;
 
+#[path = "../tests/common/artpath_fixture.rs"]
+mod artpath_fixture;
+
 pub type Out = Vec<(NodeId, Node)>;
 
 pub struct Harness {
@@ -19,8 +22,8 @@ pub struct Harness {
     pub close_requests: usize,
 }
 
-const CONTROLS: [Role; 7] =
-    [Role::Button, Role::CheckBox, Role::ComboBox, Role::SpinButton, Role::TextInput, Role::MultilineTextInput, Role::Slider];
+const CONTROLS: [Role; 8] =
+    [Role::Button, Role::CheckBox, Role::RadioButton, Role::ComboBox, Role::SpinButton, Role::TextInput, Role::MultilineTextInput, Role::Slider];
 
 impl Harness {
     pub fn new() -> Self {
@@ -67,6 +70,14 @@ impl Harness {
         let at = center(&laid_out, role, label);
         let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
         self.frame(vec![egui::Event::PointerMoved(at), press(true), press(false)], &mut run);
+        self.frame(Vec::new(), &mut run)
+    }
+
+    pub fn text(&mut self, label: &str, value: &str, mut run: impl FnMut(&egui::Context)) -> Out {
+        self.click(Role::TextInput, label, &mut run);
+        let key = |pressed| egui::Event::Key { key: egui::Key::A, physical_key: None, pressed, repeat: false,
+            modifiers: egui::Modifiers::COMMAND };
+        self.frame(vec![key(true), egui::Event::Text(value.to_owned()), key(false)], &mut run);
         self.frame(Vec::new(), &mut run)
     }
 }
@@ -134,35 +145,7 @@ pub fn cmo3_bytes() -> Vec<u8> {
 
 /// Existing ArtPath metadata layouts with two listed brushes, packaged by `caff_with_xml`.
 pub(crate) fn artpath_cmo3_xml() -> String {
-    let point = |guid: &str, x: i32| format!("<CArtPathPoint><CArtPathPointGuid xs.n='ctrlPtId' uuid='{guid}'/>\
-        <CSplineCurvePoint xs.n='curvePointPosition'><GVector2 xs.n='point'><f xs.n='x'>{x}</f><f xs.n='y'>2</f></GVector2>\
-        <GVector2 xs.n='startVelocity'><f xs.n='x'>0</f><f xs.n='y'>0</f></GVector2>\
-        <GVector2 xs.n='endVelocity'><f xs.n='x'>0</f><f xs.n='y'>0</f></GVector2></CSplineCurvePoint>\
-        <b xs.n='isCorner'>false</b><f xs.n='colorRed'>1</f><f xs.n='colorGreen'>1</f><f xs.n='colorBlue'>1</f>\
-        <f xs.n='colorAlpha'>1</f><f xs.n='opacity'>1</f><f xs.n='width'>3</f></CArtPathPoint>");
-    let path = format!("<CArtPathSource xs.id='path'><ACDrawableSource xs.n='super'>\
-        <CDrawableGuid xs.n='guid' uuid='path-guid'/><CDrawableId xs.n='id' idstr='path'/><s xs.n='localName'>Path</s>\
-        <CPartGuid xs.n='parentGuid' uuid='part-guid'/><carray_list xs.n='clipGuidList' count='0'/>\
-        <b xs.n='invertClippingMask'>false</b></ACDrawableSource><CArtPathBrushGuid xs.n='brushGuid' uuid='brush-guid'/>\
-        <LineAlgorithm xs.n='lineAlgorithm' v='LCNS'/><LineAlignment xs.n='lineAlignment' v='CENTER'/>\
-        <b xs.n='isClosed'>false</b><i xs.n='divNum'>20</i>\
-        <carray_list xs.n='keyforms' count='1'><CArtPathForm><ACDrawableForm xs.n='super'>\
-        <i xs.n='drawOrder'>950</i><f xs.n='opacity'>1</f><ACForm xs.n='super'>\
-        <CFormGuid xs.n='guid' uuid='path-form'/><CArtPathSource xs.n='_source' xs.ref='path'/></ACForm>\
-        <CoordType xs.n='coordType'><s xs.n='coordName'>Canvas</s></CoordType></ACDrawableForm>\
-        <carray_list xs.n='positions' count='2'>{}{}</carray_list></CArtPathForm></carray_list></CArtPathSource>",
-        point("point-a", 1), point("point-b", 5));
-    CMO3_XML.replace("<CArtMeshSource xs.id='mesh'><ACDrawableSource xs.n='super'>",
-        "<CArtMeshSource xs.id='mesh'><ACDrawableSource xs.n='super'><s xs.n='localName'>Mesh</s>")
-        .replace("<carray_list xs.n='_sources' count='1'><CArtMeshSource xs.ref='mesh'/></carray_list>",
-        "<carray_list xs.n='_sources' count='2'><CArtMeshSource xs.ref='mesh'/><CArtPathSource xs.ref='path'/></carray_list>")
-        .replace("</CArtMeshSource><CPartSource xs.id='part'>", &format!("</CArtMeshSource>{path}<CPartSource xs.id='part'>"))
-        .replace("<CPartId xs.n='id' idstr='root'/>", "<CPartId xs.n='id' idstr='root'/>\
-            <carray_list xs.n='_childGuids' count='2'><CArtMeshGuid uuid='mesh-guid'/><CDrawableGuid uuid='path-guid'/></carray_list>")
-        .replace("</CModelSource>", "<CArtPathBrushSetting xs.n='artPathBrushesSetting'><carray_list xs.n='brushes' count='2'>\
-            <CArtPathBrush><CArtPathBrushGuid xs.n='guid' uuid='brush-guid'/><CArtPathBrushId xs.n='id' idstr='Brush'/></CArtPathBrush>\
-            <CArtPathBrush><CArtPathBrushGuid xs.n='guid' uuid='brush-b'/><CArtPathBrushId xs.n='id' idstr='BrushB'/></CArtPathBrush>\
-            </carray_list></CArtPathBrushSetting></CModelSource>")
+    artpath_fixture::with_artpath(CMO3_XML)
 }
 
 /// `cmo3_bytes` with the ArtMesh keyed at -1 and 1 on `ParamTest`.

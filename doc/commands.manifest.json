@@ -14969,6 +14969,10 @@
     {
       "description": "Edit the stored values of control point index of one ArtPath form in the active CMO3 (stroke editing): position, startVelocity and endVelocity as [x,y], width (0 or more), opacity (0..1), color ([r,g,b] or [r,g,b,a] in 0..1) and corner. Every key is optional. ArtPaths are read and edited, not drawn. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels",
+        "Live2D source forms > Control point > Point index > Apply point"
+      ],
       "headless_ok": true,
       "id": "live2d_artpath_point_set",
       "inputSchema": {
