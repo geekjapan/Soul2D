@@ -8,6 +8,7 @@
 //! (`has_draft`). A native CMO3 holds its clips in the session only (`motion3Library`): those get the import,
 //! export and transport controls but no point or binding editing, as in D.
 
+use crate::editor_number_input::NumberInput;
 use eframe::egui;
 use serde_json::{json, Value};
 use soul2d_core::editor_controller::EditorController;
@@ -231,12 +232,17 @@ fn row_text(row: &Value, applied: bool) -> String {
 
 // ------------------------------------------------------------------------------------------ state
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PointValues {
+    time: f64,
+    value: f64,
+}
+
 struct PointDraft {
     curve: usize,
     number: usize,
-    time: f64,
-    value: f64,
+    time: NumberInput<f64>,
+    value: NumberInput<f64>,
     original_time: f64,
     original_value: f64,
     kind: String,
@@ -246,8 +252,15 @@ struct PointDraft {
 }
 
 impl PointDraft {
+    fn values(&self) -> Result<PointValues, String> {
+        match (self.time.value(), self.value.value()) {
+            (Ok(time), Ok(value)) if time.is_finite() && value.is_finite() => Ok(PointValues { time, value }),
+            _ => Err("Point time and value must be finite numbers.".into()),
+        }
+    }
+
     fn dirty(&self) -> bool {
-        self.time != self.original_time || self.value != self.original_value
+        self.values().map_or(true, |values| values.time != self.original_time || values.value != self.original_value)
     }
 }
 
@@ -368,8 +381,8 @@ impl Motion3Panel {
         self.point = Some(PointDraft {
             curve,
             number,
-            time: picked.time,
-            value: picked.value,
+            time: NumberInput::new(picked.time, "Time (seconds)", 0.01, f64::NEG_INFINITY..=f64::INFINITY, 6),
+            value: NumberInput::new(picked.value, "Value", 0.01, f64::NEG_INFINITY..=f64::INFINITY, 6),
             original_time: picked.time,
             original_value: picked.value,
             kind: picked.kind.clone(),
@@ -626,7 +639,11 @@ impl Motion3Panel {
     }
 
     fn apply_point(&mut self, controller: &mut EditorController, snapshot: &Value, outcome: &mut Outcome) -> Result<String, String> {
-        let draft = self.point.clone().filter(PointDraft::dirty).ok_or("There are no point changes to apply.")?;
+        let draft = self.point.as_ref().ok_or("There are no point changes to apply.")?;
+        let values = draft.values()?;
+        if values.time == draft.original_time && values.value == draft.original_value {
+            return Err("There are no point changes to apply.".into());
+        }
         let name = self.selected.clone();
         if draft.conflict || stored_motion(snapshot, &name) != Some(&draft.baseline) {
             if let Some(own) = self.point.as_mut() {
@@ -634,20 +651,18 @@ impl Motion3Panel {
             }
             return Err("Reload this Motion3 point before applying the stale draft.".into());
         }
-        if !draft.time.is_finite() || !draft.value.is_finite() {
-            return Err("Point time and value must be finite numbers.".into());
-        }
         let mut request = json!({"op": "motion3.point.set", "name": name, "curve": draft.curve, "point": draft.number});
-        if draft.time != draft.original_time {
-            request["time"] = json!(draft.time);
+        if values.time != draft.original_time {
+            request["time"] = json!(values.time);
         }
-        if draft.value != draft.original_value {
-            request["value"] = json!(draft.value);
+        if values.value != draft.original_value {
+            request["value"] = json!(values.value);
         }
+        let (curve, number) = (draft.curve, draft.number);
         call(controller, request)?;
         controller.pause();
         let motion = call(controller, json!({"op": "motion3.read", "name": name}))?;
-        self.load_point(&motion, draft.curve, draft.number)?;
+        self.load_point(&motion, curve, number)?;
         self.motion = Some(motion);
         outcome.changed = true;
         Ok("Motion3 point applied.".into())
@@ -779,8 +794,8 @@ impl Motion3Panel {
             ui.label(format!("Logical point {}: {}", point.number, point.kind));
             let editable = !self.missing && !point.conflict;
             ui.add_enabled_ui(editable, |ui| {
-                number_row(ui, "Time (seconds)", &mut point.time);
-                number_row(ui, "Value", &mut point.value);
+                point.time.show(ui);
+                point.value.show(ui);
             });
             let (dirty, conflict) = (point.dirty(), point.conflict);
             ui.horizontal(|ui| {
@@ -1141,6 +1156,32 @@ mod tests {
             self.frame(Vec::new())
         }
 
+        fn choose(&mut self, label: &str, choice: &str) {
+            let output = self.click(Role::ComboBox, label);
+            let role = output.iter().find(|(_,node)| crate::editor_test_support::name_of(&output,node).as_deref()==Some(choice))
+                .unwrap_or_else(|| panic!("missing choice {choice}")).1.role();
+            self.click(role, choice);
+        }
+
+        fn draft_binding(&mut self) {
+            self.choose("INX parameter", &format!("Move ({})", self.parameter));
+            self.choose("Axis", "Y");
+            self.click(Role::Button, "Add binding draft");
+            assert!(self.panel.bindings.as_ref().unwrap().dirty());
+        }
+
+        fn click_observing(&mut self, label: &str, mut observe: impl FnMut(&Motion3Panel, &EditorController)) {
+            let (panel,controller,looping) = (&mut self.panel,&mut self.controller,&mut self.looping);
+            self.harness.click(Role::Button,label,|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| {
+                    egui::ScrollArea::vertical().show(ui,|ui| {
+                        panel.show(ui,controller,looping);
+                        observe(panel,controller);
+                    });
+                });
+            });
+        }
+
         fn click(&mut self, role: Role, label: &str) -> crate::editor_test_support::Out {
             let (panel, controller, looping) = (&mut self.panel, &mut self.controller, &mut self.looping);
             self.harness.click(role, label, |ctx| {
@@ -1245,14 +1286,14 @@ mod tests {
         assert_eq!(rig.controller.core_request(&json!({"op":"motion3.point.set", "name":"Wave",
             "curve":0,"point":0,"value":9.5}))["succeeded"], true);
         let before = rig.snapshot(); let output = rig.draw();
-        assert_eq!(rig.panel.point.as_ref().unwrap().value, 9.5);
+        assert_eq!(rig.panel.point.as_ref().unwrap().value.value().unwrap(), 9.5);
         assert!(!rig.panel.has_draft());
         assert!(!texts(&output).iter().any(|text|text=="2.0000000000000"));
         rig.click(Role::SpinButton, "Value");
         let key = |pressed|egui::Event::Key {key:egui::Key::End,physical_key:None,pressed,repeat:false,
             modifiers:egui::Modifiers::NONE};
         rig.frame(vec![key(true),key(false),egui::Event::Text("0".into())]); rig.frame(Vec::new());
-        assert_eq!(rig.panel.point.as_ref().unwrap().value, 9.5);
+        assert_eq!(rig.panel.point.as_ref().unwrap().value.value().unwrap(), 9.5);
         assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(), before);
     }
 
@@ -1266,7 +1307,7 @@ mod tests {
             let before = rig.snapshot(); rig.number_text(field, raw);
             assert_eq!(rig.snapshot(), before);
             if let Some(expected) = expected {
-                let point = rig.panel.point.as_ref().unwrap();
+                let point = rig.panel.point.as_ref().unwrap().values().unwrap();
                 assert_eq!(if field=="Value" {point.value} else {point.time}, expected, "{field} {raw}");
                 assert_eq!(rig.panel.has_draft(), expected != if field=="Value" {2.0} else {0.0});
             } else {
@@ -1291,7 +1332,7 @@ mod tests {
             rig.frame(vec![key(egui::Key::End,true,egui::Modifiers::NONE),key(egui::Key::End,false,egui::Modifiers::NONE),
                 egui::Event::Text(suffix.into())]); rig.frame(Vec::new());
             let expected = format!("{initial}{suffix}").parse::<f64>().unwrap();
-            let point = rig.panel.point.as_ref().unwrap();
+            let point = rig.panel.point.as_ref().unwrap().values().unwrap();
             assert_eq!(if field=="Value" {point.value} else {point.time}, expected);
             assert_eq!(rig.snapshot(), before);
         }
@@ -1308,7 +1349,7 @@ mod tests {
             let key = |pressed|egui::Event::Key {key:egui::Key::Tab,physical_key:None,pressed,repeat:false,
                 modifiers:egui::Modifiers::NONE};
             rig.frame(vec![key(true),key(false)]); rig.frame(Vec::new()); rig.frame(Vec::new());
-            let point = rig.panel.point.as_ref().unwrap();
+            let point = rig.panel.point.as_ref().unwrap().values().unwrap();
             assert_eq!(if field=="Value" {point.value} else {point.time}, 0.1234567890123456);
             assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(), before);
         }
@@ -1338,17 +1379,235 @@ mod tests {
     }
 
     #[test]
+    fn motion3_raw_binding_actions_preserve_unfinished_point_input_and_unknown_rows() {
+        let mut rig = Rig::new("motion3-raw-binding-sibling"); rig.import();
+        let unknown = json!({"id":"Bezier","parameter":rig.parameter,"axis":0,"future":{"keep":true}});
+        assert_eq!(rig.controller.core_request(&json!({"op":"motion3.bind","name":"Wave",
+            "bindings":[unknown.clone()],"preserve_unknown":true}))["succeeded"],true);
+        rig.draw(); rig.draft_binding(); rig.number_text("Value","pending-binding-sibling");
+        let baseline = rig.panel.point.as_ref().unwrap().baseline.clone();
+        let start = rig.snapshot()["revision"].as_u64().unwrap(); let mut applied = 0;
+        rig.click_observing("Apply bindings",|panel,controller| {
+            if controller.snapshot()["revision"].as_u64().unwrap()>start {
+                applied += 1;
+                let point = panel.point.as_ref().unwrap();
+                assert!(point.values().is_err() && point.baseline==baseline && !point.conflict);
+                assert!(!panel.bindings.as_ref().unwrap().dirty());
+                assert_eq!(controller.snapshot()["model"]["live2d"]["motionBindings"]["Wave"][0],unknown);
+            }
+        });
+        assert!(applied>0); assert_eq!(rig.snapshot()["revision"].as_u64().unwrap(),start+1);
+        let before = rig.snapshot();
+        for action in ["Reload bindings","Discard binding draft"] {
+            rig.click(Role::Button,"Remove binding draft");
+            assert!(rig.panel.bindings.as_ref().unwrap().dirty());
+            rig.click(Role::Button,action);
+            assert!(!rig.panel.bindings.as_ref().unwrap().dirty());
+            assert!(rig.panel.point.as_ref().unwrap().values().is_err());
+            assert_eq!(rig.panel.point.as_ref().unwrap().baseline,baseline);
+            assert!(texts(&rig.draw()).iter().any(|text|text=="pending-binding-sibling"));
+            assert_eq!(rig.snapshot(),before);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_point_actions_preserve_the_binding_draft_in_each_invocation() {
+        for action in ["Apply point","Reload point","Discard point draft"] {
+            let mut rig = Rig::new(&format!("motion3-raw-point-sibling-{action}")); rig.import(); rig.draw(); rig.draft_binding();
+            let binding = rig.panel.bindings.as_ref().unwrap().clone();
+            let chooser = (rig.panel.bind_parameter,rig.panel.bind_axis);
+            rig.number_text("Value",if action=="Apply point" {"9.5"} else {"pending-point-sibling"});
+            let before = rig.snapshot(); let start = before["revision"].as_u64().unwrap(); let mut committed = 0;
+            rig.click_observing(action,|panel,controller| {
+                assert_eq!(panel.bindings.as_ref().unwrap(),&binding);
+                assert_eq!((panel.bind_parameter,panel.bind_axis),chooser);
+                if controller.snapshot()["revision"].as_u64().unwrap()>start {
+                    committed += 1; assert!(!panel.point.as_ref().unwrap().dirty());
+                }
+            });
+            assert_eq!(committed>0,action=="Apply point");
+            assert!(rig.panel.bindings.as_ref().unwrap().dirty());
+            assert!(!rig.panel.point.as_ref().unwrap().dirty());
+            assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,if action=="Apply point" {9.5}else{2.0});
+            assert!(!texts(&rig.draw()).iter().any(|text|text=="pending-point-sibling"));
+            if action!="Apply point" {assert_eq!(rig.snapshot(),before);}
+        }
+    }
+
+    #[test]
+    fn motion3_raw_backend_and_partial_refusals_preserve_the_existing_redo_branch() {
+        for raw in ["−0.5","-"] {
+            let mut rig = Rig::new(&format!("motion3-raw-redo-{raw}")); rig.import(); rig.draw();
+            rig.number_text("Value","9.5"); rig.click(Role::Button,"Apply point");
+            let applied = rig.motion();
+            assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"],true); rig.draw();
+            rig.number_text("Value","5.25"); rig.number_text("Time (seconds)",raw);
+            let before = rig.snapshot(); assert_eq!(before["canRedo"],true);
+            rig.click(Role::Button,"Apply point");
+            assert_eq!(rig.snapshot(),before);
+            assert!(rig.panel.has_draft() && !rig.panel.error.is_empty());
+            if raw=="−0.5" {assert!(rig.panel.error.contains("nonnegative"));}
+            assert!(texts(&rig.draw()).iter().any(|text|text==raw));
+            assert_eq!(rig.controller.core_request(&json!({"op":"redo"}))["succeeded"],true);
+            assert_eq!(rig.motion(),applied);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_single_member_apply_keeps_other_precision_with_history_and_reopen() {
+        for (field,other_slot,edited_slot,new_value) in [("Time (seconds)",1,0,0.25),("Value",0,1,5.25)] {
+            let mut rig = Rig::new(&format!("motion3-raw-precision-save-{field}"));
+            let mut fixture = fixture(); fixture["Curves"][0]["Segments"][other_slot]=json!(0.1234567890123456);
+            fixture["Meta"]["AreBeziersRestricted"]=json!(field=="Value"); fixture["future"]=json!({"keep":true});
+            std::fs::write(rig.dir.join("wave.motion3.json"),fixture.to_string()).unwrap(); rig.import(); rig.draw();
+            let original = rig.motion(); let mut expected = original.clone(); expected["Curves"][0]["Segments"][edited_slot]=json!(new_value);
+            let start = rig.snapshot()["revision"].as_u64().unwrap();
+            rig.number_text(field,&new_value.to_string()); rig.click(Role::Button,"Apply point");
+            assert_eq!(rig.snapshot()["revision"].as_u64().unwrap(),start+1);
+            assert_eq!(rig.motion(),expected); assert!(!rig.panel.has_draft());
+            assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"],true); assert_eq!(rig.motion(),original);
+            assert_eq!(rig.controller.core_request(&json!({"op":"redo"}))["succeeded"],true); assert_eq!(rig.motion(),expected);
+            let path = rig.dir.join("edited.inx");
+            assert_eq!(rig.controller.core_request(&json!({"op":"save","path":path}))["succeeded"],true);
+            let mut reopened = EditorController::new();
+            assert_eq!(reopened.core_request(&json!({"op":"open","path":path}))["succeeded"],true);
+            assert_eq!(reopened.core_request(&json!({"op":"motion3.read","name":"Wave"}))["result"],expected);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_all_logical_point_kinds_keep_unfinished_input_until_reload() {
+        for (curve,index) in [(0,0),(0,1),(1,1),(1,2),(1,3),(2,1),(3,1)] {
+            for field in ["Time (seconds)","Value"] {
+                let mut rig = Rig::new(&format!("motion3-raw-kind-{curve}-{index}-{field}")); rig.import(); rig.draw();
+                let motion = rig.motion();
+                rig.choose("Curve",&curve_title(&motion["Curves"][curve],curve));
+                let point = curve_points(&motion,curve).unwrap()[index].clone();
+                rig.choose("Logical point",&point_title(&point));
+                let before = rig.snapshot(); rig.number_text(field,"pending-point-kind");
+                rig.click(Role::Button,"Apply point");
+                assert_eq!(rig.snapshot(),before); assert!(rig.panel.has_draft());
+                assert!(texts(&rig.draw()).iter().any(|text|text=="pending-point-kind"));
+                rig.click(Role::Button,"Reload point");
+                let loaded = rig.panel.point.as_ref().unwrap();
+                assert_eq!((loaded.curve,loaded.number),(curve,index));
+                assert_eq!(loaded.values().unwrap(),PointValues {time:point.time,value:point.value});
+                assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(),before);
+            }
+        }
+    }
+
+    #[test]
+    fn motion3_raw_stale_accessibility_targets_cannot_edit_a_reloaded_point() {
+        let mut rig = Rig::new("motion3-raw-accessibility-reload"); rig.import();
+        let output = rig.draw(); let target = output.iter().find(|(_,node)|node.role()==Role::SpinButton &&
+            crate::editor_test_support::name_of(&output,node).as_deref()==Some("Value")).unwrap().0;
+        rig.number_text("Value","pending-old-widget"); rig.click(Role::Button,"Reload point");
+        let before = rig.snapshot();
+        let event = |target|egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action:egui::accesskit::Action::SetValue,target,data:Some(egui::accesskit::ActionData::NumericValue(9.5)) });
+        rig.frame(vec![event(target)]); rig.draw();
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,2.0); assert!(!rig.panel.has_draft());
+        let output = rig.draw(); let current = output.iter().find(|(_,node)|node.role()==Role::SpinButton &&
+            crate::editor_test_support::name_of(&output,node).as_deref()==Some("Value")).unwrap().0;
+        assert_ne!(current,target); rig.frame(vec![event(current)]);
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,9.5); assert!(rig.panel.has_draft());
+        assert_eq!(rig.snapshot(),before);
+    }
+
+    #[test]
+    fn motion3_raw_keyboard_accessibility_and_shift_drag_keep_native_numeric_controls() {
+        let mut rig = Rig::new("motion3-raw-gestures"); rig.import(); rig.draw(); let before = rig.snapshot();
+        for (action,data,expected) in [(egui::accesskit::Action::SetValue,Some(egui::accesskit::ActionData::NumericValue(5.25)),5.25),
+            (egui::accesskit::Action::Increment,None,5.26),(egui::accesskit::Action::Decrement,None,5.25)] {
+            let output = rig.draw(); let target = output.iter().find(|(_,node)|node.role()==Role::SpinButton &&
+                crate::editor_test_support::name_of(&output,node).as_deref()==Some("Value")).unwrap().0;
+            rig.frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {action,target,data})]);
+            assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,expected);
+        }
+        rig.number_text("Value","-");
+        let key = |key,pressed|egui::Event::Key {key,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::NONE};
+        rig.frame(vec![key(egui::Key::ArrowUp,true),key(egui::Key::ArrowUp,false)]);
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,5.26);
+        rig.frame(vec![key(egui::Key::ArrowDown,true),key(egui::Key::ArrowDown,false)]);
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,5.25);
+        rig.click(Role::SpinButton,"Time (seconds)"); rig.frame(vec![key(egui::Key::Tab,true),key(egui::Key::Tab,false)]);
+        let select = |pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+        rig.frame(vec![select(true),select(false),egui::Event::Text("6.5".into())]);
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,6.5); assert_eq!(rig.snapshot(),before);
+        let mut deltas = Vec::new();
+        for shift in [false,true] {
+            let mut rig = Rig::new(&format!("motion3-raw-fine-drag-{shift}")); rig.import(); let output = rig.draw();
+            let before = rig.snapshot(); let from = crate::editor_test_support::center(&output,Role::SpinButton,"Value");
+            let modifiers = if shift {egui::Modifiers::SHIFT}else{egui::Modifiers::NONE};
+            let press = |pos,pressed|egui::Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed,modifiers};
+            for events in [vec![egui::Event::PointerMoved(from),press(from,true)],
+                vec![egui::Event::PointerMoved(from+egui::vec2(10.0,0.0))],vec![egui::Event::PointerMoved(from+egui::vec2(20.0,0.0))],
+                vec![press(from+egui::vec2(20.0,0.0),false)],Vec::new()] {
+                rig.harness.next_input=Some(Box::new(move|input|input.modifiers=modifiers)); rig.frame(events);
+            }
+            deltas.push(rig.panel.point.as_ref().unwrap().values().unwrap().value-2.0); assert_eq!(rig.snapshot(),before);
+        }
+        assert!(deltas[0]>deltas[1] && deltas[1]>0.0,"fine dragging: {deltas:?}");
+    }
+
+    #[test]
+    fn motion3_raw_error_and_status_updates_keep_the_active_keyboard_input() {
+        let mut rig = Rig::new("motion3-raw-status-focus"); rig.import(); rig.draw(); rig.number_text("Value","3");
+        let before = rig.snapshot(); let focus = rig.harness.ctx.memory(|memory|memory.focused()).unwrap();
+        for (click,suffix,expected,error) in [(Click::BindParameter(rig.parameter as u32),"4",34.0,false),
+            (Click::Sample,"5",345.0,false),(Click::Export,"6",3456.0,true)] {
+            let snapshot = rig.snapshot(); let mut outcome = Outcome::default();
+            rig.panel.perform(click,&mut rig.controller,&snapshot,&mut outcome);
+            let output = rig.frame(Vec::new());
+            assert_eq!(rig.harness.ctx.memory(|memory|memory.focused()),Some(focus));
+            if error {
+                assert!(!rig.panel.error.is_empty()); assert!(texts(&output).contains(&rig.panel.error));
+            } else if !rig.panel.status.is_empty() {assert!(texts(&output).contains(&rig.panel.status));}
+            let key = |pressed|egui::Event::Key {key:egui::Key::End,physical_key:None,pressed,repeat:false,
+                modifiers:egui::Modifiers::NONE};
+            rig.frame(vec![key(true),key(false),egui::Event::Text(suffix.into())]); rig.frame(Vec::new());
+            assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,expected);
+            assert_eq!(rig.snapshot(),before);
+        }
+    }
+
+    #[test]
+    fn motion3_raw_missing_motion_and_reset_preserve_or_replace_the_correct_owner() {
+        let mut rig = Rig::new("motion3-raw-missing-reset"); rig.import(); rig.draw(); rig.draft_binding();
+        rig.number_text("Value","pending-missing-point");
+        let baseline = rig.panel.point.as_ref().unwrap().baseline.clone(); let bindings = rig.panel.bindings.as_ref().unwrap().rows.clone();
+        rig.controller.allow_replace_unsaved(true);
+        assert_eq!(rig.controller.core_request(&json!({"op":"new"}))["succeeded"],true); rig.draw();
+        let before = rig.snapshot();
+        assert!(rig.panel.point.as_ref().unwrap().conflict && rig.panel.bindings.as_ref().unwrap().conflict);
+        let mut outcome = Outcome::default(); rig.panel.perform(Click::ReloadPoint,&mut rig.controller,&before,&mut outcome);
+        assert_eq!(rig.panel.point.as_ref().unwrap().baseline,baseline);
+        assert!(rig.panel.point.as_ref().unwrap().values().is_err());
+        assert_eq!(rig.panel.bindings.as_ref().unwrap().rows,bindings);
+        rig.click(Role::Button,"Discard point draft");
+        assert!(rig.panel.point.is_none() && rig.panel.bindings.as_ref().unwrap().dirty());
+        assert_eq!(rig.panel.selected(),"Wave");
+        rig.click(Role::Button,"Discard binding draft"); rig.draw();
+        assert_eq!(rig.panel.selected(),""); assert!(!rig.panel.has_draft()); assert_eq!(rig.snapshot(),before);
+        rig.import(); rig.draw(); rig.number_text("Value","pending-reset-point"); rig.panel.reset(); rig.draw();
+        assert!(!rig.panel.has_draft()); rig.choose("Motion3","Wave"); let output = rig.draw();
+        assert_eq!(rig.panel.point.as_ref().unwrap().values().unwrap().value,2.0); assert!(!rig.panel.has_draft());
+        assert!(!texts(&output).iter().any(|text|text=="pending-reset-point"));
+    }
+
+    #[test]
     fn a_point_draft_applies_as_one_undo_step_blocks_switching_and_detects_conflicts() {
         let mut rig = Rig::new("motion3-point");
         rig.import();
         rig.draw();
         let draft = rig.panel.point.as_ref().unwrap();
-        assert_eq!((draft.time, draft.value, draft.kind.as_str()), (0.0, 2.0, "Initial point"));
+        assert_eq!((draft.time.value().unwrap(), draft.value.value().unwrap(), draft.kind.as_str()), (0.0, 2.0, "Initial point"));
         assert!(!rig.panel.has_draft());
         // Move to the endpoint of the Linear curve and change it.
         let motion = rig.motion();
         rig.panel.load_point(&motion, 0, 1).unwrap();
-        rig.panel.point.as_mut().unwrap().value = 9.5;
+        rig.number_text("Value", "9.5");
         assert!(rig.panel.has_draft());
         let revision = rig.snapshot()["revision"].clone();
         rig.click(Role::Button, "Export Motion3");
@@ -1370,7 +1629,7 @@ mod tests {
         rig.draw();
         let motion = rig.motion();
         rig.panel.load_point(&motion, 0, 1).unwrap();
-        rig.panel.point.as_mut().unwrap().time = 1.5;
+        rig.number_text("Time (seconds)", "1.5");
         rig.controller.core_request(&json!({"op": "motion3.point.set", "name": "Wave", "curve": 0, "point": 1, "value": 7.0}));
         rig.draw();
         assert!(rig.panel.point.as_ref().unwrap().conflict);
@@ -1381,10 +1640,10 @@ mod tests {
         rig.click(Role::Button, "Reload conflicted point");
         let reloaded = rig.panel.point.as_ref().unwrap();
         assert!(!reloaded.conflict && !rig.panel.has_draft());
-        assert_eq!((reloaded.time, reloaded.value), (1.0, 7.0), "the document's point is back in the draft");
+        assert_eq!((reloaded.time.value().unwrap(), reloaded.value.value().unwrap()), (1.0, 7.0), "the document's point is back in the draft");
 
         // Non-finite input is refused at Apply.
-        rig.panel.point.as_mut().unwrap().value = f64::NAN;
+        rig.number_text("Value", "NaN");
         let revision = rig.snapshot()["revision"].clone();
         rig.click(Role::Button, "Apply point");
         assert_eq!(rig.panel.error, "Point time and value must be finite numbers.");
@@ -1537,7 +1796,7 @@ mod tests {
         let mut rig = Rig::new("motion3-reset");
         rig.import();
         rig.draw();
-        rig.panel.point.as_mut().unwrap().value = 3.0;
+        rig.number_text("Value", "3");
         // A different document (new) takes the motion away; the editor refuses the replacement while a draft is open.
         rig.controller.allow_replace_unsaved(true);
         assert_eq!(rig.controller.core_request(&json!({"op": "new"}))["succeeded"], true);

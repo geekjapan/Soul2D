@@ -1975,3 +1975,26 @@ CAN3 player; a Part with opacity curves becomes a 0..1 parameter with opacity
 bindings and one lane per scene. Keyed ArtMesh draw order and opacity become
 zSort and opacity bindings. The answer lists what was baked and what was not
 converted.
+
+## INX Motion3 point input
+
+The INX **Live2D Motion3** panel retains unfinished or nonfinite **Time (seconds)**
+and **Value** text after focus moves. **Apply point** validates both fields before
+sending one request containing only changed members. Pending point input blocks
+save, export, document replacement and shutdown. Numeric-equivalent text remains
+clean, and focusing a loaded number does not round its stored precision. The
+controls accept finite negative Time; the backend refuses it when Apply runs.
+
+Point and binding drafts remain independent. Applying, reloading or discarding
+one preserves the other. Point conflicts compare the whole selected motion;
+binding conflicts compare mapping rows. An unrelated document revision does not
+rebase a point. Missing targets retain dirty input until explicit discard.
+Reloading a point or replacing the document creates a fresh editing view, even
+at the same point coordinates. Conditional notices preserve keyboard focus.
+The authored controls share the Forms numeric component; Preview time retains
+its separate transient behavior.
+
+The `motion3_raw_` CPU tests cover the actual editor frame, native Save action
+dispatch, host MCP save, replacement, Close, EOF, export, accessible numeric
+controls, history and INX save/reopen. Physical native input, vendor roundtrip
+and real-provider behavior require separate acceptance.

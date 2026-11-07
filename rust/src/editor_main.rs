@@ -8,6 +8,7 @@ mod editor_live2d_objects;
 mod editor_mesh_tools;
 mod editor_motion3;
 mod editor_motion_sync;
+mod editor_number_input;
 mod editor_part_split;
 mod editor_physics_groups;
 mod editor_psd_depth;
