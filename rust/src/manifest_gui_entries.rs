@@ -164,9 +164,15 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("editor_layout_reset", &[
         "View > Reset Layout",
     ]),
+    ("editor_live2d_forms_discard", &[
+        "Live2D source forms > Discard main edits / Reload form / Reload forms",
+    ]),
     ("editor_live2d_objects_discard", &[
         "Live2D objects > Reload and discard all object edits",
         "Live2D panels",
+    ]),
+    ("editor_motion3_discard", &[
+        "Live2D Motion3 > Discard point edits / Reload point / Discard bindings / Reload bindings / Reload motion",
     ]),
     ("editor_native_parameters_set", &[
         "Outline > Live2D native preview > Model parameters / facial controls > Native parameter filter",

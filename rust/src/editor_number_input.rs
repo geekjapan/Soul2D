@@ -4,6 +4,13 @@ use std::{cell::{Cell, RefCell}, ops::RangeInclusive, sync::atomic::{AtomicU64, 
 enum Content<T> { Value(T), Text(String) }
 enum Change { Text(String), Number(f64) }
 
+pub(crate) fn new_input_view() -> egui::Id {
+    static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_VIEW.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("Forms numeric view identity exhausted");
+    egui::Id::new(("editor-number", id))
+}
+
 pub(crate) struct NumberInput<T> {
     content: Content<T>,
     seed: f64,
@@ -21,11 +28,8 @@ fn finite(raw: &str) -> Option<f64> {
 
 impl<T: egui::emath::Numeric + ToString> NumberInput<T> {
     pub(crate) fn new(value: T, label: &'static str, speed: f64, range: RangeInclusive<f64>, max_decimals: usize) -> Self {
-        static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_VIEW.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("Forms numeric view identity exhausted");
         Self { content: Content::Value(value), seed: value.to_f64(), label, speed, range, max_decimals,
-            view_id: egui::Id::new(("editor-number", id)) }
+            view_id: new_input_view() }
     }
 
     pub(crate) fn value(&self) -> Result<T, String> {

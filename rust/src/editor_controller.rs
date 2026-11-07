@@ -24,6 +24,55 @@ pub const NODE_INSERT_CLASSES: &[&str] = &[
 
 pub use crate::nodes::{DropSite, ParameterUse};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormsInputAction {
+    DiscardMain,
+    ReloadForm,
+    ReloadForms,
+}
+
+impl FormsInputAction {
+    pub const ALL: [Self; 3] = [Self::DiscardMain, Self::ReloadForm, Self::ReloadForms];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DiscardMain => "discard_main",
+            Self::ReloadForm => "reload_form",
+            Self::ReloadForms => "reload_forms",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion3InputAction {
+    DiscardPoint,
+    ReloadPoint,
+    DiscardBindings,
+    ReloadBindings,
+    ReloadMotion,
+}
+
+impl Motion3InputAction {
+    pub const ALL: [Self; 5] = [Self::DiscardPoint, Self::ReloadPoint, Self::DiscardBindings,
+        Self::ReloadBindings, Self::ReloadMotion];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DiscardPoint => "discard_point", Self::ReloadPoint => "reload_point",
+            Self::DiscardBindings => "discard_bindings", Self::ReloadBindings => "reload_bindings",
+            Self::ReloadMotion => "reload_motion",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
 pub fn node_convert_classes(current_type: &str) -> &'static [&'static str] {
     match current_type {
         "Node" => &["MeshGroup", "DynamicComposite", "GridDeformer"],

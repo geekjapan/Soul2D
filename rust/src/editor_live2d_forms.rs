@@ -2,9 +2,10 @@
 
 use eframe::egui;
 use serde_json::{json, Map, Value};
-use soul2d_core::editor_controller::EditorController;
+use soul2d_core::editor_controller::{EditorController, FormsInputAction};
 
-use crate::editor_number_input::NumberInput;
+use crate::editor_input_epoch::{InputEpoch, InputEpochs, InputRefusal};
+use crate::editor_number_input::{new_input_view, NumberInput};
 
 fn number_values<const N: usize>(input: &[NumberInput<f64>; N]) -> Result<[f64; N], String> {
     let mut values = [0.0; N];
@@ -458,6 +459,7 @@ impl PointValues {
 }
 
 struct PointInput {
+    view_id: egui::Id,
     position: [String; 2],
     start_velocity: [String; 2],
     end_velocity: [String; 2],
@@ -470,6 +472,7 @@ struct PointInput {
 impl PointInput {
     fn from_values(values: &PointValues) -> Self {
         Self {
+            view_id: new_input_view(),
             position: values.position.map(|value| value.to_string()),
             start_velocity: values.start_velocity.map(|value| value.to_string()),
             end_velocity: values.end_velocity.map(|value| value.to_string()),
@@ -500,19 +503,21 @@ impl PointInput {
                 ui.add(egui::TextEdit::singleline(text).desired_width(150.0)).labelled_by(caption.id).changed()
             }).inner
         }
-        let mut changed = false;
-        for (prefix, pair) in [("Position", &mut self.position), ("Start velocity", &mut self.start_velocity),
-            ("End velocity", &mut self.end_velocity)] {
-            for (axis, text) in ["X", "Y"].into_iter().zip(pair.iter_mut()) {
-                changed |= input(ui, &format!("{prefix} {axis}"), text);
+        ui.scope_builder(egui::UiBuilder::new().id(self.view_id), |ui| {
+            let mut changed = false;
+            for (prefix, pair) in [("Position", &mut self.position), ("Start velocity", &mut self.start_velocity),
+                ("End velocity", &mut self.end_velocity)] {
+                for (axis, text) in ["X", "Y"].into_iter().zip(pair.iter_mut()) {
+                    changed |= input(ui, &format!("{prefix} {axis}"), text);
+                }
             }
-        }
-        changed |= input(ui, "Point width", &mut self.width);
-        changed |= input(ui, "Point opacity", &mut self.opacity);
-        for (channel, text) in ["R", "G", "B", "A"].into_iter().zip(self.color.iter_mut()) {
-            changed |= input(ui, &format!("Point color {channel}"), text);
-        }
-        changed | ui.checkbox(&mut self.corner, "Corner").changed()
+            changed |= input(ui, "Point width", &mut self.width);
+            changed |= input(ui, "Point opacity", &mut self.opacity);
+            for (channel, text) in ["R", "G", "B", "A"].into_iter().zip(self.color.iter_mut()) {
+                changed |= input(ui, &format!("Point color {channel}"), text);
+            }
+            changed | ui.checkbox(&mut self.corner, "Corner").changed()
+        }).inner
     }
 }
 
@@ -593,6 +598,76 @@ impl MainDraft {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredSections {
+    form: bool,
+    source: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormReloadFailure {
+    MissingSource,
+    MissingForm,
+    InvalidStoredMetadata,
+    StoredUnreconciled,
+}
+
+impl FormReloadFailure {
+    fn state(self) -> &'static str {
+        match self {
+            Self::MissingSource => "missing_source", Self::MissingForm => "missing_form",
+            Self::InvalidStoredMetadata => "invalid_stored_metadata", Self::StoredUnreconciled => "stored_unreconciled",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct FormsDiscardTarget {
+    action: FormsInputAction,
+    identity: String,
+    key: FormKey,
+    choice: MainChoice,
+    review_label: String,
+}
+
+impl std::fmt::Debug for FormsDiscardTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormsDiscardTarget").field("action", &self.action).finish_non_exhaustive()
+    }
+}
+
+impl FormsDiscardTarget {
+    pub(crate) fn action(&self) -> FormsInputAction { self.action }
+    pub(crate) fn review_label(&self) -> &str { &self.review_label }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FormRetained {
+    main: bool,
+    form: bool,
+    source: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormsDiscardOutcome {
+    MainDiscarded,
+    FormReloaded,
+    FormsReset,
+    NativeIncomplete { reason:FormReloadFailure, retained:FormRetained },
+}
+
+impl FormsDiscardOutcome {
+    pub(crate) fn value(self) -> Value {
+        match self {
+            Self::MainDiscarded => json!({"state":"main_discarded"}),
+            Self::FormReloaded => json!({"state":"form_reloaded"}),
+            Self::FormsReset => json!({"state":"forms_reset"}),
+            Self::NativeIncomplete { reason, retained } => json!({"state":"native_incomplete", "reason":reason.state(),
+                "retained":{"main":retained.main, "formSettings":retained.form, "sourceSettings":retained.source}}),
+        }
+    }
+}
+
 /// The drafts of the stored settings of the selected source and form. The two halves are applied separately and
 /// share the revision they were loaded at.
 #[derive(Default)]
@@ -628,6 +703,11 @@ impl Stored {
 
 #[derive(Default)]
 pub struct FormEditor {
+    epochs: InputEpochs,
+    input_context: Option<InputEpoch>,
+    main_epoch: Option<InputEpoch>,
+    form_epoch: Option<InputEpoch>,
+    source_epoch: Option<InputEpoch>,
     source: String,
     form: String,
     coordinate: String,
@@ -652,6 +732,187 @@ impl FormEditor {
 
     pub fn has_draft(&self) -> bool {
         self.main.is_dirty() || self.stored.is_dirty()
+    }
+
+    fn input_identity(&self, action: FormsInputAction) -> Option<String> {
+        self.input_context?;
+        match action {
+            FormsInputAction::DiscardMain => self.epochs.identity(action.name(), &[self.input_context, self.main_epoch]),
+            FormsInputAction::ReloadForm | FormsInputAction::ReloadForms => self.epochs.identity(action.name(),
+                &[self.input_context, self.main_epoch, self.form_epoch, self.source_epoch]),
+        }
+    }
+
+    fn native_input_available(&self, action: FormsInputAction, snapshot: &Value) -> bool {
+        if snapshot["documentFormat"] != "live2d.cmo3" || self.input_context.is_none() { return false; }
+        let sources = snapshot["model"]["sources"].as_array().map(Vec::as_slice).unwrap_or_default();
+        if !sources.iter().any(editable_source) { return false; }
+        let source = sources.iter().find(|source| source["guid"].as_str() == Some(self.source.as_str()) && editable_source(source));
+        if source.is_none() && !self.has_draft() { return false; }
+        let forms = source.map(editable_forms).unwrap_or_default();
+        let form = forms.iter().copied().find(|form| same_form(form, &self.form, &self.coordinate));
+        if form.is_none() {
+            return action == FormsInputAction::ReloadForms && (forms.is_empty() || self.has_draft());
+        }
+        match action {
+            FormsInputAction::ReloadForm => true,
+            FormsInputAction::DiscardMain => self.main.is_dirty() && form.is_some_and(|form|
+                form["data"].get("positions").is_some() || form["data"]["type"] == "ArtPath"),
+            FormsInputAction::ReloadForms => false,
+        }
+    }
+
+    pub(crate) fn input_snapshot(&self, snapshot: &Value) -> Value {
+        let observation = |retained:bool, key:&FormKey, revision:u64, needs_form:bool, ready:bool| {
+            if !retained { return "none"; }
+            let source = snapshot["model"]["sources"].as_array().into_iter().flatten()
+                .find(|source| source["guid"].as_str() == Some(key.source.as_str()));
+            if source.is_none() || (needs_form && source.is_none_or(|source|
+                !editable_forms(source).iter().any(|form| same_form(form, &key.form, &key.coordinate)))) { "missing" }
+            else if !ready { "unreconciled" }
+            else if snapshot["revision"].as_u64() != Some(revision) { "stale" } else { "current" }
+        };
+        let main_key = match &self.main { MainDraft::Loaded(main) => &main.key, _ => &self.stored.key };
+        let main_revision = self.main.revision().unwrap_or(0);
+        let actions: Vec<_> = FormsInputAction::ALL.into_iter().map(|action| {
+            let available = self.native_input_available(action, snapshot);
+            let identity = available.then(|| self.input_identity(action)).flatten();
+            json!({"action":action.name(), "nativeAvailable":available, "discardable":identity.is_some(), "identity":identity})
+        }).collect();
+        json!({"owners":{
+            "main":{"retained":self.main_epoch.is_some(), "dirty":self.main_epoch.is_some() && self.main.is_dirty(),
+                "valid":self.main_epoch.map(|_| self.main.request().is_ok()),
+                "observation":if matches!(self.main, MainDraft::Unavailable { .. }) { "unavailable" }
+                    else { observation(self.main_epoch.is_some(), main_key, main_revision, true, true) }},
+            "formSettings":{"retained":self.form_epoch.is_some(), "dirty":self.form_epoch.is_some() && self.stored.form_dirty(),
+                "valid":self.form_epoch.map(|_| self.stored.form.values().is_ok()),
+                "observation":observation(self.form_epoch.is_some(), &self.stored.key, self.stored.revision, true, self.stored.loaded)},
+            "sourceSettings":{"retained":self.source_epoch.is_some(), "dirty":self.source_epoch.is_some() && self.stored.source_dirty(),
+                "valid":self.source_epoch.map(|_| self.stored.source.values().is_ok()),
+                "observation":observation(self.source_epoch.is_some(), &self.stored.key, self.stored.revision, false, self.stored.loaded)}},
+            "actions":actions})
+    }
+
+    pub(crate) fn capture_discard_target(&self, action:FormsInputAction, expected:&str, snapshot:&Value)
+        -> Result<FormsDiscardTarget, InputRefusal>
+    {
+        if !self.native_input_available(action, snapshot) { return Err(InputRefusal::Unavailable); }
+        let identity = self.input_identity(action).ok_or(InputRefusal::IdentityUnavailable)?;
+        if identity != expected { return Err(InputRefusal::StaleInput); }
+        let source = snapshot["model"]["sources"].as_array().into_iter().flatten()
+            .find(|source| source["guid"].as_str() == Some(self.source.as_str()));
+        let label = source.map(source_label).unwrap_or_else(|| self.source.clone());
+        let choice = self.main.choice();
+        let scope = match choice {
+            MainChoice::Vertex(index) => format!("vertex {index}"), MainChoice::FormOpacity => "form opacity".into(),
+            MainChoice::ArtPathPoint(index) => format!("ArtPath point {index}"),
+        };
+        Ok(FormsDiscardTarget { action, identity, key:self.form_key(), choice,
+            review_label:format!("{label} / form {} [{}] / {scope}", self.form, self.coordinate) })
+    }
+
+    pub(crate) fn check_discard_target(&self, target:&FormsDiscardTarget, snapshot:&Value) -> Result<(), InputRefusal> {
+        let identity = self.input_identity(target.action).ok_or(InputRefusal::IdentityUnavailable)?;
+        if self.form_key() != target.key || self.main.choice() != target.choice
+            || identity != target.identity {
+            return Err(InputRefusal::StaleInput);
+        }
+        if !self.native_input_available(target.action, snapshot) { return Err(InputRefusal::Unavailable); }
+        Ok(())
+    }
+
+    pub(crate) fn discard_if_current(&mut self, target:&FormsDiscardTarget, snapshot:&Value)
+        -> Result<FormsDiscardOutcome, InputRefusal>
+    {
+        self.check_discard_target(target, snapshot)?;
+        let old = (self.main_epoch, self.form_epoch, self.source_epoch);
+        self.perform_native_input_action(target.action, snapshot);
+        match target.action {
+            FormsInputAction::DiscardMain => Ok(FormsDiscardOutcome::MainDiscarded),
+            FormsInputAction::ReloadForms => Ok(FormsDiscardOutcome::FormsReset),
+            FormsInputAction::ReloadForm => {
+                let failure = self.settle_form_reload(snapshot).err();
+                let retained = FormRetained { main:old.0.is_some() && old.0 == self.main_epoch,
+                    form:old.1.is_some() && old.1 == self.form_epoch, source:old.2.is_some() && old.2 == self.source_epoch };
+                Ok(if let Some(reason) = failure {
+                    FormsDiscardOutcome::NativeIncomplete { reason, retained }
+                } else if retained.main || retained.form || retained.source {
+                    FormsDiscardOutcome::NativeIncomplete { reason:FormReloadFailure::StoredUnreconciled, retained }
+                } else { FormsDiscardOutcome::FormReloaded })
+            }
+        }
+    }
+
+    fn replace_main(&mut self, main: MainDraft) {
+        let unchanged_empty = match (&self.main, &main) {
+            (MainDraft::Unloaded(old), MainDraft::Unloaded(new)) => old == new,
+            (MainDraft::Unavailable { choice:old, message:old_message },
+                MainDraft::Unavailable { choice:new, message:new_message }) => old == new && old_message == new_message,
+            _ => false,
+        };
+        if !unchanged_empty {
+            self.input_context = Some(self.epochs.next());
+            self.main_epoch = matches!(main, MainDraft::Loaded(_)).then(|| self.epochs.next());
+        }
+        self.main = main;
+    }
+
+    fn perform_native_input_action(&mut self, action: FormsInputAction, snapshot: &Value) {
+        self.input_context = Some(self.epochs.next());
+        match action {
+            FormsInputAction::DiscardMain => {
+                self.replace_main(MainDraft::Unloaded(self.main.choice()));
+                self.conflict = self.stored.loaded && self.stored.is_dirty()
+                    && self.stored.revision != snapshot["revision"].as_u64().unwrap_or(0);
+                if !self.conflict { self.error.clear(); }
+                self.status.clear();
+            }
+            FormsInputAction::ReloadForm => {
+                self.replace_main(MainDraft::Unloaded(self.main.choice()));
+                self.conflict = false;
+                self.error.clear();
+                self.status.clear();
+                self.stored.loaded = false;
+            }
+            FormsInputAction::ReloadForms => self.reset(),
+        }
+    }
+
+    fn prepare_main(&mut self, form: &Value, revision: u64) {
+        if (form["data"].get("positions").is_some() || form["data"]["type"] == "ArtPath")
+            && !matches!(self.main, MainDraft::Loaded(_)) {
+            self.load_draft(form, revision);
+        }
+    }
+
+    fn prepare_stored(&mut self, source: &Value, form: Option<&Value>, revision: u64)
+        -> Result<StoredSections, FormReloadFailure>
+    {
+        let kind = source["data"]["type"].as_str().unwrap_or_default();
+        let sections = StoredSections {
+            form: form.is_some() && matches!(kind, "ArtMesh" | "Part" | "Rotation" | "Glue" | "ArtPath"),
+            source: matches!(kind, "ArtMesh" | "Part" | "ArtPath"),
+        };
+        if !sections.form && !sections.source { return Ok(sections); }
+        if kind == "ArtPath" && (source["data"]["closed"].as_bool().is_none()
+            || source["data"]["divisionCount"].as_u64().and_then(|n| u32::try_from(n).ok()).is_none()
+            || source["data"]["brushGuid"].as_str().is_none()) {
+            self.error = "ArtPath stored metadata is invalid".into();
+            return Err(FormReloadFailure::InvalidStoredMetadata);
+        }
+        self.sync_stored(source, form, revision, sections);
+        Ok(sections)
+    }
+
+    fn settle_form_reload(&mut self, snapshot: &Value) -> Result<StoredSections, FormReloadFailure> {
+        let source = snapshot["model"]["sources"].as_array().into_iter().flatten()
+            .find(|source| source["guid"].as_str() == Some(self.source.as_str()) && editable_source(source))
+            .ok_or(FormReloadFailure::MissingSource)?;
+        let form = editable_forms(source).into_iter().find(|form| same_form(form, &self.form, &self.coordinate))
+            .ok_or(FormReloadFailure::MissingForm)?;
+        let revision = snapshot["revision"].as_u64().unwrap_or(0);
+        self.prepare_main(form, revision);
+        self.prepare_stored(source, Some(form), revision)
     }
 
     #[cfg(test)]
@@ -707,7 +968,7 @@ impl FormEditor {
         })();
         match values {
             Ok(values) => {
-                self.main = MainDraft::Loaded(MainEdit { key: self.form_key(), revision, values });
+                self.replace_main(MainDraft::Loaded(MainEdit { key: self.form_key(), revision, values }));
                 if !(self.stored.loaded && self.stored.is_dirty() && self.stored.revision != revision) {
                     self.error.clear();
                     self.conflict = false;
@@ -715,7 +976,7 @@ impl FormEditor {
             }
             Err(message) => {
                 self.error = message.clone();
-                self.main = MainDraft::Unavailable { choice, message };
+                self.replace_main(MainDraft::Unavailable { choice, message });
             }
         }
     }
@@ -733,7 +994,8 @@ impl FormEditor {
             MainChoice::ArtPathPoint(index) => self.last_point = index,
             MainChoice::FormOpacity => {}
         }
-        self.main = MainDraft::Unloaded(choice);
+        self.input_context = Some(self.epochs.next());
+        self.replace_main(MainDraft::Unloaded(choice));
         self.error.clear();
         self.status.clear();
         Ok(())
@@ -749,7 +1011,8 @@ impl FormEditor {
         self.coordinate.clear();
         self.last_vertex = 0;
         self.last_point = 0;
-        self.main = MainDraft::default();
+        self.input_context = Some(self.epochs.next());
+        self.replace_main(MainDraft::default());
         self.conflict = false;
         self.error.clear();
     }
@@ -768,7 +1031,8 @@ impl FormEditor {
         self.coordinate = coordinate.to_owned();
         self.last_vertex = 0;
         self.last_point = 0;
-        self.main = MainDraft::Unloaded(choice);
+        self.input_context = Some(self.epochs.next());
+        self.replace_main(MainDraft::Unloaded(choice));
         self.conflict = false;
         self.error.clear();
     }
@@ -794,7 +1058,7 @@ impl FormEditor {
                 self.conflict = true;
                 self.error = "Document changed elsewhere. Your draft is preserved; reload before applying.".into();
             } else {
-                self.main = MainDraft::Unloaded(self.main.choice());
+                self.replace_main(MainDraft::Unloaded(self.main.choice()));
                 self.error.clear();
             }
         }
@@ -872,16 +1136,14 @@ impl FormEditor {
             if self.has_draft() {
                 ui.label("Reload discards the main edit, form settings and source settings.");
             }
-            if ui.button("Reload forms").clicked() {
-                self.reset();
+            if ui.add_enabled(self.native_input_available(FormsInputAction::ReloadForms, &snapshot), egui::Button::new("Reload forms")).clicked() {
+                self.perform_native_input_action(FormsInputAction::ReloadForms, &snapshot);
             }
             return changed;
         };
         let artpath = form["data"]["type"] == "ArtPath";
         let vertex_form = form["data"].get("positions").is_some();
-        if (vertex_form || artpath) && !matches!(self.main, MainDraft::Loaded(_)) {
-            self.load_draft(form, revision);
-        }
+        self.prepare_main(form, revision);
         let mut changed = false;
         let mut apply_main = false;
         if vertex_form || artpath {
@@ -959,17 +1221,15 @@ impl FormEditor {
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
             }
             if input_changed {
+                self.main_epoch = Some(self.epochs.next());
                 self.error.clear();
                 self.status.clear();
             }
             if self.main.is_dirty() {
                 ui.label("Apply or discard this edit before changing its mode or index.");
             }
-            if ui.add_enabled(self.main.is_dirty(), egui::Button::new("Discard main edit")).clicked() {
-                self.main = MainDraft::Unloaded(self.main.choice());
-                self.conflict = self.stored.loaded && self.stored.is_dirty() && self.stored.revision != revision;
-                if !self.conflict { self.error.clear(); }
-                self.status.clear();
+            if ui.add_enabled(self.native_input_available(FormsInputAction::DiscardMain, &snapshot), egui::Button::new("Discard main edit")).clicked() {
+                self.perform_native_input_action(FormsInputAction::DiscardMain, &snapshot);
                 apply_main = false;
             }
         }
@@ -980,12 +1240,8 @@ impl FormEditor {
         if self.has_draft() {
             ui.label("Reload discards the main edit, form settings and source settings.");
         }
-        if ui.button("Reload form").clicked() {
-            self.main = MainDraft::Unloaded(self.main.choice());
-            self.conflict = false;
-            self.error.clear();
-            self.status.clear();
-            self.stored.loaded = false;
+        if ui.add_enabled(self.native_input_available(FormsInputAction::ReloadForm, &snapshot), egui::Button::new("Reload form")).clicked() {
+            self.perform_native_input_action(FormsInputAction::ReloadForm, &snapshot);
             apply_main = false;
         }
         // Finish consuming this snapshot before a main edit advances the revision.
@@ -1006,7 +1262,7 @@ impl FormEditor {
 
     /// Loads the drafts of the stored settings when the selection changed, or when the document did and no draft
     /// would be lost; a draft the document outran is kept and marked as a conflict.
-    fn sync_stored(&mut self, source: &Value, form: Option<&Value>, revision: u64) {
+    fn sync_stored(&mut self, source: &Value, form: Option<&Value>, revision: u64, sections: StoredSections) {
         let key = self.form_key();
         let stored = &mut self.stored;
         if stored.loaded && stored.key == key && stored.revision != revision && stored.is_dirty() {
@@ -1016,6 +1272,8 @@ impl FormEditor {
             stored.load_form(form);
             stored.load_source(source);
             (stored.key, stored.revision, stored.loaded) = (key, revision, true);
+            self.form_epoch = sections.form.then(|| self.epochs.next());
+            self.source_epoch = sections.source.then(|| self.epochs.next());
         }
     }
 
@@ -1031,38 +1289,32 @@ impl FormEditor {
         brushes: &[Value],
     ) -> bool {
         let kind = source["data"]["type"].as_str().unwrap_or_default();
-        let form_settings = form.is_some() && matches!(kind, "ArtMesh" | "Part" | "Rotation" | "Glue" | "ArtPath");
-        let source_settings = matches!(kind, "ArtMesh" | "Part" | "ArtPath");
-        if !form_settings && !source_settings {
-            return false;
-        }
-        if kind == "ArtPath" && (source["data"]["closed"].as_bool().is_none()
-            || source["data"]["divisionCount"].as_u64().and_then(|n| u32::try_from(n).ok()).is_none()
-            || source["data"]["brushGuid"].as_str().is_none())
-        {
-            self.error = "ArtPath stored metadata is invalid".into();
-            ui.colored_label(egui::Color32::LIGHT_RED, self.error.as_str());
-            return false;
-        }
-        self.sync_stored(source, form, revision);
+        let sections = match self.prepare_stored(source, form, revision) {
+            Ok(sections) => sections,
+            Err(_) => { ui.colored_label(egui::Color32::LIGHT_RED, self.error.as_str()); return false; }
+        };
+        if !sections.form && !sections.source { return false; }
         ui.separator();
         ui.label("Stored settings");
         let (own, mut apply) = (self.source.clone(), None);
+        let (mut form_changed, mut source_changed) = (false, false);
         ui.add_enabled_ui(!self.conflict, |ui| {
             let stored = &mut self.stored;
-            if form_settings {
-                form_fields(ui, kind, &mut stored.form);
+            if sections.form {
+                form_changed |= form_fields(ui, kind, &mut stored.form);
                 if ui.add_enabled(stored.form_dirty(), egui::Button::new("Apply form settings")).clicked() {
                     apply = Some(Half::Form);
                 }
             }
-            if source_settings {
-                source_fields(ui, kind, &mut stored.source, masks, &own, brushes);
+            if sections.source {
+                source_changed |= source_fields(ui, kind, &mut stored.source, masks, &own, brushes);
                 if ui.add_enabled(stored.source_dirty(), egui::Button::new("Apply source settings")).clicked() {
                     apply = Some(Half::Source);
                 }
             }
         });
+        if form_changed { self.form_epoch = Some(self.epochs.next()); }
+        if source_changed { self.source_epoch = Some(self.epochs.next()); }
         apply.is_some_and(|half| self.apply_stored(controller, half, kind))
     }
 
@@ -1086,8 +1338,12 @@ impl FormEditor {
                         Half::Form => {
                             let form = editable_forms(source).into_iter().find(|form| same_form(form, &self.form, &self.coordinate));
                             self.stored.load_form(form);
+                            self.form_epoch = form.map(|_| self.epochs.next());
                         }
-                        Half::Source => self.stored.load_source(source),
+                        Half::Source => {
+                            self.stored.load_source(source);
+                            self.source_epoch = Some(self.epochs.next());
+                        }
                     }
                     self.stored.revision = snapshot["revision"].as_u64().unwrap_or(0);
                 } else {
@@ -1116,7 +1372,7 @@ impl FormEditor {
             Ok(()) => {
                 let snapshot = controller.snapshot().clone();
                 let revision = snapshot["revision"].as_u64().unwrap_or(0);
-                self.main = MainDraft::Unloaded(self.main.choice());
+                self.replace_main(MainDraft::Unloaded(self.main.choice()));
                 self.conflict = false;
                 if self.stored.loaded {
                     self.stored.revision = revision;
@@ -1151,31 +1407,34 @@ fn send(controller: &mut EditorController, request: Result<Value, String>) -> Re
     })
 }
 
-fn form_fields(ui: &mut egui::Ui, kind: &str, draft: &mut FormInputs) {
+fn form_fields(ui: &mut egui::Ui, kind: &str, draft: &mut FormInputs) -> bool {
+    let mut changed = false;
     if matches!(kind, "ArtMesh" | "ArtPath") {
-        draft.draw_order.show(ui);
+        changed |= draft.draw_order.show(ui).changed();
     }
     if matches!(kind, "ArtMesh" | "Part") {
-        for field in &mut draft.multiply { field.show(ui); }
-        for field in &mut draft.screen { field.show(ui); }
+        for field in &mut draft.multiply { changed |= field.show(ui).changed(); }
+        for field in &mut draft.screen { changed |= field.show(ui).changed(); }
     }
     if kind == "Rotation" {
-        draft.angle.show(ui);
-        draft.origin[0].show(ui);
-        draft.origin[1].show(ui);
-        draft.scale.show(ui);
-        ui.checkbox(&mut draft.reflect_x, "Reflect X");
-        ui.checkbox(&mut draft.reflect_y, "Reflect Y");
+        changed |= draft.angle.show(ui).changed();
+        changed |= draft.origin[0].show(ui).changed();
+        changed |= draft.origin[1].show(ui).changed();
+        changed |= draft.scale.show(ui).changed();
+        changed |= ui.checkbox(&mut draft.reflect_x, "Reflect X").changed();
+        changed |= ui.checkbox(&mut draft.reflect_y, "Reflect Y").changed();
     }
     if kind == "Glue" {
-        draft.intensity.show(ui);
+        changed |= draft.intensity.show(ui).changed();
     }
+    changed
 }
 
-fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks: &[(String, String)], own: &str, brushes: &[Value]) {
+fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks: &[(String, String)], own: &str, brushes: &[Value]) -> bool {
+    let mut changed = false;
     if kind == "ArtPath" {
-        ui.checkbox(&mut draft.closed, "Closed");
-        draft.division_count.show(ui);
+        changed |= ui.checkbox(&mut draft.closed, "Closed").changed();
+        changed |= draft.division_count.show(ui).changed();
         let label = |brush: &Value| format!("{} [{}]", brush["name"].as_str().filter(|name| !name.is_empty())
             .or_else(|| brush["id"].as_str()).unwrap_or("Brush"), brush["guid"].as_str().unwrap_or_default());
         let selected = brushes.iter().find(|brush| brush["guid"] == draft.brush_guid)
@@ -1184,7 +1443,7 @@ fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks:
             egui::ComboBox::from_label("Brush").selected_text(selected).show_ui(ui, |ui| {
                 for brush in brushes {
                     if let Some(guid) = brush["guid"].as_str() {
-                        ui.selectable_value(&mut draft.brush_guid, guid.to_owned(), label(brush));
+                        changed |= ui.selectable_value(&mut draft.brush_guid, guid.to_owned(), label(brush)).changed();
                     }
                 }
             });
@@ -1197,20 +1456,21 @@ fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks:
         for (label, names, value) in choices {
             egui::ComboBox::from_label(label).selected_text(value.as_str()).show_ui(ui, |ui| {
                 for name in names {
-                    ui.selectable_value(value, (*name).to_owned(), *name);
+                    changed |= ui.selectable_value(value, (*name).to_owned(), *name).changed();
                 }
             });
         }
     }
-    ui.checkbox(&mut draft.invert_clipping_mask, "Invert clipping mask");
+    changed |= ui.checkbox(&mut draft.invert_clipping_mask, "Invert clipping mask").changed();
     if kind == "Part" {
-        ui.checkbox(&mut draft.use_offscreen, "Use offscreen");
+        changed |= ui.checkbox(&mut draft.use_offscreen, "Use offscreen").changed();
     }
     ui.label("Clipping masks");
     egui::ScrollArea::vertical().max_height(160.0).id_salt("clipping-masks").show(ui, |ui| {
         for (guid, name) in masks.iter().filter(|(guid, _)| guid.as_str() != own) {
             let mut on = draft.clip_guids.contains(guid);
             if ui.checkbox(&mut on, name.as_str()).changed() {
+                changed = true;
                 if on {
                     draft.clip_guids.push(guid.clone());
                 } else {
@@ -1219,6 +1479,7 @@ fn source_fields(ui: &mut egui::Ui, kind: &str, draft: &mut SourceInputs, masks:
             }
         }
     });
+    changed
 }
 
 #[cfg(test)]
@@ -1629,6 +1890,271 @@ mod tests {
             for (button, raw) in [("Apply opacity", "pending-main"), ("Apply form settings", "pending-form"), ("Apply source settings", "pending-source")] {
                 assert_eq!(texts(&output).iter().any(|text| text == raw), button != first);
             }
+        }
+    }
+
+    #[test]
+    fn forms_discard_observation_is_pure_unopened_and_never_discloses_input() {
+        let mut rig = Rig::new("forms-discard-observation");
+        let before = rig.controller.snapshot().clone();
+        let unopened = rig.editor.input_snapshot(&before);
+        for _ in 0..5 { assert_eq!(rig.editor.input_snapshot(&before), unopened); }
+        assert!(rig.editor.input_context.is_none() && rig.editor.main_epoch.is_none());
+        assert!(!rig.editor.stored.loaded && rig.editor.form_epoch.is_none() && rig.editor.source_epoch.is_none());
+        assert!(unopened["actions"].as_array().unwrap().iter().all(|action| action["identity"].is_null() && action["nativeAvailable"] == false));
+        rig.draw(); rig.number_text("Source X", "never-disclose-pending-input");
+        let observed = rig.editor.input_snapshot(&before);
+        let encoded = observed.to_string();
+        for secret in ["never-disclose-pending-input", "mesh-guid", "form-guid", "Source X"] {
+            assert!(!encoded.contains(secret));
+        }
+        assert_eq!(observed["owners"]["main"]["dirty"], true);
+        assert_eq!(observed["owners"]["main"]["valid"], false);
+        let identity = rig.editor.input_identity(FormsInputAction::DiscardMain).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::DiscardMain, &identity, &before).unwrap();
+        assert!(!format!("{target:?}").contains("mesh-guid"));
+        assert_eq!(rig.editor.input_snapshot(&before), observed);
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_captured_scope_rejects_reuse_and_preserves_settings_without_draw() {
+        let mut rig = Rig::new("forms-discard-captured-scope");
+        rig.harness.screen = egui::vec2(1300.0, 2600.0);
+        rig.draw(); rig.number_text("Source X", "pending-main"); rig.number_text("Draw order", "pending-form");
+        let before = rig.controller.snapshot().clone();
+        let identity = rig.editor.input_identity(FormsInputAction::DiscardMain).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::DiscardMain, &identity, &before).unwrap();
+        assert_eq!(rig.editor.capture_discard_target(FormsInputAction::ReloadForm, &identity, &before), Err(InputRefusal::StaleInput));
+        rig.number_text("Draw order", "newer-settings-input");
+        assert_eq!(rig.editor.check_discard_target(&target, &before), Ok(()));
+        assert_eq!(rig.editor.discard_if_current(&target, &before), Ok(FormsDiscardOutcome::MainDiscarded));
+        assert!(!rig.editor.main.is_dirty() && rig.editor.stored.form.values().is_err());
+        assert_eq!(rig.editor.check_discard_target(&target, &before), Err(InputRefusal::StaleInput));
+        let identity = rig.editor.input_identity(FormsInputAction::ReloadForm).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::ReloadForm, &identity, &before).unwrap();
+        let observed = rig.editor.input_snapshot(&before);
+        assert_eq!(observed["owners"]["main"]["retained"], false);
+        assert_eq!(rig.editor.discard_if_current(&target, &before), Ok(FormsDiscardOutcome::FormReloaded));
+        assert!(!rig.editor.has_draft() && rig.editor.stored.loaded);
+        assert_eq!(rig.editor.check_discard_target(&target, &before), Err(InputRefusal::StaleInput));
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_availability_preserves_missing_inputs_and_exact_no_form_reset() {
+        let mut rig = Rig::new("forms-discard-availability");
+        rig.draw(); rig.number_text("Source X", "pending-main");
+        let before = rig.controller.snapshot().clone();
+        let identity = rig.editor.input_identity(FormsInputAction::DiscardMain).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::DiscardMain, &identity, &before).unwrap();
+        let mut missing = before.clone(); missing["model"]["sources"] = json!([]);
+        assert_eq!(rig.editor.discard_if_current(&target, &missing), Err(InputRefusal::Unavailable));
+        assert!(rig.editor.main.is_dirty());
+        assert!(rig.editor.input_snapshot(&missing)["actions"].as_array().unwrap().iter().all(|action| action["identity"].is_null()));
+        let mut no_form = before.clone();
+        no_form["model"]["sources"].as_array_mut().unwrap().iter_mut()
+            .find(|source| source["guid"] == "mesh-guid").unwrap()["forms"] = json!([]);
+        let identity = rig.editor.input_identity(FormsInputAction::ReloadForms).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::ReloadForms, &identity, &no_form).unwrap();
+        assert_eq!(rig.editor.discard_if_current(&target, &no_form), Ok(FormsDiscardOutcome::FormsReset));
+        assert!(rig.editor.source.is_empty() && rig.editor.form.is_empty() && !rig.editor.has_draft());
+        assert!(rig.editor.input_context.is_none());
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_actual_widget_epochs_detect_equal_text_aba_and_cancelled_ime() {
+        let mut rig = Rig::new("forms-discard-widget-epochs");
+        rig.harness.screen = egui::vec2(1300.0, 2600.0);
+        assert!(rig.editor.input_identity(FormsInputAction::ReloadForm).is_none());
+        rig.draw();
+        let before = rig.controller.snapshot().clone();
+        let main = rig.editor.input_identity(FormsInputAction::DiscardMain).unwrap();
+        let all = rig.editor.input_identity(FormsInputAction::ReloadForm).unwrap();
+        rig.number_text("Draw order", "pending-form");
+        assert_eq!(rig.editor.input_identity(FormsInputAction::DiscardMain).as_ref(), Some(&main));
+        assert_ne!(rig.editor.input_identity(FormsInputAction::ReloadForm).as_ref(), Some(&all));
+        let settings = rig.editor.form_epoch;
+        let context = rig.editor.input_context;
+        rig.number_text("Source X", "1.000000");
+        assert!(!rig.editor.main.is_dirty());
+        assert_ne!(rig.editor.input_identity(FormsInputAction::DiscardMain).as_ref(), Some(&main));
+        assert_eq!(rig.editor.form_epoch, settings);
+        let key = |key, modifiers, pressed| egui::Event::Key { key, physical_key:None, pressed, repeat:false, modifiers };
+        let select = || vec![key(egui::Key::A,egui::Modifiers::COMMAND,true),key(egui::Key::A,egui::Modifiers::COMMAND,false)];
+        for ime in [false, true] {
+            let identity = rig.editor.input_identity(FormsInputAction::DiscardMain).unwrap();
+            let events = if ime {
+                vec![key(egui::Key::End,egui::Modifiers::NONE,true),key(egui::Key::End,egui::Modifiers::NONE,false),
+                    egui::Event::Ime(egui::ImeEvent::Enabled),egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),egui::Event::Ime(egui::ImeEvent::Disabled)]
+            } else {
+                let mut events = select(); events.push(egui::Event::Text("x".into())); events.extend(select());
+                events.push(egui::Event::Text("1.000000".into())); events
+            };
+            rig.frame(events);
+            assert!(!rig.editor.main.is_dirty());
+            assert_ne!(rig.editor.input_identity(FormsInputAction::DiscardMain).as_ref(), Some(&identity));
+            assert_eq!(rig.editor.form_epoch, settings);
+            assert_eq!(rig.editor.input_context, context);
+        }
+        let all = rig.editor.input_identity(FormsInputAction::ReloadForm).unwrap();
+        for _ in 0..3 { rig.draw(); }
+        assert_eq!(rig.editor.input_identity(FormsInputAction::ReloadForm).as_ref(), Some(&all));
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_artpath_reload_retires_the_actual_text_widget() {
+        let mut rig = Rig::artpath("forms-discard-point-view", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.harness.screen = egui::vec2(1300.0, 3200.0);
+        rig.draw();
+        rig.click(Role::RadioButton, "Control point");
+        rig.text("Point width", "pending-point");
+        let find = |output: &crate::editor_test_support::Out| output.iter().find(|(_, node)| node.role() == Role::TextInput
+            && crate::editor_test_support::name_of(output, node).as_deref() == Some("Point width")).unwrap().0;
+        let old = find(&rig.draw());
+        let before = rig.controller.snapshot().clone();
+        rig.click(Role::Button, "Discard main edit");
+        let current = find(&rig.draw());
+        assert_ne!(old, current);
+        let focus = |target| egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action:egui::accesskit::Action::Focus, target, data:None });
+        rig.frame(vec![focus(old)]);
+        rig.frame(vec![egui::Event::Text("stale".into())]);
+        assert!(!rig.editor.main.is_dirty());
+        rig.frame(vec![focus(current)]);
+        let key = |pressed| egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+        rig.frame(vec![key(true),key(false),egui::Event::Text("2.25".into())]);
+        assert!(rig.editor.main.is_dirty());
+        let MainDraft::Loaded(MainEdit { values:MainValues::ArtPathPoint { input, .. }, .. }) = &rig.editor.main else { panic!("point") };
+        assert_eq!(input.width, "2.25");
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_epoch_failure_keeps_native_reload_and_retained_owner_semantics() {
+        for exhausted in [false, true] {
+            let mut rig = Rig::new(&format!("forms-discard-epoch-failure-{exhausted}"));
+            rig.harness.screen = egui::vec2(1300.0, 2600.0);
+            rig.draw();
+            rig.number_text("Source X", "pending-main");
+            rig.number_text("Draw order", "pending-form");
+            let owner = rig.editor.form_epoch;
+            rig.editor.stored.loaded = false;
+            assert_eq!(rig.editor.form_epoch, owner);
+            assert!(owner.is_some() && rig.editor.has_draft());
+            if exhausted { rig.editor.epochs.exhaust_for_test(); }
+            else { rig.editor.epochs.fail_instance_for_test(); }
+            assert!(rig.editor.input_identity(FormsInputAction::ReloadForm).is_none());
+            let before = rig.controller.snapshot().clone();
+            rig.click(Role::Button, "Reload form");
+            assert!(!rig.editor.has_draft());
+            assert!(rig.editor.input_identity(FormsInputAction::ReloadForm).is_none());
+            assert_eq!(rig.controller.snapshot(), &before);
+        }
+    }
+
+    #[test]
+    fn forms_discard_native_unload_and_nonvisual_reconstruction_preserve_scopes() {
+        let mut rig = Rig::new("forms-discard-nonvisual");
+        rig.harness.screen = egui::vec2(1300.0, 2600.0);
+        rig.draw();
+        rig.number_text("Source X", "pending-main");
+        rig.number_text("Draw order", "pending-form");
+        rig.click(Role::CheckBox, "Invert clipping mask");
+        let before = rig.controller.snapshot().clone();
+        let source_path = rig.controller.project_path().unwrap().to_owned();
+        let bytes = std::fs::read(&source_path).unwrap();
+        let key = rig.editor.form_key();
+        let revision = rig.editor.stored.revision;
+        rig.editor.perform_native_input_action(FormsInputAction::DiscardMain, &before);
+        assert!(matches!(rig.editor.main, MainDraft::Unloaded(_)));
+        assert!(rig.editor.stored.form.values().is_err() && rig.editor.stored.source.invert_clipping_mask);
+        assert_eq!(rig.editor.stored.revision, revision);
+        rig.draw();
+        assert!(!rig.editor.main.is_dirty() && rig.editor.stored.is_dirty());
+        rig.editor.perform_native_input_action(FormsInputAction::ReloadForm, &before);
+        assert!(!rig.editor.stored.loaded && rig.editor.stored.is_dirty());
+        assert!(matches!(rig.editor.main, MainDraft::Unloaded(_)));
+        assert_eq!(rig.editor.settle_form_reload(&before), Ok(StoredSections { form:true, source:true }));
+        assert!(rig.editor.stored.loaded && !rig.editor.has_draft());
+        assert!(matches!(rig.editor.main, MainDraft::Loaded(_)));
+        assert!(rig.editor.form_key() == key);
+        assert_eq!(rig.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(source_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn forms_discard_native_click_keeps_the_original_unloaded_frame() {
+        let mut rig = Rig::new("forms-discard-native-frame");
+        rig.harness.screen = egui::vec2(1300.0, 2600.0);
+        rig.draw();
+        rig.number_text("Source X", "pending-main");
+        rig.number_text("Draw order", "pending-form");
+        rig.click(Role::CheckBox, "Invert clipping mask");
+        let before = rig.controller.snapshot().clone();
+        let mut states = Vec::new();
+        let (editor, controller) = (&mut rig.editor, &mut rig.controller);
+        rig.harness.click(Role::Button, "Reload form", |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { editor.show(ui, controller); });
+            states.push((matches!(editor.main, MainDraft::Loaded(_)), editor.stored.loaded, editor.stored.is_dirty()));
+        });
+        assert_eq!(states.len(), 4);
+        assert_eq!(states[2], (false, false, true));
+        assert_eq!(states[3], (true, true, false));
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_guarded_reconstruction_retains_invalid_stored_inputs() {
+        let mut rig = Rig::artpath("forms-discard-invalid-settings", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.harness.screen = egui::vec2(1300.0, 2600.0);
+        rig.draw();
+        rig.number_text("Opacity", "pending-main");
+        rig.number_text("Draw order", "pending-form");
+        rig.number_text("Division count", "pending-source");
+        let before = rig.controller.snapshot().clone();
+        let mut malformed = before.clone();
+        let source = malformed["model"]["sources"].as_array_mut().unwrap().iter_mut()
+            .find(|source| source["guid"] == "path-guid").unwrap();
+        source["data"]["divisionCount"] = json!(4294967296_u64);
+        let form_original = rig.editor.stored.form_original.clone();
+        let source_original = rig.editor.stored.source_original.clone();
+        let identity = rig.editor.input_identity(FormsInputAction::ReloadForm).unwrap();
+        let target = rig.editor.capture_discard_target(FormsInputAction::ReloadForm, &identity, &malformed).unwrap();
+        let outcome = rig.editor.discard_if_current(&target, &malformed).unwrap();
+        assert_eq!(outcome.value(), json!({"state":"native_incomplete", "reason":"invalid_stored_metadata",
+            "retained":{"main":false, "formSettings":true, "sourceSettings":true}}));
+        assert!(matches!(rig.editor.main, MainDraft::Loaded(_)) && !rig.editor.main.is_dirty());
+        assert!(!rig.editor.stored.loaded && rig.editor.stored.is_dirty() && rig.editor.has_draft());
+        assert!(rig.editor.stored.form.values().is_err() && rig.editor.stored.source.values().is_err());
+        assert!(rig.editor.stored.form_original == form_original);
+        assert!(rig.editor.stored.source_original == source_original);
+        assert_eq!(rig.editor.error, "ArtPath stored metadata is invalid");
+        assert_eq!(rig.controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn forms_discard_reconstruction_never_selects_a_missing_target() {
+        let mut rig = Rig::new("forms-discard-missing-target");
+        rig.draw();
+        rig.number_text("Source X", "pending-main");
+        rig.number_text("Draw order", "pending-form");
+        let before = rig.controller.snapshot().clone();
+        let key = rig.editor.form_key();
+        for missing_source in [true, false] {
+            let mut missing = before.clone();
+            let sources = missing["model"]["sources"].as_array_mut().unwrap();
+            if missing_source { sources.retain(|source| source["guid"] != key.source); }
+            else { sources.iter_mut().find(|source| source["guid"] == key.source).unwrap()["forms"] = json!([]); }
+            assert_eq!(rig.editor.settle_form_reload(&missing), Err(if missing_source {
+                FormReloadFailure::MissingSource
+            } else { FormReloadFailure::MissingForm }));
+            assert!(rig.editor.form_key() == key);
+            assert!(rig.editor.main.is_dirty() && rig.editor.stored.form.values().is_err());
+            assert_eq!(rig.controller.snapshot(), &before);
         }
     }
 

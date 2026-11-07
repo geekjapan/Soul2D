@@ -104,6 +104,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
     "editor_live2d_objects_discard",
+    "editor_live2d_forms_discard", "editor_motion3_discard",
     "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set", "editor_coding_agent_start", "editor_coding_agent_new_session", "editor_coding_agent_prompt_set", "editor_coding_agent_send",
     "editor_selection_set", "editor_armed_set", "editor_camera_set", "editor_camera_fit", "editor_camera_sync", "editor_tool_set", "editor_grid_set",
     "editor_guides_set", "editor_physics_preview_set", "editor_solo_set", "editor_onion_set", "editor_playback_set", "editor_timeline_zoom_set", "editor_viewport_set", "editor_address_dialog", "editor_about_set", "editor_welcome_set", "editor_command_browser_set", "editor_texture_viewer_set", "editor_parameters_set", "editor_panel_set", "editor_layout_reset", "editor_workspace_save",
@@ -216,6 +217,19 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         Ok(ids)
     };
     Ok(match name {
+        "editor_live2d_forms_discard" | "editor_motion3_discard" => {
+            let identity = arguments["expectedInputIdentity"].as_str().filter(|text| !text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            let action = arguments["action"].as_str().ok_or("action must be a string")?;
+            let op = if name == "editor_live2d_forms_discard" {
+                crate::editor_controller::FormsInputAction::parse(action).ok_or("Unknown Forms input action")?;
+                "editor.live2d.forms.discard"
+            } else {
+                crate::editor_controller::Motion3InputAction::parse(action).ok_or("Unknown Motion3 input action")?;
+                "editor.motion3.discard"
+            };
+            json!({"op":op, "action":action, "expectedInputIdentity":identity})
+        },
         "editor_live2d_objects_discard" => {
             let identity = arguments["expectedInputIdentity"].as_str().filter(|text| !text.is_empty())
                 .ok_or("expectedInputIdentity must be a nonempty string")?;
@@ -5435,6 +5449,34 @@ flip-pair partners. The clipboard is used up.",
              Original whitespace is preserved. First briefing uses current document context at execution. No launch, enable, \
              permission grant or document edit. Failed/lost/expired reply delivery never sends. Headless hosts refuse.",
             closed_schema(&[("expectedDraftIdentity", json!({"type":"string"}))], &["expectedDraftIdentity"])),
+        tool("editor_live2d_forms_discard", "Action: admit one native Forms input discard or reload. Read live2dFormInputs.actions \
+             and use the selected action's nonempty identity as expectedInputIdentity. Reads never initialize retained inputs. \
+             discard_main discards only main inputs; reload_form replaces main, form and source settings through shared native \
+             reload and bounded reconstruction, including hidden panels; reload_forms resets the reachable no-form panel. \
+             Native availability and scope apply. Admission is not completion: poll live2dFormDiscard by action and attempt. \
+             native_incomplete reports surviving old owners, which can continue blocking Save. Identified successful local reply \
+             delivery and final matching inputs, document and authority precede one execution after current UI. Every authenticated \
+             ACP occurrence needs original-call human Allow once, even clean inputs; at most 256 occurrences per owned prompt. \
+             Native edits, document changes, closing, invalid consent or failed/lost/expired delivery prevent execution. No automatic \
+             retry, Session/history/file changes, other-panel discard or dialog answers. Input contents are not returned. \
+             Headless, internal calls and notifications refuse.",
+            closed_schema(&[("action", json!({"type":"string", "enum":crate::editor_controller::FormsInputAction::ALL.iter()
+                .map(|action|action.name()).collect::<Vec<_>>()})), ("expectedInputIdentity", json!({"type":"string", "minLength":1}))],
+                &["action", "expectedInputIdentity"])),
+        tool("editor_motion3_discard", "Action: admit one native authored Motion3 point, binding or whole-motion input discard/reload. \
+             Read motion3Inputs.actions and supply that action's nonempty identity as expectedInputIdentity. Native CMO3 mode and \
+             unavailable controls refuse. Point and bindings have independent lanes; whole-motion reload overlaps both. Reads do \
+             not create a buffer; native reload_bindings can establish an absent buffer on an eligible existing selection. \
+             Admission is not completion: poll motion3Discard point/bindings/reload by lane, action and attempt. Native errors \
+             report partial owner effects without input contents. Identified successful local reply delivery and final matching \
+             inputs, document and authority precede one execution after current UI. Every authenticated ACP occurrence needs \
+             original-call human Allow once, even clean inputs; at most 256 occurrences per owned prompt across all new discard \
+             lanes. Native edits, document changes, closing, invalid consent or failed/lost/expired delivery prevent execution. \
+             No automatic retry, Session/history/file changes, other-panel discard or dialog answers. \
+             Headless, internal calls and notifications refuse.",
+            closed_schema(&[("action", json!({"type":"string", "enum":crate::editor_controller::Motion3InputAction::ALL.iter()
+                .map(|action|action.name()).collect::<Vec<_>>()})), ("expectedInputIdentity", json!({"type":"string", "minLength":1}))],
+                &["action", "expectedInputIdentity"])),
         tool("editor_live2d_objects_discard", "Action: admit native Reload and discard of all retained Live2D Object inputs. \
              Read live2dObjectInputs.identity and supply expectedInputIdentity. Requires a CMO3 document and an already loaded buffer; \
              reads do not initialize it. Includes clean, stale and missing retained inputs. Reload rebuilds Name, ID, Parent Part, \
@@ -6579,6 +6621,30 @@ mod tests {
             assert!(editor_request(&request(arguments)).unwrap().is_err());
         }
         assert_eq!(crate::manifest::effect_of("editor_live2d_objects_discard"),Some("editor-state"));
+    }
+
+    #[test]
+    fn panel_discard_translation_is_closed_action_specific_and_headless_refuses() {
+        let families = [("editor_live2d_forms_discard", "editor.live2d.forms.discard",
+            crate::editor_controller::FormsInputAction::ALL.iter().map(|action|action.name()).collect::<Vec<_>>()),
+            ("editor_motion3_discard", "editor.motion3.discard",
+            crate::editor_controller::Motion3InputAction::ALL.iter().map(|action|action.name()).collect::<Vec<_>>())];
+        for (name, op, actions) in families {
+            let request = |arguments| json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":name, "arguments":arguments}});
+            for action in &actions {
+                let call = request(json!({"action":action, "expectedInputIdentity":"  opaque 日本語  "}));
+                assert_eq!(editor_request(&call).unwrap().unwrap(), json!({"op":op, "action":action, "expectedInputIdentity":"  opaque 日本語  "}));
+                let mut session = Session::new(); let snapshot = session.snapshot();
+                assert_eq!(session.handle_mcp(&call).unwrap()["result"]["isError"], true);
+                assert_eq!(session.snapshot(), snapshot);
+            }
+            for arguments in [json!({}), json!({"action":actions[0]}), json!({"action":true, "expectedInputIdentity":"id"}),
+                json!({"action":"unknown", "expectedInputIdentity":"id"}), json!({"action":actions[0], "expectedInputIdentity":""}),
+                json!({"action":actions[0], "expectedInputIdentity":1}), json!({"action":actions[0], "expectedInputIdentity":"id", "text":"bypass"})] {
+                assert!(editor_request(&request(arguments)).unwrap().is_err());
+            }
+            assert_eq!(crate::manifest::effect_of(name), Some("editor-state"));
+        }
     }
 
     #[test]

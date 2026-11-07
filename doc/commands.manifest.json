@@ -12177,6 +12177,41 @@
       ]
     },
     {
+      "description": "Action: admit one native Forms input discard or reload. Read live2dFormInputs.actions and use the selected action's nonempty identity as expectedInputIdentity. Reads never initialize retained inputs. discard_main discards only main inputs; reload_form replaces main, form and source settings through shared native reload and bounded reconstruction, including hidden panels; reload_forms resets the reachable no-form panel. Native availability and scope apply. Admission is not completion: poll live2dFormDiscard by action and attempt. native_incomplete reports surviving old owners, which can continue blocking Save. Identified successful local reply delivery and final matching inputs, document and authority precede one execution after current UI. Every authenticated ACP occurrence needs original-call human Allow once, even clean inputs; at most 256 occurrences per owned prompt. Native edits, document changes, closing, invalid consent or failed/lost/expired delivery prevent execution. No automatic retry, Session/history/file changes, other-panel discard or dialog answers. Input contents are not returned. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Live2D source forms > Discard main edits / Reload form / Reload forms"
+      ],
+      "headless_ok": false,
+      "id": "editor_live2d_forms_discard",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "discard_main",
+              "reload_form",
+              "reload_forms"
+            ],
+            "type": "string"
+          },
+          "expectedInputIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "expectedInputIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: admit native Reload and discard of all retained Live2D Object inputs. Read live2dObjectInputs.identity and supply expectedInputIdentity. Requires a CMO3 document and an already loaded buffer; reads do not initialize it. Includes clean, stale and missing retained inputs. Reload rebuilds Name, ID, Parent Part, Rotation destination and parameter range from the same object, the first available object, or none. Identified successful local reply delivery and matching input, document and authority precede one reload after current UI. Admission is not completion; read live2dObjectDiscard and match attempt. Every authenticated ACP occurrence needs original-call human Allow once, even clean inputs. Native edits, document changes, closing, failed/lost/expired delivery or invalid consent prevent execution. Never retry automatically. No Session, history, files, other drafts or dialog answers change. Input contents are not returned. Headless, internal calls and notifications refuse.",
       "effect": "editor-state",
       "guiEntry": [
@@ -12194,6 +12229,43 @@
           }
         },
         "required": [
+          "expectedInputIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
+      "description": "Action: admit one native authored Motion3 point, binding or whole-motion input discard/reload. Read motion3Inputs.actions and supply that action's nonempty identity as expectedInputIdentity. Native CMO3 mode and unavailable controls refuse. Point and bindings have independent lanes; whole-motion reload overlaps both. Reads do not create a buffer; native reload_bindings can establish an absent buffer on an eligible existing selection. Admission is not completion: poll motion3Discard point/bindings/reload by lane, action and attempt. Native errors report partial owner effects without input contents. Identified successful local reply delivery and final matching inputs, document and authority precede one execution after current UI. Every authenticated ACP occurrence needs original-call human Allow once, even clean inputs; at most 256 occurrences per owned prompt across all new discard lanes. Native edits, document changes, closing, invalid consent or failed/lost/expired delivery prevent execution. No automatic retry, Session/history/file changes, other-panel discard or dialog answers. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Live2D Motion3 > Discard point edits / Reload point / Discard bindings / Reload bindings / Reload motion"
+      ],
+      "headless_ok": false,
+      "id": "editor_motion3_discard",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "discard_point",
+              "reload_point",
+              "discard_bindings",
+              "reload_bindings",
+              "reload_motion"
+            ],
+            "type": "string"
+          },
+          "expectedInputIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
           "expectedInputIdentity"
         ],
         "type": "object"

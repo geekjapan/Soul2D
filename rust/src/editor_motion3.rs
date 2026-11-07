@@ -8,10 +8,11 @@
 //! (`has_draft`). A native CMO3 holds its clips in the session only (`motion3Library`): those get the import,
 //! export and transport controls but no point or binding editing, as in D.
 
+use crate::editor_input_epoch::{InputEpoch, InputEpochs, InputRefusal};
 use crate::editor_number_input::NumberInput;
 use eframe::egui;
 use serde_json::{json, Value};
-use soul2d_core::editor_controller::EditorController;
+use soul2d_core::editor_controller::{EditorController, Motion3InputAction};
 
 // ------------------------------------------------------------------------------------------ pure helpers
 
@@ -288,6 +289,13 @@ pub struct Outcome {
 
 #[derive(Default)]
 pub struct Motion3Panel {
+    epochs: InputEpochs,
+    selection_epoch: Option<InputEpoch>,
+    motion_epoch: Option<InputEpoch>,
+    curve_epoch: Option<InputEpoch>,
+    point_epoch: Option<InputEpoch>,
+    bindings_epoch: Option<InputEpoch>,
+    chooser_epoch: Option<InputEpoch>,
     selected: String,
     motion: Option<Value>,
     missing: bool,
@@ -305,6 +313,63 @@ pub struct Motion3Panel {
     export_path: String,
     error: String,
     status: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Motion3DiscardTarget {
+    action: Motion3InputAction,
+    identity: String,
+    selected: String,
+    curve: usize,
+    point: usize,
+    review_label: String,
+}
+
+impl std::fmt::Debug for Motion3DiscardTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Motion3DiscardTarget").field("action", &self.action).finish_non_exhaustive()
+    }
+}
+
+impl Motion3DiscardTarget {
+    pub(crate) fn action(&self) -> Motion3InputAction { self.action }
+    pub(crate) fn review_label(&self) -> &str { &self.review_label }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Motion3InputEffects {
+    point: bool,
+    bindings: bool,
+    cache: bool,
+    chooser: bool,
+}
+
+impl Motion3InputEffects {
+    fn value(self) -> Value {
+        json!({"point":self.point, "bindings":self.bindings, "cache":self.cache, "chooser":self.chooser})
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Motion3DiscardOutcome {
+    Completed { action:Motion3InputAction, effects:Motion3InputEffects },
+    NativeError { effects:Motion3InputEffects },
+}
+
+impl Motion3DiscardOutcome {
+    pub(crate) fn value(self) -> Value {
+        match self {
+            Self::Completed { action, effects } => {
+                let state = match action {
+                    Motion3InputAction::DiscardPoint => "point_discarded", Motion3InputAction::ReloadPoint => "point_reloaded",
+                    Motion3InputAction::DiscardBindings => "bindings_discarded", Motion3InputAction::ReloadBindings => "bindings_reloaded",
+                    Motion3InputAction::ReloadMotion => "motion_reloaded",
+                };
+                json!({"state":state, "inputEffects":effects.value()})
+            }
+            Self::NativeError { effects } => json!({"state":"native_error", "inputEffects":effects.value()}),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -357,6 +422,155 @@ impl Motion3Panel {
         self.point.as_ref().is_some_and(PointDraft::dirty) || self.bindings.as_ref().is_some_and(BindingDraft::dirty)
     }
 
+    fn input_identity(&self, action: Motion3InputAction) -> Option<String> {
+        self.selection_epoch?;
+        match action {
+            Motion3InputAction::DiscardPoint | Motion3InputAction::ReloadPoint =>
+                self.epochs.identity(action.name(), &[self.selection_epoch, self.point_epoch]),
+            Motion3InputAction::DiscardBindings | Motion3InputAction::ReloadBindings =>
+                self.epochs.identity(action.name(), &[self.selection_epoch, self.motion_epoch, self.curve_epoch,
+                    self.bindings_epoch, self.chooser_epoch]),
+            Motion3InputAction::ReloadMotion => self.epochs.identity(action.name(),
+                &[self.selection_epoch, self.motion_epoch, self.point_epoch, self.bindings_epoch]),
+        }
+    }
+
+    fn native_input_available(&self, action:Motion3InputAction, snapshot:&Value) -> bool {
+        if is_native(snapshot) || snapshot["deformPending"].as_bool() == Some(true)
+            || self.selection_epoch.is_none() || self.selected.is_empty() { return false; }
+        let Some(motion) = self.motion.as_ref() else { return false };
+        let present = stored_motion(snapshot, &self.selected).is_some();
+        if !present && !self.has_draft() { return false; }
+        if action == Motion3InputAction::ReloadMotion { return present && !self.has_draft(); }
+        let list = curves(motion);
+        let Some(curve) = list.get(self.curve.min(list.len().saturating_sub(1))) else { return false };
+        match action {
+            Motion3InputAction::DiscardPoint => self.point.is_some(),
+            Motion3InputAction::ReloadPoint => self.point.is_some() && present,
+            Motion3InputAction::DiscardBindings => curve["Target"] == "Parameter" && self.bindings.is_some(),
+            Motion3InputAction::ReloadBindings => curve["Target"] == "Parameter" && (self.bindings.is_none() || present),
+            Motion3InputAction::ReloadMotion => unreachable!(),
+        }
+    }
+
+    pub(crate) fn input_snapshot(&self, snapshot:&Value) -> Value {
+        let current = stored_motion(snapshot, &self.selected);
+        let point = self.point.as_ref().filter(|_| self.point_epoch.is_some());
+        let bindings = self.bindings.as_ref().filter(|_| self.bindings_epoch.is_some());
+        let point_observation = match point {
+            None => "none", Some(_) if current.is_none() => "missing",
+            Some(point) if current != Some(&point.baseline) => "stale", Some(_) => "current",
+        };
+        let binding_observation = match bindings {
+            None => "none", Some(_) if current.is_none() => "missing",
+            Some(bindings) if bindings.baseline != stored_bindings(snapshot, &self.selected) => "stale", Some(_) => "current",
+        };
+        let actions: Vec<_> = Motion3InputAction::ALL.into_iter().map(|action| {
+            let available = self.native_input_available(action, snapshot);
+            let identity = available.then(|| self.input_identity(action)).flatten();
+            json!({"action":action.name(), "nativeAvailable":available, "discardable":identity.is_some(), "identity":identity})
+        }).collect();
+        json!({"owners":{
+            "point":{"retained":point.is_some(), "dirty":point.is_some_and(PointDraft::dirty),
+                "valid":point.map(|point|point.values().is_ok()), "observation":point_observation},
+            "bindings":{"retained":bindings.is_some(), "dirty":bindings.is_some_and(BindingDraft::dirty),
+                "valid":bindings.map(|bindings|bindings.rows.is_array()), "observation":binding_observation}},
+            "actions":actions})
+    }
+
+    pub(crate) fn capture_discard_target(&self, action:Motion3InputAction, expected:&str, snapshot:&Value)
+        -> Result<Motion3DiscardTarget, InputRefusal>
+    {
+        if !self.native_input_available(action, snapshot) { return Err(InputRefusal::Unavailable); }
+        let identity = self.input_identity(action).ok_or(InputRefusal::IdentityUnavailable)?;
+        if identity != expected { return Err(InputRefusal::StaleInput); }
+        Ok(Motion3DiscardTarget { action, identity, selected:self.selected.clone(), curve:self.curve, point:self.point_index,
+            review_label:format!("Motion3 {} / curve {} / point {}", self.selected, self.curve, self.point_index) })
+    }
+
+    pub(crate) fn check_discard_target(&self, target:&Motion3DiscardTarget, snapshot:&Value) -> Result<(), InputRefusal> {
+        let identity = self.input_identity(target.action).ok_or(InputRefusal::IdentityUnavailable)?;
+        let point_action = matches!(target.action, Motion3InputAction::DiscardPoint | Motion3InputAction::ReloadPoint | Motion3InputAction::ReloadMotion);
+        if self.selected != target.selected || self.curve != target.curve || (point_action && self.point_index != target.point)
+            || identity != target.identity { return Err(InputRefusal::StaleInput); }
+        if !self.native_input_available(target.action, snapshot) { return Err(InputRefusal::Unavailable); }
+        Ok(())
+    }
+
+    pub(crate) fn discard_if_current(&mut self, target:&Motion3DiscardTarget, controller:&mut EditorController)
+        -> Result<Motion3DiscardOutcome, InputRefusal>
+    {
+        let snapshot = controller.snapshot().clone();
+        self.check_discard_target(target, &snapshot)?;
+        let old = (self.point_epoch, self.bindings_epoch, self.motion_epoch, self.chooser_epoch);
+        self.error.clear();
+        let result = self.perform_input_action(target.action, controller, &snapshot);
+        let succeeded = self.present_result(result);
+        let effects = Motion3InputEffects { point:old.0 != self.point_epoch, bindings:old.1 != self.bindings_epoch,
+            cache:old.2 != self.motion_epoch, chooser:old.3 != self.chooser_epoch };
+        Ok(if succeeded { Motion3DiscardOutcome::Completed { action:target.action, effects } }
+            else { Motion3DiscardOutcome::NativeError { effects } })
+    }
+
+    fn replace_motion(&mut self, motion: Value) {
+        self.motion_epoch = Some(self.epochs.next());
+        self.motion = Some(motion);
+    }
+
+    fn replace_bindings(&mut self, rows: Value) {
+        self.bindings = Some(BindingDraft { baseline:rows.clone(), rows, conflict:false });
+        self.bindings_epoch = Some(self.epochs.next());
+    }
+
+    fn clear_point(&mut self) {
+        self.point = None;
+        self.point_epoch = None;
+    }
+
+    fn perform_input_action(&mut self, action: Motion3InputAction, controller: &mut EditorController,
+        snapshot: &Value) -> Result<String, String>
+    {
+        let name = self.selected.clone();
+        match action {
+            Motion3InputAction::ReloadMotion => {
+                let motion = call(controller, json!({"op":"motion3.read", "name":name}))?;
+                let (curve, number) = (self.curve, self.point_index);
+                self.clear_point();
+                self.bindings = None;
+                self.bindings_epoch = None;
+                if self.load_point(&motion, curve, number).is_err() { let _ = self.load_point(&motion, 0, 0); }
+                self.replace_motion(motion);
+                if !is_native(snapshot) {
+                    let rows = call(controller, json!({"op":"motion3.bindings", "name":name}))?;
+                    self.replace_bindings(rows);
+                }
+                Ok("Motion3 reloaded.".into())
+            }
+            Motion3InputAction::ReloadPoint => {
+                let motion = stored_motion(snapshot, &name).cloned().ok_or("The selected Motion3 was removed.")?;
+                let (curve, number) = (self.curve, self.point_index);
+                self.clear_point();
+                self.load_point(&motion, curve, number)?;
+                Ok("Motion3 point reloaded.".into())
+            }
+            Motion3InputAction::DiscardPoint => {
+                let (curve, number) = (self.curve, self.point_index);
+                self.clear_point();
+                if let Some(motion) = stored_motion(snapshot, &name).cloned() { self.load_point(&motion, curve, number)?; }
+                Ok(String::new())
+            }
+            Motion3InputAction::ReloadBindings | Motion3InputAction::DiscardBindings => {
+                let rows = if stored_motion(snapshot, &name).is_none() { json!([]) }
+                    else { call(controller, json!({"op":"motion3.bindings", "name":name}))? };
+                self.replace_bindings(rows);
+                self.bind_parameter = 0;
+                self.bind_axis = 0;
+                self.chooser_epoch = Some(self.epochs.next());
+                Ok(String::new())
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn selected(&self) -> &str {
         &self.selected
@@ -365,6 +579,7 @@ impl Motion3Panel {
     #[cfg(test)]
     pub fn select_for_test(&mut self, name: &str) {
         self.selected = name.to_owned();
+        self.selection_epoch = Some(self.epochs.next());
     }
 
     fn clear_selection(&mut self) {
@@ -376,6 +591,7 @@ impl Motion3Panel {
     fn load_point(&mut self, motion: &Value, curve: usize, number: usize) -> Result<(), String> {
         let points = curve_points(motion, curve)?;
         let picked = points.get(number).ok_or("Motion3 point index is out of range.")?;
+        if self.curve != curve || self.curve_epoch.is_none() { self.curve_epoch = Some(self.epochs.next()); }
         self.curve = curve;
         self.point_index = number;
         self.point = Some(PointDraft {
@@ -389,6 +605,7 @@ impl Motion3Panel {
             baseline: motion.clone(),
             conflict: false,
         });
+        self.point_epoch = Some(self.epochs.next());
         Ok(())
     }
 
@@ -419,11 +636,11 @@ impl Motion3Panel {
             point.conflict = point.baseline != current;
         } else if self.motion.as_ref() != Some(&current) {
             let (curve, number) = (self.curve, self.point_index);
-            self.point = None;
+            self.clear_point();
             if self.load_point(&current, curve, number).is_err() && self.load_point(&current, 0, 0).is_err() {
-                self.point = None;
+                self.clear_point();
             }
-            self.motion = Some(current);
+            self.replace_motion(current);
         }
         if is_native(snapshot) {
             return;
@@ -431,7 +648,11 @@ impl Motion3Panel {
         let rows = stored_bindings(snapshot, &self.selected);
         match self.bindings.as_mut() {
             Some(draft) if draft.dirty() => draft.conflict = draft.baseline != rows,
-            _ => self.bindings = Some(BindingDraft { baseline: rows.clone(), rows, conflict: false }),
+            _ => {
+                if !self.bindings.as_ref().is_some_and(|draft| draft.rows == rows && draft.baseline == rows && !draft.conflict) {
+                    self.replace_bindings(rows);
+                }
+            }
         }
     }
 
@@ -440,11 +661,16 @@ impl Motion3Panel {
     fn perform(&mut self, click: Click, controller: &mut EditorController, snapshot: &Value, outcome: &mut Outcome) {
         self.error.clear();
         let result = self.perform_inner(click, controller, snapshot, outcome);
+        self.present_result(result);
+    }
+
+    fn present_result(&mut self, result:Result<String, String>) -> bool {
         match result {
-            Ok(status) => self.status = status,
+            Ok(status) => { self.status = status; true }
             Err(error) => {
                 self.status.clear();
                 self.error = error;
+                false
             }
         }
     }
@@ -468,11 +694,12 @@ impl Motion3Panel {
                 controller.pause();
                 self.clear_selection();
                 self.selected = new_name;
+                self.selection_epoch = Some(self.epochs.next());
                 self.seek_draft = 0.0;
                 if !is_native(snapshot) {
                     let _ = self.load_point(&motion, 0, 0);
                 }
-                self.motion = Some(motion);
+                self.replace_motion(motion);
                 outcome.changed = true;
                 Ok("Motion3 imported.".into())
             }
@@ -492,32 +719,19 @@ impl Motion3Panel {
                 controller.pause();
                 self.clear_selection();
                 self.selected = picked;
+                self.selection_epoch = Some(self.epochs.next());
                 self.seek_draft = 0.0;
                 if !is_native(snapshot) {
                     let _ = self.load_point(&motion, 0, 0);
                 }
-                self.motion = Some(motion);
+                self.replace_motion(motion);
                 Ok("Motion3 selected. Seek or play explicitly to change the preview.".into())
             }
             Click::Export => {
                 call(controller, json!({"op": "motion3.export", "name": name, "path": self.export_path.trim()}))?;
                 Ok("Motion3 exported.".into())
             }
-            Click::Reload => {
-                let motion = call(controller, json!({"op": "motion3.read", "name": name}))?;
-                let (curve, number) = (self.curve, self.point_index);
-                self.point = None;
-                self.bindings = None;
-                if self.load_point(&motion, curve, number).is_err() {
-                    let _ = self.load_point(&motion, 0, 0);
-                }
-                self.motion = Some(motion);
-                if !is_native(snapshot) {
-                    let rows = call(controller, json!({"op": "motion3.bindings", "name": name}))?;
-                    self.bindings = Some(BindingDraft { baseline: rows.clone(), rows, conflict: false });
-                }
-                Ok("Motion3 reloaded.".into())
-            }
+            Click::Reload => self.perform_input_action(Motion3InputAction::ReloadMotion, controller, snapshot),
             Click::Curve(index) => {
                 let motion = self.motion.clone().ok_or("Select a Motion3 first.")?;
                 self.load_point(&motion, index, 0)?;
@@ -530,28 +744,17 @@ impl Motion3Panel {
                 Ok(String::new())
             }
             Click::ApplyPoint => self.apply_point(controller, snapshot, outcome),
-            Click::ReloadPoint => {
-                let motion = stored_motion(snapshot, &name).cloned().ok_or("The selected Motion3 was removed.")?;
-                let (curve, number) = (self.curve, self.point_index);
-                self.point = None;
-                self.load_point(&motion, curve, number)?;
-                Ok("Motion3 point reloaded.".into())
-            }
-            Click::DiscardPoint => {
-                let (curve, number) = (self.curve, self.point_index);
-                self.point = None;
-                if let Some(motion) = stored_motion(snapshot, &name).cloned() {
-                    self.load_point(&motion, curve, number)?;
-                }
-                Ok(String::new())
-            }
+            Click::ReloadPoint => self.perform_input_action(Motion3InputAction::ReloadPoint, controller, snapshot),
+            Click::DiscardPoint => self.perform_input_action(Motion3InputAction::DiscardPoint, controller, snapshot),
             Click::BindParameter(id) => {
                 self.bind_parameter = id;
                 self.bind_axis = 0;
+                self.chooser_epoch = Some(self.epochs.next());
                 Ok(String::new())
             }
             Click::BindAxis(axis) => {
                 self.bind_axis = axis;
+                self.chooser_epoch = Some(self.epochs.next());
                 Ok(String::new())
             }
             Click::AddBinding | Click::RemoveBinding => {
@@ -568,6 +771,7 @@ impl Motion3Panel {
                 let rows = bindings_with(&draft.rows, &curve_id, choice)?;
                 if let Some(draft) = self.bindings.as_mut() {
                     draft.rows = rows;
+                    self.bindings_epoch = Some(self.epochs.next());
                 }
                 controller.pause();
                 Ok(String::new())
@@ -584,16 +788,14 @@ impl Motion3Panel {
                     controller,
                     json!({"op": "motion3.bind", "name": name, "bindings": draft.rows, "preserve_unknown": true}),
                 )?;
-                self.bindings = Some(BindingDraft { baseline: applied.clone(), rows: applied, conflict: false });
+                self.replace_bindings(applied);
                 outcome.changed = true;
                 Ok("Motion3 bindings applied.".into())
             }
             Click::ReloadBindings | Click::DiscardBindings => {
-                let rows = if self.missing { json!([]) } else { call(controller, json!({"op": "motion3.bindings", "name": name}))? };
-                self.bindings = Some(BindingDraft { baseline: rows.clone(), rows, conflict: false });
-                self.bind_parameter = 0;
-                self.bind_axis = 0;
-                Ok(String::new())
+                let action = if matches!(click, Click::ReloadBindings) { Motion3InputAction::ReloadBindings }
+                    else { Motion3InputAction::DiscardBindings };
+                self.perform_input_action(action, controller, snapshot)
             }
             Click::Sample => {
                 self.last_sample = Some(call(controller, json!({"op": "motion3.sample", "name": name, "time": self.seek_draft}))?);
@@ -663,7 +865,7 @@ impl Motion3Panel {
         controller.pause();
         let motion = call(controller, json!({"op": "motion3.read", "name": name}))?;
         self.load_point(&motion, curve, number)?;
-        self.motion = Some(motion);
+        self.replace_motion(motion);
         outcome.changed = true;
         Ok("Motion3 point applied.".into())
     }
@@ -793,10 +995,12 @@ impl Motion3Panel {
         if let Some(point) = self.point.as_mut() {
             ui.label(format!("Logical point {}: {}", point.number, point.kind));
             let editable = !self.missing && !point.conflict;
-            ui.add_enabled_ui(editable, |ui| {
-                point.time.show(ui);
-                point.value.show(ui);
-            });
+            let changed = ui.add_enabled_ui(editable, |ui| {
+                let time_changed = point.time.show(ui).changed();
+                let value_changed = point.value.show(ui).changed();
+                time_changed | value_changed
+            }).inner;
+            if changed { self.point_epoch = Some(self.epochs.next()); }
             let (dirty, conflict) = (point.dirty(), point.conflict);
             ui.horizontal(|ui| {
                 if ui.add_enabled(dirty && !conflict && !self.missing, egui::Button::new("Apply point")).clicked() {
@@ -833,8 +1037,10 @@ impl Motion3Panel {
         if let Some(row) = &existing {
             // The selector follows the stored mapping until the user picks something else.
             if self.bind_parameter == 0 {
+                let previous = (self.bind_parameter, self.bind_axis);
                 self.bind_parameter = row["parameter"].as_u64().and_then(|id| u32::try_from(id).ok()).unwrap_or(0);
                 self.bind_axis = row["axis"].as_i64().unwrap_or(0);
+                if (self.bind_parameter, self.bind_axis) != previous { self.chooser_epoch = Some(self.epochs.next()); }
             }
         }
         ui.separator();
@@ -1256,6 +1462,175 @@ mod tests {
         // Importing the same name again is refused by the session.
         rig.click(Role::Button, "Import Motion3");
         assert!(rig.panel.error.contains("already exists"), "{}", rig.panel.error);
+    }
+
+    #[test]
+    fn motion3_discard_observation_is_pure_and_refuses_busy_or_native_targets() {
+        let mut rig = Rig::new("motion3-discard-observation");
+        let before = rig.snapshot();
+        let unopened = rig.panel.input_snapshot(&before);
+        for _ in 0..5 { assert_eq!(rig.panel.input_snapshot(&before), unopened); }
+        assert!(rig.panel.selection_epoch.is_none() && rig.panel.point.is_none() && rig.panel.bindings.is_none());
+        assert!(unopened["actions"].as_array().unwrap().iter().all(|action| action["identity"].is_null()));
+        rig.import(); rig.draw(); rig.number_text("Value", "never-disclose-motion3-input");
+        let before = rig.snapshot();
+        let observed = rig.panel.input_snapshot(&before);
+        for secret in ["never-disclose-motion3-input", "Wave", "wave.motion3.json"] { assert!(!observed.to_string().contains(secret)); }
+        assert_eq!(observed["owners"]["point"]["valid"], false);
+        let identity = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        let target = rig.panel.capture_discard_target(Motion3InputAction::DiscardPoint, &identity, &before).unwrap();
+        assert!(!format!("{target:?}").contains("Wave"));
+        assert_eq!(rig.panel.input_snapshot(&before), observed);
+        for native in [false, true] {
+            let mut unavailable = before.clone();
+            if native { unavailable["motion3Library"] = json!({}); } else { unavailable["deformPending"] = json!(true); }
+            assert_eq!(rig.panel.capture_discard_target(Motion3InputAction::DiscardPoint, &identity, &unavailable), Err(InputRefusal::Unavailable));
+            assert!(rig.panel.input_snapshot(&unavailable)["actions"].as_array().unwrap().iter().all(|action| action["identity"].is_null()));
+        }
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_no_buffer_reload_and_point_target_are_independent() {
+        let mut rig = Rig::new("motion3-discard-empty-bindings");
+        rig.import(); rig.draw();
+        let before = rig.snapshot();
+        let point_id = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        let point = rig.panel.capture_discard_target(Motion3InputAction::DiscardPoint, &point_id, &before).unwrap();
+        rig.panel.bindings = None; rig.panel.bindings_epoch = None;
+        let identity = rig.panel.input_identity(Motion3InputAction::ReloadBindings).unwrap();
+        assert_eq!(rig.panel.capture_discard_target(Motion3InputAction::ReloadBindings, &point_id, &before), Err(InputRefusal::StaleInput));
+        let target = rig.panel.capture_discard_target(Motion3InputAction::ReloadBindings, &identity, &before).unwrap();
+        let observed = rig.panel.input_snapshot(&before);
+        assert_eq!(observed["owners"]["bindings"]["retained"], false);
+        let outcome = rig.panel.discard_if_current(&target, &mut rig.controller).unwrap();
+        assert_eq!(outcome.value()["state"], "bindings_reloaded");
+        assert_eq!(outcome.value()["inputEffects"]["point"], false);
+        assert!(rig.panel.bindings.is_some());
+        assert_eq!(rig.panel.check_discard_target(&point, &before), Ok(()));
+        assert_eq!(rig.panel.check_discard_target(&target, &before), Err(InputRefusal::StaleInput));
+        let identity = rig.panel.input_identity(Motion3InputAction::DiscardBindings).unwrap();
+        let bindings = rig.panel.capture_discard_target(Motion3InputAction::DiscardBindings, &identity, &before).unwrap();
+        assert_eq!(rig.panel.discard_if_current(&point, &mut rig.controller).unwrap().value()["state"], "point_discarded");
+        assert_eq!(rig.panel.check_discard_target(&bindings, &before), Ok(()));
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_missing_point_reload_refuses_before_discard_removes_it() {
+        let mut rig = Rig::new("motion3-discard-point-missing");
+        rig.import(); rig.draw(); rig.draft_binding(); rig.number_text("Value", "pending-point");
+        assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+        let before = rig.snapshot();
+        let identity = rig.panel.input_identity(Motion3InputAction::ReloadPoint).unwrap();
+        assert_eq!(rig.panel.capture_discard_target(Motion3InputAction::ReloadPoint, &identity, &before), Err(InputRefusal::Unavailable));
+        let identity = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        let target = rig.panel.capture_discard_target(Motion3InputAction::DiscardPoint, &identity, &before).unwrap();
+        let bindings = rig.panel.bindings.as_ref().unwrap().rows.clone();
+        assert_eq!(rig.panel.discard_if_current(&target, &mut rig.controller).unwrap().value()["state"], "point_discarded");
+        assert!(rig.panel.point.is_none());
+        assert_eq!(rig.panel.bindings.as_ref().unwrap().rows, bindings);
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_point_reload_reports_real_partial_effect_after_undo_and_reimport() {
+        let mut rig = Rig::new("motion3-discard-partial-point");
+        rig.import(); rig.draw();
+        let before = rig.snapshot(); let mut ignored = Outcome::default();
+        rig.panel.perform(Click::Point(1), &mut rig.controller, &before, &mut ignored);
+        rig.draw(); rig.draft_binding(); rig.number_text("Value", "pending-removed-point");
+        assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+        let short = json!({"Version":3,"Meta":{"Duration":2,"Fps":30,"Loop":true,"AreBeziersRestricted":false,
+            "CurveCount":1,"TotalSegmentCount":0,"TotalPointCount":1},
+            "Curves":[{"Target":"Parameter","Id":"Linear","Segments":[0,2]}]});
+        let path = rig.dir.join("short.motion3.json"); std::fs::write(&path, short.to_string()).unwrap();
+        let imported = rig.controller.core_request(&json!({"op":"motion3.import","name":"Wave","path":path}));
+        assert_eq!(imported["succeeded"], true, "{imported}");
+        let before = rig.snapshot();
+        let identity = rig.panel.input_identity(Motion3InputAction::ReloadPoint).unwrap();
+        let target = rig.panel.capture_discard_target(Motion3InputAction::ReloadPoint, &identity, &before).unwrap();
+        let bindings = rig.panel.bindings.as_ref().unwrap().rows.clone();
+        let cache = rig.panel.motion.clone();
+        let outcome = rig.panel.discard_if_current(&target, &mut rig.controller).unwrap().value();
+        assert_eq!(outcome["state"], "native_error");
+        assert_eq!(outcome["inputEffects"], json!({"point":true,"bindings":false,"cache":false,"chooser":false}));
+        assert!(rig.panel.point.is_none());
+        assert_eq!(rig.panel.bindings.as_ref().unwrap().rows, bindings);
+        assert_eq!(rig.panel.motion, cache);
+        assert!(!rig.panel.error.is_empty());
+        assert!(!outcome.to_string().contains("pending-removed-point"));
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_owner_epochs_preserve_unrelated_input_and_stable_idle() {
+        let mut rig = Rig::new("motion3-discard-owner-epochs");
+        assert!(rig.panel.input_identity(Motion3InputAction::ReloadMotion).is_none());
+        rig.import(); rig.draw();
+        let before = rig.snapshot();
+        let point = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        rig.draft_binding();
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardPoint).as_ref(), Some(&point));
+        let bindings = rig.panel.input_identity(Motion3InputAction::DiscardBindings).unwrap();
+        rig.number_text("Value", "2.000000");
+        assert!(!rig.panel.point.as_ref().unwrap().dirty());
+        assert_ne!(rig.panel.input_identity(Motion3InputAction::DiscardPoint).as_ref(), Some(&point));
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&bindings));
+        let point = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        for _ in 0..3 { rig.draw(); }
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardPoint).as_ref(), Some(&point));
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&bindings));
+        let mut outcome = Outcome::default();
+        rig.panel.perform(Click::ReloadPoint, &mut rig.controller, &before, &mut outcome);
+        assert_ne!(rig.panel.input_identity(Motion3InputAction::DiscardPoint).as_ref(), Some(&point));
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&bindings));
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_chooser_following_invalidates_once_after_zero_reset() {
+        let mut rig = Rig::new("motion3-discard-chooser-follow");
+        rig.import(); rig.draw(); rig.draft_binding();
+        rig.click(Role::Button, "Apply bindings"); rig.draw();
+        let before = rig.snapshot();
+        let point = rig.panel.input_identity(Motion3InputAction::DiscardPoint).unwrap();
+        let mut outcome = Outcome::default();
+        rig.panel.perform(Click::DiscardBindings, &mut rig.controller, &before, &mut outcome);
+        assert_eq!((rig.panel.bind_parameter, rig.panel.bind_axis), (0,0));
+        let reset = rig.panel.input_identity(Motion3InputAction::DiscardBindings).unwrap();
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&reset));
+        rig.draw();
+        assert_eq!(rig.panel.bind_parameter, rig.parameter as u32);
+        assert_ne!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&reset));
+        let settled = rig.panel.input_identity(Motion3InputAction::DiscardBindings).unwrap();
+        rig.draw();
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardBindings).as_ref(), Some(&settled));
+        assert_eq!(rig.panel.input_identity(Motion3InputAction::DiscardPoint).as_ref(), Some(&point));
+        assert_eq!(rig.snapshot(), before);
+    }
+
+    #[test]
+    fn motion3_discard_hidden_missing_bindings_uses_snapshot_without_point_sync() {
+        let mut rig = Rig::new("motion3-discard-hidden-missing");
+        rig.import(); rig.draw(); rig.draft_binding(); rig.number_text("Value", "pending-point");
+        let point = rig.panel.point_epoch;
+        let motion = rig.panel.motion.clone();
+        let baseline = rig.panel.point.as_ref().unwrap().baseline.clone();
+        assert!(!rig.panel.missing);
+        rig.controller.allow_replace_unsaved(true);
+        assert_eq!(rig.controller.core_request(&json!({"op":"new"}))["succeeded"], true);
+        let before = rig.snapshot();
+        let mut outcome = Outcome::default();
+        rig.panel.perform(Click::DiscardBindings, &mut rig.controller, &before, &mut outcome);
+        assert!(rig.panel.error.is_empty());
+        assert_eq!(rig.panel.bindings.as_ref().unwrap().rows, json!([]));
+        assert_eq!(rig.panel.point_epoch, point);
+        assert_eq!(rig.panel.motion, motion);
+        assert_eq!(rig.panel.point.as_ref().unwrap().baseline, baseline);
+        assert!(rig.panel.point.as_ref().unwrap().values().is_err());
+        assert!(!rig.panel.point.as_ref().unwrap().conflict && !rig.panel.missing);
+        assert_eq!(rig.snapshot(), before);
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod editor_binding_values;
 mod editor_depth;
 mod editor_depth_draw;
 mod editor_inspector;
+mod editor_input_epoch;
 mod editor_live2d_forms;
 mod editor_live2d_objects;
 mod editor_mesh_tools;

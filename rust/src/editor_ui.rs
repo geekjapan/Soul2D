@@ -384,6 +384,72 @@ impl RemoteObjectDiscard {
     }
 }
 
+enum PanelDiscardOutcome {
+    Forms(crate::editor_live2d_forms::FormsDiscardOutcome),
+    Motion3(crate::editor_motion3::Motion3DiscardOutcome),
+    Input(crate::editor_input_epoch::InputRefusal),
+    StaleDocument,
+    ConsentInvalid,
+    EditorClosing,
+    ReplyNotProduced,
+    ReplyFailed,
+    ReplyLost,
+    ReplyExpired,
+}
+
+impl PanelDiscardOutcome {
+    fn value(&self) -> Value {
+        let state = match self {
+            Self::Forms(outcome) => return outcome.value(),
+            Self::Motion3(outcome) => return outcome.value(),
+            Self::Input(refusal) => refusal.state(),
+            Self::StaleDocument => "stale_document", Self::ConsentInvalid => "consent_invalid",
+            Self::EditorClosing => "editor_closing", Self::ReplyNotProduced => "reply_not_produced",
+            Self::ReplyFailed => "reply_failed", Self::ReplyLost => "reply_lost", Self::ReplyExpired => "reply_expired",
+        };
+        json!({"state":state})
+    }
+}
+
+enum RemotePanelDiscard {
+    Idle,
+    Reviewing { attempt:u64, target:crate::editor_agent::PanelDiscardTarget },
+    Waiting { attempt:u64, target:crate::editor_agent::PanelDiscardTarget,
+        receipt:Receiver<Result<(), String>>, deadline:Instant },
+    Finished { attempt:u64, action:&'static str, outcome:PanelDiscardOutcome },
+}
+
+impl RemotePanelDiscard {
+    fn attempt(&self) -> u64 {
+        match self { Self::Idle => 0,
+            Self::Reviewing { attempt, .. } | Self::Waiting { attempt, .. } | Self::Finished { attempt, .. } => *attempt }
+    }
+    fn pending(&self) -> bool { matches!(self, Self::Reviewing { .. } | Self::Waiting { .. }) }
+    fn state(&self) -> Value {
+        match self {
+            Self::Idle => json!({"state":"idle"}),
+            Self::Reviewing { attempt, target } => json!({"state":"awaiting_human", "attempt":attempt, "action":target.input.action()}),
+            Self::Waiting { attempt, target, .. } => json!({"state":"waiting_for_reply", "attempt":attempt, "action":target.input.action()}),
+            Self::Finished { attempt, action, outcome } => {
+                let mut state = outcome.value();
+                state["attempt"] = json!(attempt);
+                state["action"] = json!(action);
+                state
+            }
+        }
+    }
+    fn close(&mut self, agent:&mut crate::editor_agent::AgentPanel) {
+        let pending = std::mem::replace(self, Self::Idle);
+        *self = match pending {
+            Self::Reviewing { attempt, target } | Self::Waiting { attempt, target, .. } => {
+                agent.invalidate_panel_discard(&target, true);
+                Self::Finished { attempt, action:target.input.action(), outcome:PanelDiscardOutcome::EditorClosing }
+            }
+            other => other,
+        };
+    }
+}
+
 impl crate::editor_agent::AgentLaunchAction {
     fn from_tool(name: &str) -> Option<Self> {
         match name { "editor_coding_agent_start" => Some(Self::Start),
@@ -845,6 +911,7 @@ impl RemoteQuit {
 /// All of it is view state: nothing here reaches the document, its history or its revision.
 struct EditorView<'a> {
     object_discard: &'a mut RemoteObjectDiscard,
+    panel_discards: &'a mut [RemotePanelDiscard; 4],
     remote_quit: &'a mut RemoteQuit,
     agent_cancel: &'a mut RemoteAgentCancel,
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
@@ -925,6 +992,7 @@ macro_rules! editor_view {
     ($app:expr, $ctx:expr) => {
         EditorView {
             object_discard: &mut $app.object_discard,
+            panel_discards: &mut $app.panel_discards,
             remote_quit: &mut $app.remote_quit,
             agent_cancel: &mut $app.agent_cancel,
             agent_cancel_target: $app.agent.cancel_target(),
@@ -1039,6 +1107,47 @@ impl EditorView<'_> {
         let control_reply_capable = matches!(origin, McpOrigin::Client | McpOrigin::Agent(_));
         let identified_stop = control_reply_capable && message["jsonrpc"] == "2.0" && message.get("id").is_some_and(|id|
             id.is_string() || id.as_i64().is_some() || id.as_u64().is_some());
+        let panel_discard_target: Result<crate::editor_agent::PanelDiscardTarget, String> = (|| {
+            use soul2d_core::editor_controller::{FormsInputAction, Motion3InputAction};
+            use crate::editor_agent::PanelDiscardInput;
+            if message["method"] != "tools/call" { return Err("Input discard requires tools/call".into()); }
+            if !identified_stop { return Err("Input discard requires an identified request with a reply writer".into()); }
+            if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
+                || self.ctx.input(|input|input.viewport().close_requested()) { return Err(CLOSING_MESSAGE.into()); }
+            if self.remote_quit.active() { return Err("Input discard refused: Quit is pending".into()); }
+            let args = &message["params"]["arguments"];
+            let expected = args["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            let action = args["action"].as_str().ok_or("action must be a string")?;
+            let input = match message["params"]["name"].as_str() {
+                Some("editor_live2d_forms_discard") => PanelDiscardInput::Forms(self.forms.capture_discard_target(
+                    FormsInputAction::parse(action).ok_or("Unknown Forms input action")?, expected, controller.snapshot())
+                    .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
+                Some("editor_motion3_discard") => PanelDiscardInput::Motion3(self.motion3.capture_discard_target(
+                    Motion3InputAction::parse(action).ok_or("Unknown Motion3 input action")?, expected, controller.snapshot())
+                    .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
+                _ => return Err("Not a panel input discard request".into()),
+            };
+            let document = crate::editor_agent::ObjectDiscardDocument {
+                revision:controller.snapshot()["revision"].as_u64().ok_or("Document revision unavailable")?,
+                path:controller.project_path().map(Path::to_owned),
+            };
+            let approval = match &origin { McpOrigin::Agent(approval) => Some(&**approval), _ => None };
+            let target = crate::editor_agent::PanelDiscardTarget::new(input, document, approval)?;
+            let lane = target.input.lane();
+            if (lane == 3 && self.panel_discards[1..3].iter().any(RemotePanelDiscard::pending))
+                || ((lane == 1 || lane == 2) && self.panel_discards[3].pending()) {
+                return Err("Input discard already pending in an overlapping scope; read editor state".into());
+            }
+            match &self.panel_discards[lane] {
+                RemotePanelDiscard::Reviewing { target:original, .. } if original == &target && target.invocation().is_some() => Ok(target),
+                RemotePanelDiscard::Reviewing { .. } | RemotePanelDiscard::Waiting { .. } =>
+                    Err("Input discard already pending; read editor state".into()),
+                other => other.attempt().checked_add(1).map(|_|target).ok_or("Input discard attempt identity exhausted".into()),
+            }
+        })();
+        let panel_discard_continuing = panel_discard_target.as_ref().is_ok_and(|target|
+            matches!(&self.panel_discards[target.input.lane()], RemotePanelDiscard::Reviewing { target:original, .. } if original == target));
         let object_discard_target: Result<crate::editor_agent::ObjectDiscardTarget, String> = (|| {
             if !identified_stop { return Err("Object discard requires an identified request with a reply writer".into()); }
             if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
@@ -1154,7 +1263,8 @@ impl EditorView<'_> {
         let read_only = matches!(message["method"].as_str(), Some("tools/list" | "resources/list" | "resources/templates/list" | "resources/read" | "ping" | "initialize"))
             || (message["method"] == "tools/call" && message["params"]["name"].as_str()
                 .is_some_and(|name| soul2d_core::manifest::effect_of(name) == Some("-")));
-        if !is_quit && !read_only { self.remote_quit.cancel("new_operation"); }
+        let is_panel_discard = matches!(message["params"]["name"].as_str(), Some("editor_live2d_forms_discard" | "editor_motion3_discard"));
+        if !is_quit && !read_only && !is_panel_discard { self.remote_quit.cancel("new_operation"); }
         if self.remote_quit.active() {
             let changed = match &*self.remote_quit {
                 RemoteQuit::Reviewing { revision, path, .. } | RemoteQuit::Waiting { revision, path, .. } =>
@@ -1176,6 +1286,7 @@ impl EditorView<'_> {
                 }
             });
         let mut object_discard_receipt = None;
+        let mut panel_discard_receipt = None;
         let mut draft_receipt = None;
         let mut send_receipt = None;
         let mut launch_receipt = None;
@@ -1202,6 +1313,11 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
+                if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) {
+                    let target = panel_discard_target.clone()?;
+                    approval.reserve_input_discard(&target, panel_discard_continuing)?;
+                    return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::PanelDiscard(target)), None);
+                }
                 if call["op"] == "editor.live2d.objects.discard" {
                     let target = object_discard_target.clone()?;
                     let review = target.review().ok_or("Object discard needs its original authenticated invocation")?;
@@ -1395,6 +1511,26 @@ impl EditorView<'_> {
                 send_receipt = Some((sender, admitted.clone()));
                 return Ok(admitted);
             }
+            if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) {
+                let target = panel_discard_target.clone()?;
+                let lane = target.input.lane();
+                let attempt = if target.invocation().is_some() {
+                    match &self.panel_discards[lane] {
+                        RemotePanelDiscard::Reviewing { attempt, target:original } if original == &target => *attempt,
+                        _ => return Err("The original input discard review is no longer valid".into()),
+                    }
+                } else { self.panel_discards[lane].attempt().checked_add(1).ok_or("Input discard attempt identity exhausted")? };
+                let (sender, receipt) = sync_channel(1);
+                let action = target.input.action();
+                self.panel_discards[lane] = RemotePanelDiscard::Waiting { attempt, target, receipt,
+                    deadline:Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT };
+                let key = if lane == 0 { "live2dFormDiscard" } else { "motion3Discard" };
+                let lane_name = ["forms", "point", "bindings", "reload"][lane];
+                let admitted = json!({key:{"state":"admitted", "action":action, "lane":lane_name, "attempt":attempt,
+                    "policy":"after_local_reply_delivery_and_matching_inputs_document_and_invocation"}});
+                panel_discard_receipt = Some((lane, sender, admitted.clone()));
+                return Ok(admitted);
+            }
             if call["op"] == "editor.live2d.objects.discard" {
                 let target = object_discard_target.clone()?;
                 let attempt = if target.invocation().is_some() {
@@ -1513,6 +1649,16 @@ impl EditorView<'_> {
             self.handle(controller, call)
         });
         if let McpOrigin::Agent(approval) = &origin {
+            if let Ok(target) = &panel_discard_target {
+                if approval.panel_discard_review().as_ref() == Some(target) {
+                    let lane = target.input.lane();
+                    if !self.panel_discards[lane].pending() {
+                        if let Some(attempt) = self.panel_discards[lane].attempt().checked_add(1) {
+                            self.panel_discards[lane] = RemotePanelDiscard::Reviewing { attempt, target:target.clone() };
+                        }
+                    }
+                }
+            }
             if let Ok(target) = &launch_target {
                 if target.review().is_some() && approval.new_session_review() == target.review()
                     && !matches!(&*self.agent_new_session, RemoteAgentLaunch::Reviewing { .. } | RemoteAgentLaunch::Waiting { .. })
@@ -1608,6 +1754,20 @@ impl EditorView<'_> {
             *self.agent_send = RemoteAgentSend::Finished { attempt:self.agent_send.attempt(), outcome:AgentSendOutcome::ReplyNotProduced };
             return RpcReply::plain(response);
         }
+        if let Some((lane, receipt, admitted)) = panel_discard_receipt {
+            if response.as_ref().is_some_and(|reply|reply["result"]["isError"] == false
+                && reply["result"]["structuredContent"] == admitted) {
+                if let RemotePanelDiscard::Waiting { deadline, .. } = &mut self.panel_discards[lane] {
+                    *deadline = Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT;
+                }
+                return RpcReply::tracked(message, response, receipt);
+            }
+            let pending = std::mem::replace(&mut self.panel_discards[lane], RemotePanelDiscard::Idle);
+            let RemotePanelDiscard::Waiting { attempt, target, .. } = pending else { unreachable!() };
+            self.panel_discards[lane] = RemotePanelDiscard::Finished { attempt, action:target.input.action(),
+                outcome:PanelDiscardOutcome::ReplyNotProduced };
+            return RpcReply::plain(response);
+        }
         if let Some((receipt, admitted)) = object_discard_receipt {
             if response.as_ref().is_some_and(|reply|reply["result"]["isError"] == false
                 && reply["result"]["structuredContent"] == admitted) {
@@ -1700,6 +1860,7 @@ impl EditorView<'_> {
     fn quit_work_refusal(&self, controller: &EditorController) -> Option<String> {
         let reason = if *self.closing { "The editor is closing" }
         else if self.object_discard.pending() { "Quit refused: an Object input discard request is pending" }
+        else if self.panel_discards.iter().any(RemotePanelDiscard::pending) { "Quit refused: a panel input discard request is pending" }
         else if self.agent_send.pending() { "Quit refused: a coding-agent Send request is pending" }
         else if self.agent_start.pending() { "Quit refused: a coding-agent Start request is pending" }
         else if matches!(&*self.agent_new_session, RemoteAgentLaunch::Reviewing { .. } | RemoteAgentLaunch::Waiting { .. }) {
@@ -2397,6 +2558,11 @@ impl EditorView<'_> {
         });
         state["live2dObjectInputs"] = object_inputs;
         state["live2dObjectDiscard"] = self.object_discard.state();
+        state["live2dFormInputs"] = self.forms.input_snapshot(snapshot);
+        state["live2dFormDiscard"] = self.panel_discards[0].state();
+        state["motion3Inputs"] = self.motion3.input_snapshot(snapshot);
+        state["motion3Discard"] = json!({"point":self.panel_discards[1].state(),
+            "bindings":self.panel_discards[2].state(), "reload":self.panel_discards[3].state()});
         state
     }
 }
@@ -2427,6 +2593,7 @@ pub struct EditorApp {
     agent_start: RemoteAgentLaunch,
     agent_new_session: RemoteAgentLaunch,
     object_discard: RemoteObjectDiscard,
+    panel_discards: [RemotePanelDiscard; 4],
     agent_draft: RemoteAgentDraft,
     agent_send: RemoteAgentSend,
     #[cfg(test)]
@@ -2565,6 +2732,7 @@ impl EditorApp {
             agent_start: RemoteAgentLaunch::Idle,
             agent_new_session: RemoteAgentLaunch::Idle,
             object_discard: RemoteObjectDiscard::Idle,
+            panel_discards: std::array::from_fn(|_|RemotePanelDiscard::Idle),
             agent_draft: RemoteAgentDraft::Idle,
             agent_send: RemoteAgentSend::Idle,
             #[cfg(test)]
@@ -3008,6 +3176,7 @@ impl EditorApp {
     fn begin_closing(&mut self) {
         self.closing = true;
         self.object_discard.close(&mut self.agent);
+        for lane in &mut self.panel_discards { lane.close(&mut self.agent); }
         self.agent_send.close();
         self.agent_start.close(&mut self.agent);
         self.agent_new_session.close(&mut self.agent);
@@ -3020,6 +3189,62 @@ impl EditorApp {
             }
             other => other,
         };
+    }
+
+    fn finish_panel_discards(&mut self, ctx:&egui::Context) {
+        for lane in 0..self.panel_discards.len() {
+            let (target, admitted) = match &self.panel_discards[lane] {
+                RemotePanelDiscard::Reviewing { target, .. } => (target.clone(), false),
+                RemotePanelDiscard::Waiting { target, .. } => (target.clone(), true),
+                _ => continue,
+            };
+            if target.invocation().is_some() { self.agent.pump(); }
+            if self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_))
+                || ctx.input(|input|input.viewport().close_requested()) {
+                self.panel_discards[lane].close(&mut self.agent);
+                continue;
+            }
+            let input_status = match &target.input {
+                crate::editor_agent::PanelDiscardInput::Forms(input) => self.forms.check_discard_target(input, self.controller.snapshot()),
+                crate::editor_agent::PanelDiscardInput::Motion3(input) => self.motion3.check_discard_target(input, self.controller.snapshot()),
+            };
+            let mut failure = if self.controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
+                || self.controller.project_path() != target.document.path.as_deref() { Some(PanelDiscardOutcome::StaleDocument) }
+                else if let Err(refusal) = input_status { Some(PanelDiscardOutcome::Input(refusal)) }
+                else if !self.agent.panel_discard_status(&target, admitted) { Some(PanelDiscardOutcome::ConsentInvalid) }
+                else { None };
+            match &mut self.panel_discards[lane] {
+                RemotePanelDiscard::Reviewing { .. } if failure.is_none() => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    continue;
+                }
+                RemotePanelDiscard::Waiting { receipt, deadline, .. } if failure.is_none() => {
+                    failure = if Instant::now() >= *deadline { Some(PanelDiscardOutcome::ReplyExpired) } else {
+                        match receipt.try_recv() {
+                            Ok(Ok(())) => None,
+                            Ok(Err(_)) => Some(PanelDiscardOutcome::ReplyFailed),
+                            Err(TryRecvError::Disconnected) => Some(PanelDiscardOutcome::ReplyLost),
+                            Err(TryRecvError::Empty) => { ctx.request_repaint_after(Duration::from_millis(10)); continue; }
+                        }
+                    };
+                }
+                _ => {}
+            }
+            let pending = std::mem::replace(&mut self.panel_discards[lane], RemotePanelDiscard::Idle);
+            let attempt = pending.attempt();
+            let outcome = if let Some(outcome) = failure { outcome } else {
+                let result = match &target.input {
+                    crate::editor_agent::PanelDiscardInput::Forms(input) => self.forms.discard_if_current(input, self.controller.snapshot())
+                        .map(PanelDiscardOutcome::Forms),
+                    crate::editor_agent::PanelDiscardInput::Motion3(input) => self.motion3.discard_if_current(input, &mut self.controller)
+                        .map(PanelDiscardOutcome::Motion3),
+                };
+                self.sync_panel_drafts();
+                result.unwrap_or_else(PanelDiscardOutcome::Input)
+            };
+            self.agent.invalidate_panel_discard(&target, false);
+            self.panel_discards[lane] = RemotePanelDiscard::Finished { attempt, action:target.input.action(), outcome };
+        }
     }
 
     fn object_discard_status(&self, target: &crate::editor_agent::ObjectDiscardTarget, admitted: bool) -> Result<(), ObjectDiscardOutcome> {
@@ -8464,6 +8689,7 @@ impl eframe::App for EditorApp {
         self.finish_close_requests(ctx, host_effect, confirmation_pending);
         self.finish_remote_quit(ctx);
         self.finish_object_discard(ctx);
+        self.finish_panel_discards(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -17342,7 +17568,7 @@ mod shell_flow_tests {
         assert!(crate::editor_test_support::texts(&output).iter().any(|text|text.contains(value)),"the raw input must be visible");
     }
 
-    fn object_number_text(harness: &mut Harness,label: &str,value: &str,mut draw: impl FnMut(&egui::Context)) -> crate::editor_test_support::Out {
+    pub(super) fn object_number_text(harness: &mut Harness,label: &str,value: &str,mut draw: impl FnMut(&egui::Context)) -> crate::editor_test_support::Out {
         harness.click(Role::SpinButton,label,&mut draw);
         let key = |pressed| egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,
             modifiers:egui::Modifiers::COMMAND};
@@ -20337,6 +20563,522 @@ mod editor_state_tests {
             finish_object_discard(&mut app);
             assert_eq!(state(&mut app)["live2dObjectDiscard"]["state"],"consent_invalid");assert!(app.objects.has_draft());
             peer.finish(&mut app);
+        }
+    }
+
+    fn panel_discard_draw(app:&mut EditorApp, ctx:&egui::Context, forms:bool) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if forms { app.forms.show(ui, &mut app.controller); }
+            else { app.motion3.show(ui, &mut app.controller, &mut app.looping); }
+        });
+        app.sync_panel_drafts();
+    }
+
+    fn panel_discard_app(name:&str, forms:bool, dirty:bool) -> (EditorApp, crate::editor_test_support::Harness) {
+        use crate::editor_test_support::Harness;
+        let mut app = app(name);
+        let dir = temp_dir(&format!("{name}-inputs"));
+        if forms {
+            let path = dir.join("forms.cmo3");
+            std::fs::write(&path, crate::editor_test_support::cmo3_bytes()).unwrap();
+            app.command(json!({"op":"open", "path":path}));
+        } else {
+            let path = dir.join("wave.motion3.json");
+            std::fs::write(&path, json!({"Version":3,"Meta":{"Duration":2,"Fps":30,"Loop":true,
+                "AreBeziersRestricted":false,"CurveCount":1,"TotalSegmentCount":1,"TotalPointCount":2},
+                "Curves":[{"Target":"Parameter","Id":"Linear","Segments":[0,2,0,1,6]}]}).to_string()).unwrap();
+            assert_eq!(app.controller.core_request(&json!({"op":"motion3.import", "name":"Wave", "path":path}))["succeeded"], true);
+            assert_eq!(app.controller.core_request(&json!({"op":"save", "path":dir.join("motion.inx")}))["succeeded"], true);
+            app.motion3.select_for_test("Wave");
+        }
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1500.0, 4000.0);
+        harness.frame(Vec::new(), |ctx|panel_discard_draw(&mut app, ctx, forms));
+        if dirty {
+            super::shell_flow_tests::object_number_text(&mut harness, if forms { "Source X" } else { "Time (seconds)" },
+                "private-unparsed-input", |ctx|panel_discard_draw(&mut app, ctx, forms));
+        }
+        assert_eq!(if forms { app.forms.has_draft() } else { app.motion3.has_draft() }, dirty);
+        app.tools.store.set("Outline.visible", false).unwrap();
+        (app, harness)
+    }
+
+    fn panel_discard_message(app:&EditorApp, forms:bool, action:&str) -> Value {
+        let inputs = if forms { app.forms.input_snapshot(app.controller.snapshot()) } else { app.motion3.input_snapshot(app.controller.snapshot()) };
+        let identity = inputs["actions"].as_array().unwrap().iter().find(|entry|entry["action"] == action).unwrap()["identity"].clone();
+        assert!(identity.is_string(), "{action}: {inputs}");
+        json!({"jsonrpc":"2.0", "id":"panel-discard", "method":"tools/call", "params":{
+            "name":if forms { "editor_live2d_forms_discard" } else { "editor_motion3_discard" },
+            "arguments":{"action":action, "expectedInputIdentity":identity}}})
+    }
+
+    fn request_panel_discard(app:&mut EditorApp, message:&Value) -> RpcReply {
+        CTX.with(|ctx|editor_view!(app, ctx).mcp(&mut app.controller, message, McpOrigin::Client))
+    }
+
+    fn finish_panel_discards(app:&mut EditorApp) { CTX.with(|ctx|app.finish_panel_discards(ctx)); }
+
+    #[test]
+    fn panel_discard_hidden_forms_settlement_and_motion_actions_preserve_document_and_other_work() {
+        for (forms, action, expected) in [(true, "discard_main", "main_discarded"), (true, "reload_form", "form_reloaded"),
+            (false, "discard_point", "point_discarded"), (false, "reload_point", "point_reloaded"),
+            (false, "discard_bindings", "bindings_discarded"), (false, "reload_bindings", "bindings_reloaded"),
+            (false, "reload_motion", "motion_reloaded")] {
+            let dirty = forms || action.contains("point");
+            let (mut app, _) = panel_discard_app(&format!("panel-discard-preserve-{action}"), forms, dirty);
+            app.timeline_weight_draft = Some(("Other panel draft".into(), 0.4));
+            app.unsaved = Some(unsaved_dialog());
+            let snapshot = app.controller.snapshot().clone(); let settings = app.tools.store.clone();
+            let path = app.controller.project_path().unwrap().to_owned(); let bytes = std::fs::read(&path).unwrap();
+            let request = panel_discard_message(&app, forms, action);
+            let reply = request_panel_discard(&mut app, &request);
+            finish_panel_discards(&mut app);
+            assert_eq!(app.panel_discards.iter().filter(|lane|lane.pending()).count(), 1);
+            assert_eq!(if forms { app.forms.has_draft() } else { app.motion3.has_draft() }, dirty);
+            let mut output = Vec::new(); reply.write_line(&mut output).unwrap();
+            let response:Value = serde_json::from_slice(&output).unwrap(); assert_eq!(response["result"]["isError"], false, "{response}");
+            let key = if forms {"live2dFormDiscard"} else {"motion3Discard"};
+            assert_eq!(response["result"]["structuredContent"][key]["state"], "admitted");
+            assert_eq!(response["result"]["structuredContent"][key]["action"], action);
+            assert_eq!(response["result"]["structuredContent"][key]["attempt"], 1);
+            finish_panel_discards(&mut app);
+            let lane = if forms {0} else if action.contains("point") {1} else if action.contains("bindings") {2} else {3};
+            assert_eq!(app.panel_discards[lane].state()["state"], expected, "{action}");
+            assert_eq!(app.panel_discards[lane].state()["action"], action);
+            assert!(!if forms { app.forms.has_draft() } else { app.motion3.has_draft() });
+            assert_eq!(app.controller.snapshot(), &snapshot); assert_eq!(app.tools.store, settings);
+            assert_eq!(std::fs::read(path).unwrap(), bytes); assert!(app.unsaved.is_some());
+            assert_eq!(app.timeline_weight_draft, Some(("Other panel draft".into(), 0.4)));
+            assert!(!state(&mut app).to_string().contains("private-unparsed-input"));
+        }
+    }
+
+    #[test]
+    fn panel_discard_delivery_failures_preserve_inputs_and_do_not_revive() {
+        struct BadWriter;
+        impl std::io::Write for BadWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for forms in [false, true] {
+            for case in ["failed", "lost", "expired"] {
+                let (mut app, _) = panel_discard_app(&format!("panel-discard-{forms}-{case}"), forms, true);
+                let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+                let reply = request_panel_discard(&mut app, &message);
+                let lane = if forms {0} else {1};
+                let late = match case {
+                    "failed" => { assert!(reply.write_line(&mut BadWriter).is_err()); None }
+                    "lost" => { drop(reply); None }
+                    _ => { let RemotePanelDiscard::Waiting { deadline, .. } = &mut app.panel_discards[lane] else {panic!()};
+                        *deadline = Instant::now(); Some(reply) }
+                };
+                finish_panel_discards(&mut app);
+                assert_eq!(app.panel_discards[lane].state()["state"], format!("reply_{case}"));
+                if let Some(reply) = late { reply.write_line(&mut Vec::new()).unwrap(); }
+                finish_panel_discards(&mut app);
+                assert!(if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+                assert_eq!(app.panel_discards[lane].state()["state"], format!("reply_{case}"));
+            }
+        }
+    }
+
+    #[test]
+    fn panel_discard_every_acp_occurrence_requires_original_human_review() {
+        use crate::editor_test_support::Harness; use egui::accesskit::Role;
+        for forms in [false, true] {
+            let (mut app, _) = panel_discard_app(&format!("panel-discard-acp-{forms}"), forms, false);
+            let (mut peer, token) = draft_peer(&mut app);
+            let action = if forms {"reload_form"} else {"reload_point"};
+            let message = panel_discard_message(&app, forms, action);
+            let original = draft_http(&app, &token, &message); let duplicate = draft_http(&app, &token, &message);
+            serve_agent_requests(&mut app);
+            let lane = if forms {0} else {1};
+            assert_eq!(app.panel_discards[lane].state()["state"], "awaiting_human");
+            assert_eq!(lifecycle_http_result(duplicate, "panel-discard")["isError"], true);
+            let path = app.tools.store_path.clone();
+            Harness::new().click(Role::Button, "Allow once", |ctx|app.agent.host_approval_window(ctx, path.as_deref()));
+            serve_agent_requests(&mut app);
+            assert_eq!(lifecycle_http_result(original, "panel-discard")["isError"], false);
+            finish_panel_discards(&mut app);
+            assert!(!app.panel_discards[lane].pending());
+            let fresh = draft_http(&app, &token, &panel_discard_message(&app, forms, action)); serve_agent_requests(&mut app);
+            assert_eq!(app.panel_discards[lane].state()["state"], "awaiting_human");
+            assert_eq!(app.panel_discards[lane].attempt(), 2);
+            app.begin_closing(); assert_eq!(lifecycle_http_result(fresh, "panel-discard")["isError"], true);
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn panel_discard_checks_current_document_and_native_input_after_reply() {
+        for forms in [false, true] {
+            for case in ["document", "input"] {
+                let (mut app, mut harness) = panel_discard_app(&format!("panel-discard-stale-{forms}-{case}"), forms, true);
+                let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+                request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+                if case == "document" {
+                    let revision = app.controller.snapshot()["revision"].as_u64().unwrap();
+                    assert_eq!(app.controller.core_request(&json!({"op":"new"}))["succeeded"], true);
+                    assert!(app.controller.snapshot()["revision"].as_u64().unwrap() > revision);
+                }
+                else { super::shell_flow_tests::object_number_text(&mut harness, if forms {"Source X"} else {"Time (seconds)"},
+                    "different-private-input", |ctx|panel_discard_draw(&mut app, ctx, forms)); }
+                finish_panel_discards(&mut app);
+                assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"],
+                    if case == "document" {"stale_document"} else {"stale_input"});
+                assert!(if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+            }
+        }
+    }
+
+    #[test]
+    fn panel_discard_motion_lanes_are_independent_and_whole_reload_overlaps_both() {
+        let (mut app, _) = panel_discard_app("panel-discard-overlap", false, false);
+        let whole = panel_discard_message(&app, false, "reload_motion");
+        let point = panel_discard_message(&app, false, "reload_point");
+        let bindings = panel_discard_message(&app, false, "reload_bindings");
+        let point_reply = request_panel_discard(&mut app, &point);
+        let binding_reply = request_panel_discard(&mut app, &bindings);
+        assert!(app.panel_discards[1].pending() && app.panel_discards[2].pending());
+        assert_eq!(request_panel_discard(&mut app, &whole).into_message().unwrap()["result"]["isError"], true);
+        binding_reply.write_line(&mut Vec::new()).unwrap(); finish_panel_discards(&mut app);
+        assert_eq!(app.panel_discards[2].state()["state"], "bindings_reloaded");
+        assert!(app.panel_discards[1].pending());
+        point_reply.write_line(&mut Vec::new()).unwrap(); finish_panel_discards(&mut app);
+        assert_eq!(app.panel_discards[1].state()["state"], "point_reloaded");
+        let whole_message = panel_discard_message(&app, false, "reload_motion");
+        let point_message = panel_discard_message(&app, false, "reload_point");
+        let whole = request_panel_discard(&mut app, &whole_message);
+        assert_eq!(request_panel_discard(&mut app, &point_message).into_message().unwrap()["result"]["isError"], true);
+        whole.write_line(&mut Vec::new()).unwrap(); finish_panel_discards(&mut app);
+        assert_eq!(app.panel_discards[3].state()["state"], "motion_reloaded");
+    }
+
+    #[test]
+    fn panel_discard_clean_pending_blocks_eof_and_quit_and_does_not_cancel_pending_quit() {
+        for forms in [false, true] {
+            let (mut app, mut harness) = panel_discard_app(&format!("panel-discard-quit-{forms}"), forms, false);
+            let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+            let quit = json!({"jsonrpc":"2.0", "id":"quit", "method":"tools/call", "params":{"name":"editor_quit", "arguments":{}}});
+            let quit_reply = request_panel_discard(&mut app, &quit);
+            assert!(app.remote_quit.active());
+            assert_eq!(request_panel_discard(&mut app, &message).into_message().unwrap()["result"]["isError"], true);
+            assert!(app.remote_quit.active());
+            app.remote_quit.cancel("test_reset"); drop(quit_reply);
+            let reply = request_panel_discard(&mut app, &message);
+            assert_eq!(request_panel_discard(&mut app, &quit).into_message().unwrap()["result"]["isError"], true);
+            harness.frame(Vec::new(), |ctx|app.finish_close_requests(ctx, HostDrainEffect::Eof, false));
+            assert!(!app.closing && harness.close_requests == 0);
+            reply.write_line(&mut Vec::new()).unwrap(); finish_panel_discards(&mut app);
+            assert!(!app.closing && harness.close_requests == 0);
+        }
+    }
+
+    #[test]
+    fn panel_discard_native_close_frame_invalidates_even_when_close_is_blocked() {
+        use crate::editor_test_support::Harness;
+        for forms in [false, true] {
+            let (mut app, _) = panel_discard_app(&format!("panel-discard-close-{forms}"), forms, true);
+            let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+            request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+            let mut harness = Harness::new();
+            harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close)));
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"], "editor_closing");
+            assert!(!app.closing && harness.close_requests == 0);
+            assert!(if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+            finish_panel_discards(&mut app);
+            assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"], "editor_closing");
+        }
+    }
+
+    #[test]
+    fn panel_discard_admitted_acp_rechecks_permissions_completion_and_disconnect() {
+        use crate::editor_test_support::Harness; use egui::accesskit::Role;
+        for forms in [false, true] {
+            for case in ["permission", "completed", "disconnect"] {
+                let (mut app, _) = panel_discard_app(&format!("panel-discard-authority-{forms}-{case}"), forms, true);
+                let (mut peer, token) = draft_peer(&mut app);
+                let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+                let original = draft_http(&app, &token, &message); serve_agent_requests(&mut app);
+                let path = app.tools.store_path.clone();
+                Harness::new().click(Role::Button, "Allow once", |ctx|app.agent.host_approval_window(ctx, path.as_deref()));
+                serve_agent_requests(&mut app);
+                assert_eq!(lifecycle_http_result(original, "panel-discard")["isError"], false);
+                match case {
+                    "permission" => peer.enqueue(lifecycle_permission()),
+                    "completed" => peer.enqueue(json!({"jsonrpc":"2.0", "id":2, "result":{"stopReason":"end_turn"}})),
+                    _ => {peer.frames.take(); let deadline = Instant::now() + Duration::from_secs(5);
+                        while app.agent.state().turn_active {app.agent.pump(); assert!(Instant::now() < deadline); std::thread::yield_now();}}
+                }
+                finish_panel_discards(&mut app);
+                assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"], "consent_invalid");
+                assert!(if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+                peer.finish(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn panel_discard_actual_http_completes_both_families_only_after_local_delivery() {
+        use std::io::{Read, Write}; use std::net::{Shutdown, TcpStream};
+        for forms in [false, true] {
+            let (mut app, _) = panel_discard_app(&format!("panel-discard-http-{forms}"), forms, true);
+            let snapshot = app.controller.snapshot().clone();
+            let server = McpServer::start(&McpSettings { enabled:true, host:"127.0.0.1".into(), port:0, auth:true },
+                Some("owned-panel-discard-token".into())).unwrap();
+            let address = server.url().strip_prefix("http://").unwrap().split('/').next().unwrap().to_owned();
+            app.mcp_server = Some(server);
+            let body = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"}).to_string();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                write!(stream, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer owned-panel-discard-token\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                let mut response = String::new(); stream.read_to_string(&mut response).unwrap(); response
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !client.is_finished() || app.panel_discards.iter().any(RemotePanelDiscard::pending) {
+                assert!(Instant::now() < deadline);
+                CTX.with(|ctx| {app.serve_mcp(ctx); app.finish_panel_discards(ctx);});
+                std::thread::yield_now();
+            }
+            let response = client.join().unwrap(); assert!(response.starts_with("HTTP/1.1 200 OK"));
+            let reply:Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let key = if forms {"live2dFormDiscard"} else {"motion3Discard"};
+            assert_eq!(reply["result"]["structuredContent"][key]["state"], "admitted");
+            assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"], if forms {"form_reloaded"} else {"point_reloaded"});
+            assert!(!if forms {app.forms.has_draft()} else {app.motion3.has_draft()});
+            assert_eq!(app.controller.snapshot(), &snapshot); app.mcp_server = None;
+        }
+    }
+
+    #[test]
+    fn panel_discard_actual_stdio_flush_and_eof_preserve_other_drafts() {
+        use crate::editor_test_support::Harness;
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes:&[u8]) -> std::io::Result<usize> {self.0.lock().unwrap().0.extend_from_slice(bytes); Ok(bytes.len())}
+            fn flush(&mut self) -> std::io::Result<()> {self.0.lock().unwrap().1 += 1; Ok(())}
+        }
+        for forms in [false, true] {
+            let (mut app, _) = panel_discard_app(&format!("panel-discard-stdio-{forms}"), forms, true);
+            app.timeline_weight_draft = Some(("Other retained panel draft".into(), 0.4));
+            let snapshot = app.controller.snapshot().clone();
+            let message = format!("{}\n", panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"}));
+            let output = Output(std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0)))); let writer = output.clone();
+            let (sender, receiver) = sync_channel(1); app.host_rx = Some(receiver);
+            let worker = std::thread::spawn(move ||editor_stdio::serve_lines(std::io::Cursor::new(message), writer, &sender, &egui::Context::default()));
+            let mut harness = Harness::new(); let mut frame = eframe::Frame::_new_kittest();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() || app.panel_discards.iter().any(RemotePanelDiscard::pending) || !app.stdin_closed {
+                assert!(Instant::now() < deadline);
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame)); std::thread::yield_now();
+            }
+            worker.join().unwrap(); let output = output.0.lock().unwrap();
+            assert!(output.0.ends_with(b"\n") && output.1 > 0);
+            let reply:Value = serde_json::from_slice(&output.0).unwrap();
+            let key = if forms {"live2dFormDiscard"} else {"motion3Discard"};
+            assert_eq!(reply["result"]["structuredContent"][key]["state"], "admitted");
+            assert_eq!(app.panel_discards[if forms {0} else {1}].state()["state"], if forms {"form_reloaded"} else {"point_reloaded"});
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(app.timeline_weight_draft, Some(("Other retained panel draft".into(), 0.4)));
+            assert!(!app.closing && harness.close_requests == 0);
+        }
+    }
+
+    fn panel_discard_choose(app:&mut EditorApp, harness:&mut crate::editor_test_support::Harness, combo:&str, choice:&str) {
+        use egui::accesskit::Role;
+        let output = harness.click(Role::ComboBox, combo, |ctx|panel_discard_draw(app, ctx, true));
+        let role = output.iter().find(|(_, node)|crate::editor_test_support::name_of(&output, node).as_deref() == Some(choice))
+            .unwrap_or_else(||panic!("missing choice {choice}")).1.role();
+        harness.click(role, choice, |ctx|panel_discard_draw(app, ctx, true));
+    }
+
+    #[test]
+    fn panel_discard_forms_all_widget_kinds_invalidate_delivered_consent_even_after_restore() {
+        use egui::accesskit::Role;
+        for case in ["invert", "color", "alpha", "closed", "brush", "mask", "corner", "text", "reflect", "offscreen"] {
+            let (mut app, mut harness) = panel_discard_app(&format!("panel-discard-widget-{case}"), true, false);
+            if matches!(case, "closed" | "brush" | "mask" | "corner" | "text" | "reflect") {
+                let xml = if case == "reflect" { include_str!("../tests/fixtures/rotation-reparent.xml").to_owned() }
+                    else { crate::editor_test_support::artpath_cmo3_xml() };
+                let path = temp_dir(&format!("panel-discard-widget-source-{case}")).join("source.cmo3");
+                std::fs::write(&path, crate::editor_test_support::caff_with_xml(&xml)).unwrap();
+                assert_eq!(app.controller.core_request(&json!({"op":"open", "path":path}))["succeeded"], true);
+                app.forms.reset();
+                harness.frame(Vec::new(), |ctx|panel_discard_draw(&mut app, ctx, true));
+                panel_discard_choose(&mut app, &mut harness, "Source", if case == "reflect" {"Old [Rotation]"} else {"Path [ArtPath]"});
+                if matches!(case, "corner" | "text") {
+                    harness.click(Role::RadioButton, "Control point", |ctx|panel_discard_draw(&mut app, ctx, true));
+                }
+            }
+            if case == "offscreen" {
+                let output = harness.click(Role::ComboBox, "Source", |ctx|panel_discard_draw(&mut app, ctx, true));
+                let (role, choice) = output.iter().find_map(|(_, node)|crate::editor_test_support::name_of(&output, node)
+                    .filter(|name|name.ends_with("[Part]")).map(|name|(node.role(), name))).unwrap();
+                harness.click(role, &choice, |ctx|panel_discard_draw(&mut app, ctx, true));
+            }
+            let action = if case == "offscreen" {"reload_forms"} else {"reload_form"};
+            let message = panel_discard_message(&app, true, action);
+            let snapshot = app.controller.snapshot().clone();
+            request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+            match case {
+                "color" => {panel_discard_choose(&mut app, &mut harness, "Color composition", "ADD");
+                    panel_discard_choose(&mut app, &mut harness, "Color composition", "NORMAL");}
+                "alpha" => {panel_discard_choose(&mut app, &mut harness, "Alpha composition", "ATOP");
+                    panel_discard_choose(&mut app, &mut harness, "Alpha composition", "OVER");}
+                "brush" => {panel_discard_choose(&mut app, &mut harness, "Brush", "BrushB [brush-b]");
+                    panel_discard_choose(&mut app, &mut harness, "Brush", "Brush [brush-guid]");}
+                "text" => {harness.text("Point width", "private ArtPath draft", |ctx|panel_discard_draw(&mut app, ctx, true));}
+                _ => {
+                    let label = match case {"invert"=>"Invert clipping mask", "closed"=>"Closed", "mask"=>"Mesh",
+                        "corner"=>"Corner", "reflect"=>"Reflect X", "offscreen"=>"Use offscreen", _=>unreachable!()};
+                    for _ in 0..2 {harness.click(Role::CheckBox, label, |ctx|panel_discard_draw(&mut app, ctx, true));}
+                }
+            }
+            finish_panel_discards(&mut app);
+            assert_eq!(app.panel_discards[0].state()["state"], "stale_input", "{case}");
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(app.forms.has_draft(), case == "text", "restored widgets are clean but stale: {case}");
+        }
+    }
+
+    #[test]
+    fn panel_discard_reachable_no_form_reset_completes_without_recreating_retained_settings() {
+        use egui::accesskit::Role;
+        let (mut app, mut harness) = panel_discard_app("panel-discard-no-form-reset", true, false);
+        let output = harness.click(Role::ComboBox, "Source", |ctx|panel_discard_draw(&mut app, ctx, true));
+        let (role, choice) = output.iter().find_map(|(_, node)|crate::editor_test_support::name_of(&output, node)
+            .filter(|name|name.ends_with("[Part]")).map(|name|(node.role(), name))).unwrap();
+        harness.click(role, &choice, |ctx|panel_discard_draw(&mut app, ctx, true));
+        harness.click(Role::CheckBox, "Use offscreen", |ctx|panel_discard_draw(&mut app, ctx, true));
+        assert!(app.forms.has_draft());
+        let message = panel_discard_message(&app, true, "reload_forms");
+        let snapshot = app.controller.snapshot().clone();
+        request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+        finish_panel_discards(&mut app);
+        assert_eq!(app.panel_discards[0].state()["state"], "forms_reset"); assert!(!app.forms.has_draft());
+        assert_eq!(app.forms.input_snapshot(app.controller.snapshot())["owners"]["sourceSettings"]["retained"], false);
+        assert_eq!(app.controller.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn panel_discard_full_app_post_delivery_equal_spelling_aba_and_cancelled_ime_never_revive() {
+        use egui::accesskit::Role;
+        for kind in ["forms", "artpath", "motion"] {
+            for edit in ["equal", "aba", "ime"] {
+                let forms = kind != "motion";
+                let (mut app, mut harness) = panel_discard_app(&format!("panel-discard-app-event-{kind}-{edit}"), forms, false);
+                if kind == "artpath" {
+                    let path = temp_dir(&format!("panel-discard-artpath-event-{edit}")).join("source.cmo3");
+                    std::fs::write(&path, crate::editor_test_support::caff_with_xml(&crate::editor_test_support::artpath_cmo3_xml())).unwrap();
+                    app.command(json!({"op":"open", "path":path}));
+                    harness.frame(Vec::new(), |ctx|panel_discard_draw(&mut app, ctx, true));
+                    panel_discard_choose(&mut app, &mut harness, "Source", "Path [ArtPath]");
+                    harness.click(Role::RadioButton, "Control point", |ctx|panel_discard_draw(&mut app, ctx, true));
+                }
+                app.tools.store.set("Outline.visible", true).unwrap();
+                harness.screen = egui::vec2(1800.0, 5000.0);
+                let mut frame = eframe::Frame::_new_kittest();
+                if forms { harness.click(Role::Button, "Live2D source forms", |ctx|app.update(ctx, &mut frame)); }
+                let (role, field, original) = match kind {
+                    "forms" => (Role::SpinButton, "Source X", "1"),
+                    "artpath" => (Role::TextInput, "Point width", "3"),
+                    _ => (Role::SpinButton, "Time (seconds)", "0"),
+                };
+                harness.click(role, field, |ctx|app.update(ctx, &mut frame));
+                let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+                let identity = message["params"]["arguments"]["expectedInputIdentity"].clone();
+                let snapshot = app.controller.snapshot().clone();
+                request_panel_discard(&mut app, &message).write_line(&mut Vec::new()).unwrap();
+                let key = |key, modifiers, pressed|egui::Event::Key {key, physical_key:None, pressed, repeat:false, modifiers};
+                let select = ||vec![key(egui::Key::A, egui::Modifiers::COMMAND, true), key(egui::Key::A, egui::Modifiers::COMMAND, false)];
+                let events = if edit == "ime" {
+                    vec![key(egui::Key::End, egui::Modifiers::NONE, true), key(egui::Key::End, egui::Modifiers::NONE, false),
+                        egui::Event::Ime(egui::ImeEvent::Enabled), egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())), egui::Event::Ime(egui::ImeEvent::Disabled)]
+                } else {
+                    let mut events = select();
+                    if edit == "aba" { events.push(egui::Event::Text("x".into())); events.extend(select()); }
+                    events.push(egui::Event::Text(if edit == "equal" {format!("{original}.000000")} else {original.into()})); events
+                };
+                harness.frame(events, |ctx|app.update(ctx, &mut frame));
+                let lane = if forms {0} else {1};
+                assert_eq!(app.panel_discards[lane].state()["state"], "stale_input", "{kind} {edit}");
+                assert!(!if forms {app.forms.has_draft()} else {app.motion3.has_draft()}, "same final value is clean: {kind} {edit}");
+                let next = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
+                assert_ne!(next["params"]["arguments"]["expectedInputIdentity"], identity);
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert_eq!(app.panel_discards[lane].state()["state"], "stale_input");
+                assert_eq!(app.controller.snapshot(), &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn panel_discard_full_app_motion_context_and_automatic_chooser_stale_only_affected_scopes() {
+        use egui::accesskit::Role;
+        for case in ["chooser", "point", "curve", "automatic"] {
+            let (mut app, mut harness) = panel_discard_app(&format!("panel-discard-app-context-{case}"), false, false);
+            let path = temp_dir(&format!("panel-discard-context-source-{case}")).join("context.motion3.json");
+            std::fs::write(&path, json!({"Version":3,"Meta":{"Duration":2,"Fps":30,"Loop":true,
+                "AreBeziersRestricted":false,"CurveCount":2,"TotalSegmentCount":2,"TotalPointCount":4},
+                "Curves":[{"Target":"Parameter","Id":"First","Segments":[0,2,0,1,6]},
+                    {"Target":"Parameter","Id":"Second","Segments":[0,3,0,1,7]}]}).to_string()).unwrap();
+            assert_eq!(app.controller.core_request(&json!({"op":"motion3.import", "name":"Context", "path":path}))["succeeded"], true);
+            if case == "automatic" {
+                let bound = app.controller.core_request(&json!({"op":"motion3.bind", "name":"Context",
+                    "bindings":[{"id":"First", "parameter":10, "axis":0}]}));
+                assert_eq!(bound["succeeded"], true, "{bound}");
+            }
+            app.motion3.select_for_test("Context");
+            app.tools.store.set("Outline.visible", true).unwrap();
+            harness.screen = egui::vec2(1800.0, 5000.0);
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            let mut output = harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            let (role, label) = match case {
+                "chooser" => {output = harness.click(Role::ComboBox, "INX parameter", |ctx|app.update(ctx, &mut frame)); (Role::Button, "Blink (10)")}
+                "point" => {output = harness.click(Role::ComboBox, "Logical point", |ctx|app.update(ctx, &mut frame)); (Role::Button, "#1 Segment 0: Linear endpoint  t=1  v=6")}
+                "curve" => {output = harness.click(Role::ComboBox, "Curve", |ctx|app.update(ctx, &mut frame)); (Role::Button, "1. Parameter / Second")}
+                _ => (Role::Button, "Discard binding draft"),
+            };
+            let actual_role = if case == "automatic" {role} else {
+                output.iter().find(|(_, node)|crate::editor_test_support::name_of(&output, node).as_deref() == Some(label))
+                    .unwrap_or_else(||panic!("missing context choice {label}")).1.role()
+            };
+            let at = crate::editor_test_support::center(&output, actual_role, label);
+            let click = ||vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {pos:at, button:egui::PointerButton::Primary,
+                pressed:true, modifiers:egui::Modifiers::NONE}, egui::Event::PointerButton {pos:at, button:egui::PointerButton::Primary,
+                pressed:false, modifiers:egui::Modifiers::NONE}];
+            if case == "automatic" {harness.frame(click(), |ctx|app.update(ctx, &mut frame));}
+            let point = panel_discard_message(&app, false, "reload_point");
+            let bindings = panel_discard_message(&app, false, "reload_bindings");
+            let snapshot = app.controller.snapshot().clone();
+            let point_reply = request_panel_discard(&mut app, &point);
+            let binding_reply = request_panel_discard(&mut app, &bindings);
+            let (waiting, receipt) = if case == "point" {
+                point_reply.write_line(&mut Vec::new()).unwrap(); (2, Some(binding_reply))
+            } else if case == "curve" {
+                point_reply.write_line(&mut Vec::new()).unwrap(); binding_reply.write_line(&mut Vec::new()).unwrap(); (0, None)
+            } else {binding_reply.write_line(&mut Vec::new()).unwrap(); (1, Some(point_reply))};
+            harness.frame(if case == "automatic" {Vec::new()} else {click()}, |ctx|app.update(ctx, &mut frame));
+            let stale = if case == "point" {1} else {2};
+            assert_eq!(app.panel_discards[stale].state()["state"], "stale_input", "{case}");
+            if case == "curve" {assert_eq!(app.panel_discards[1].state()["state"], "stale_input");}
+            else {
+                assert!(app.panel_discards[waiting].pending(), "unrelated scope stays pending: {case}");
+                let original = if waiting == 1 {&point} else {&bindings};
+                let current = panel_discard_message(&app, false, if waiting == 1 {"reload_point"} else {"reload_bindings"});
+                assert_eq!(current["params"]["arguments"]["expectedInputIdentity"], original["params"]["arguments"]["expectedInputIdentity"]);
+                receipt.unwrap().write_line(&mut Vec::new()).unwrap();
+            }
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert_eq!(app.panel_discards[stale].state()["state"], "stale_input", "no revival: {case}");
+            assert!(!app.motion3.has_draft()); assert_eq!(app.controller.snapshot(), &snapshot);
         }
     }
 

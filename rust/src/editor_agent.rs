@@ -398,6 +398,7 @@ pub(crate) enum ApprovalTarget {
     CodingAgentNewSession(NewSessionReviewTarget),
     CodingAgentDraft(DraftReviewTarget),
     ObjectDiscard(ObjectDiscardReviewTarget),
+    PanelDiscard(PanelDiscardTarget),
     Settings(Option<PathBuf>),
     Output(PathBuf),
     Outputs(Vec<PathBuf>),
@@ -427,6 +428,8 @@ pub(crate) struct HostApproval {
     request: Option<ApprovalRequest>,
     defer_current: bool,
     invocation: Option<AcpInvocation>,
+    input_context: Option<(u64, PromptId, u64)>,
+    input_occurrences: Vec<AcpInvocation>,
 }
 
 /// Assigned only inside authenticated hosting; equal wire IDs do not identify the same invocation.
@@ -450,6 +453,7 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
+        if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard")) { return true; }
         matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.live2d.objects.discard" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
@@ -503,6 +507,31 @@ impl HostApproval {
         Some(ObjectDiscardTarget { input:review.input.clone(), document:review.document.clone(), invocation:Some(review.invocation.clone()) })
     }
 
+    pub(crate) fn panel_discard_review(&self) -> Option<PanelDiscardTarget> {
+        let request = self.request.as_ref()?;
+        if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
+        match &request.target { ApprovalTarget::PanelDiscard(target) => Some(target.clone()), _ => None }
+    }
+
+    fn input_invocation(&self) -> Result<AcpInvocation, String> {
+        self.invocation.clone().filter(|call| self.active && call.permissions != u64::MAX
+            && self.input_context == Some((call.run, call.prompt, call.permissions)))
+            .ok_or_else(|| "Input discard needs its original authenticated transmitted uncancelled prompt".into())
+    }
+
+    pub(crate) fn reserve_input_discard(&mut self, target: &PanelDiscardTarget, continuing: bool) -> Result<(), String> {
+        let invocation = self.input_invocation()?;
+        if target.invocation() != Some(&invocation) { return Err("Input discard refused: consent_invalid".into()); }
+        self.input_occurrences.retain(|old| old.run == invocation.run && old.prompt == invocation.prompt);
+        let reserved = self.input_occurrences.iter().any(|old| old.run == invocation.run
+            && old.prompt == invocation.prompt && old.call == invocation.call);
+        if continuing && reserved && self.panel_discard_review().as_ref() == Some(target) { return Ok(()); }
+        if reserved { return Err("Input discard refused: occurrence_consumed".into()); }
+        if self.input_occurrences.len() >= 256 { return Err("Input discard refused: occurrence_capacity".into()); }
+        self.input_occurrences.push(invocation);
+        Ok(())
+    }
+
     pub(crate) fn new_session_review(&self) -> Option<NewSessionReviewTarget> {
         let request = self.request.as_ref()?;
         if !matches!(request.decision, ApprovalDecision::Pending | ApprovalDecision::AllowedOnce) { return None; }
@@ -531,6 +560,7 @@ impl HostApproval {
         if !active {
             self.request = None;
             self.defer_current = false;
+            self.input_context = None;
         }
     }
 
@@ -551,7 +581,7 @@ impl HostApproval {
             return Err("The host is reviewing another operation".into());
         }
         let (target, document) = match target.and_then(|target| {
-            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentNewSession(_) | ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_)) { None }
+            let document = if matches!(target, ApprovalTarget::Settings(_) | ApprovalTarget::Store(_) | ApprovalTarget::Stop(_) | ApprovalTarget::CodingAgentSet(_) | ApprovalTarget::CodingAgentNewSession(_) | ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_) | ApprovalTarget::PanelDiscard(_)) { None }
                 else { Some(document.ok_or("The operation needs the current document state")?) };
             Ok((target, document))
         }) {
@@ -575,7 +605,7 @@ impl HostApproval {
         if matches!(target, ApprovalTarget::Settings(None)) { return Ok(()) }
         let tool = call["op"].as_str().unwrap_or_default().replace('.', "_");
         let effect = soul2d_core::manifest::effect_of(&tool).filter(|effect| matches!(*effect, "file-write" | "project-reset" | "import" | "application-lifecycle")
-            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_))))
+            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_) | ApprovalTarget::PanelDiscard(_))))
             .ok_or("The operation effect is missing from the command manifest")?;
         if let Some(request) = &self.request {
             if matches!(request.decision, ApprovalDecision::AllowedOnce) {
@@ -674,6 +704,27 @@ impl HostApproval {
                         .unwrap_or_else(|| "Unsaved".into()), review.document.revision));
                     ui.label("Allow this original request once, even when inputs are clean. After local reply delivery and final input, document and invocation checks, Reload rebuilds the same object or the first available object, or clears the buffer when none remain.");
                     ui.label("Native edits or document changes invalidate this request. This does not apply edits, save, change undo, answer dialogs or discard other panels' drafts. Input contents are not disclosed.");
+                },
+                ApprovalTarget::PanelDiscard(target) => {
+                    ui.label(format!("Action: {}   Target: {}", target.input.action(), target.input.review_label()));
+                    ui.label(format!("Document: {}   Revision: {}", target.document.path.as_ref().map(|path|path.display().to_string())
+                        .unwrap_or_else(|| "Unsaved".into()), target.document.revision));
+                    ui.label(match &target.input {
+                        PanelDiscardInput::Forms(input) => match input.action() {
+                            soul2d_core::editor_controller::FormsInputAction::DiscardMain => "Discard the retained main form inputs only.",
+                            soul2d_core::editor_controller::FormsInputAction::ReloadForm => "Reload the current form, replacing its retained main, form and source settings inputs.",
+                            soul2d_core::editor_controller::FormsInputAction::ReloadForms => "Reset the Forms panel and all its retained inputs.",
+                        },
+                        PanelDiscardInput::Motion3(input) => match input.action() {
+                            soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
+                            | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => "Discard or reload the retained point inputs only.",
+                            soul2d_core::editor_controller::Motion3InputAction::DiscardBindings
+                            | soul2d_core::editor_controller::Motion3InputAction::ReloadBindings => "Discard or reload retained parameter bindings and reset their chooser.",
+                            soul2d_core::editor_controller::Motion3InputAction::ReloadMotion => "Reload the selected motion, including its retained point and bindings inputs.",
+                        },
+                    });
+                    ui.label("Allow this original request once, including clean inputs. Execution follows local reply delivery and final input, document and invocation checks. Native failure can leave partial effects, reported in editor state. No automatic retry.");
+                    ui.label("This does not apply edits, save, change undo, answer dialogs or discard other panels' inputs. Retained input contents are not disclosed.");
                 },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
@@ -1029,6 +1080,48 @@ impl ObjectDiscardTarget {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PanelDiscardInput {
+    Forms(crate::editor_live2d_forms::FormsDiscardTarget),
+    Motion3(crate::editor_motion3::Motion3DiscardTarget),
+}
+
+impl PanelDiscardInput {
+    pub(crate) fn action(&self) -> &'static str {
+        match self { Self::Forms(input) => input.action().name(), Self::Motion3(input) => input.action().name() }
+    }
+    fn review_label(&self) -> &str {
+        match self { Self::Forms(input) => input.review_label(), Self::Motion3(input) => input.review_label() }
+    }
+    pub(crate) fn lane(&self) -> usize {
+        match self {
+            Self::Forms(_) => 0,
+            Self::Motion3(input) => match input.action() {
+                soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
+                | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => 1,
+                soul2d_core::editor_controller::Motion3InputAction::DiscardBindings
+                | soul2d_core::editor_controller::Motion3InputAction::ReloadBindings => 2,
+                soul2d_core::editor_controller::Motion3InputAction::ReloadMotion => 3,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PanelDiscardTarget {
+    pub(crate) input: PanelDiscardInput,
+    pub(crate) document: ObjectDiscardDocument,
+    invocation: Option<AcpInvocation>,
+}
+
+impl PanelDiscardTarget {
+    pub(crate) fn new(input:PanelDiscardInput, document:ObjectDiscardDocument, approval:Option<&HostApproval>) -> Result<Self, String> {
+        let invocation = approval.map(HostApproval::input_invocation).transpose()?;
+        Ok(Self { input, document, invocation })
+    }
+    pub(crate) fn invocation(&self) -> Option<&AcpInvocation> { self.invocation.as_ref() }
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct SendSnapshot {
     owner: StopOwner,
@@ -1334,11 +1427,34 @@ impl<W: Write> AgentPanel<W> {
     pub(crate) fn object_discard_status(&self, target: &ObjectDiscardTarget, admitted: bool) -> bool {
         let Some(invocation) = target.invocation() else { return true };
         let Some(run) = &self.run else { return false };
-        run.id == invocation.run && !run.closed && run.client.prompt_active() && !run.client.conversation.cancelling()
-            && run.client.active_prompt() == Some(invocation.prompt) && invocation.permissions != u64::MAX
-            && run.client.permission_epoch() == invocation.permissions
+        self.input_invocation_live(invocation)
             && (admitted || (run.host_approval.object_discard_review().as_ref() == Some(target)
                 && run.host_approval.request.as_ref().is_some_and(|request|request.created.elapsed() < HOST_APPROVAL_TIMEOUT)))
+    }
+
+    fn input_invocation_live(&self, invocation:&AcpInvocation) -> bool {
+        self.run.as_ref().is_some_and(|run| run.id == invocation.run && !run.closed
+            && run.client.prompt_active() && !run.client.conversation.cancelling()
+            && run.client.active_prompt() == Some(invocation.prompt) && invocation.permissions != u64::MAX
+            && run.client.permission_epoch() == invocation.permissions)
+    }
+
+    pub(crate) fn panel_discard_status(&self, target:&PanelDiscardTarget, admitted:bool) -> bool {
+        let Some(invocation) = target.invocation() else { return true };
+        self.input_invocation_live(invocation) && (admitted || self.run.as_ref().is_some_and(|run|
+            run.host_approval.panel_discard_review().as_ref() == Some(target)
+                && run.host_approval.request.as_ref().is_some_and(|request|request.created.elapsed() < HOST_APPROVAL_TIMEOUT)))
+    }
+
+    pub(crate) fn invalidate_panel_discard(&mut self, target:&PanelDiscardTarget, closing:bool) {
+        let Some(run) = &mut self.run else { return };
+        if run.host_approval.request.as_ref().is_some_and(|request|
+            matches!(&request.target, ApprovalTarget::PanelDiscard(review) if review == target)) {
+            if closing { run.clear_approval("The editor is closing; panel inputs were not discarded"); }
+            else if let Some(request) = &mut run.host_approval.request {
+                if !matches!(request.decision, ApprovalDecision::Denied) { request.decision = ApprovalDecision::Stale; }
+            }
+        }
     }
 
     pub(crate) fn invalidate_object_discard_review(&mut self, target: &ObjectDiscardReviewTarget) {
@@ -1672,6 +1788,8 @@ impl<W: Write> AgentPanel<W> {
             run.clear_approval("Host approval expired; the operation was not applied");
         }
         run.host_approval.set_active(active);
+        run.host_approval.input_context = if active { run.client.active_prompt().map(|prompt|
+            (run.id, prompt, run.client.permission_epoch())) } else { None };
     }
 
     pub fn host_approval_window(&mut self, ctx: &egui::Context, path: Option<&Path>) {
@@ -3255,6 +3373,58 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         client.join().unwrap()
+    }
+
+    #[test]
+    fn panel_discard_occurrences_survive_cleanup_and_permission_changes_and_fail_closed_at_capacity() {
+        use soul2d_core::editor_controller::{EditorController, FormsInputAction};
+        use crate::editor_test_support::{Harness, temp_dir};
+        let path = temp_dir("panel-discard-reservations").join("source.cmo3");
+        std::fs::write(&path, crate::editor_test_support::cmo3_bytes()).unwrap();
+        let mut controller = EditorController::new();
+        assert_eq!(controller.core_request(&json!({"op":"open", "path":path}))["succeeded"], true);
+        let mut forms = crate::editor_live2d_forms::FormEditor::default();
+        Harness::new().frame(Vec::new(), |ctx| { egui::CentralPanel::default().show(ctx, |ui| { forms.show(ui, &mut controller); }); });
+        let inputs = forms.input_snapshot(controller.snapshot());
+        let identity = inputs["actions"].as_array().unwrap().iter().find(|entry|entry["action"] == "reload_form").unwrap()["identity"].as_str().unwrap();
+        let input = PanelDiscardInput::Forms(forms.capture_discard_target(FormsInputAction::ReloadForm, identity, controller.snapshot()).unwrap());
+        let document = ObjectDiscardDocument { revision:controller.snapshot()["revision"].as_u64().unwrap(), path:Some(path) };
+        let (mut panel, _agent, _) = active_panel_endpoint();
+        panel.sync_approval();
+        let run = panel.run.as_mut().unwrap();
+        let prompt = run.client.active_prompt().unwrap();
+        let permissions = run.client.permission_epoch();
+        let approval = &mut run.host_approval;
+        approval.invocation = Some(AcpInvocation { run:run.id, prompt, permissions, call:1 });
+        let first = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+        approval.reserve_input_discard(&first, false).unwrap();
+        assert!(approval.reserve_input_discard(&first, true).unwrap_err().contains("occurrence_consumed"));
+        let call = json!({"op":"editor.live2d.forms.discard", "action":"reload_form", "expectedInputIdentity":identity});
+        assert!(approval.guard(&call, Ok(ApprovalTarget::PanelDiscard(first.clone())), None).is_err());
+        approval.reserve_input_discard(&first, true).unwrap();
+        approval.request.as_mut().unwrap().decision = ApprovalDecision::AllowedOnce;
+        approval.guard(&call, Ok(ApprovalTarget::PanelDiscard(first.clone())), None).unwrap();
+        assert!(approval.reserve_input_discard(&first, true).unwrap_err().contains("occurrence_consumed"));
+        for occurrence in 2..=256 {
+            approval.invocation.as_mut().unwrap().call = occurrence;
+            let target = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+            approval.reserve_input_discard(&target, false).unwrap();
+        }
+        approval.set_active(false);
+        assert!(PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).is_err());
+        assert_eq!(approval.input_occurrences.len(), 256);
+        approval.set_active(true);
+        approval.input_context = Some((run.id, prompt, permissions + 1));
+        approval.invocation = Some(AcpInvocation { run:run.id, prompt, permissions:permissions + 1, call:1 });
+        let changed_permissions = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+        assert!(approval.reserve_input_discard(&changed_permissions, false).unwrap_err().contains("occurrence_consumed"));
+        approval.invocation.as_mut().unwrap().call = 257;
+        let overflow = PanelDiscardTarget::new(input.clone(), document.clone(), Some(approval)).unwrap();
+        assert!(approval.reserve_input_discard(&overflow, false).unwrap_err().contains("occurrence_capacity"));
+        assert_eq!(approval.input_occurrences.len(), 256);
+        assert_eq!(approval.input_occurrences[0].call, 1);
+        approval.input_context = None;
+        assert!(PanelDiscardTarget::new(input, document, Some(approval)).is_err());
     }
 
     fn active_panel_endpoint() -> (AgentPanel<PipeWriter>, Agent, Value) {

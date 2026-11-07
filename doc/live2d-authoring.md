@@ -1531,8 +1531,10 @@ whole group before sending a request; a valid sibling field cannot cause a
 partial commit. Applying another group retains the pending text and its original
 values. Dirty input blocks Save, document replacement, Close and EOF shutdown
 through the existing panel-draft checks. **Discard main edit** clears only the
-main input; **Reload form** clears all three groups. A clean refresh replaces
-the editing text along with the loaded values.
+main input; **Reload form** unloads the main input and marks stored settings for
+reconstruction. Old settings remain retained until reconstruction succeeds, even
+while the panel is hidden. A clean refresh replaces the editing text along with
+the loaded values.
 
 Finite keyboard input keeps the existing whitespace, Unicode minus and exponent
 grammar, range clamps and integer casts. Unfinished text and nonfinite results
@@ -1566,8 +1568,9 @@ retains it. Apply or **Discard main edit** before changing mode or point.
 Applying point, form settings or source settings retains the other drafts and
 advances their revision guards; an external change instead requires Reload.
 **Discard main edit** keeps the form/source settings drafts. **Reload form**
-(**Reload forms** when the selected form is unavailable) discards all three drafts;
-the panel states this beside the action. Neither action edits the document.
+(**Reload forms** in the reachable no-form branch) replaces all applicable drafts
+after successful reconstruction, or resets that no-form panel. Neither action
+edits the document.
 Pending point input blocks Save, document replacement and Quit. Point creation,
 brush creation and stroke rendering remain separate work, as do physical native
 input and vendor acceptance.
@@ -1993,6 +1996,26 @@ Reloading a point or replacing the document creates a fresh editing view, even
 at the same point coordinates. Conditional notices preserve keyboard focus.
 The authored controls share the Forms numeric component; Preview time retains
 its separate transient behavior.
+
+The editor MCP tools `editor_live2d_forms_discard` and `editor_motion3_discard`
+admit these same native input actions. Read the action-specific opaque identity
+from `live2dFormInputs.actions` or `motion3Inputs.actions`; observation never
+initializes a buffer. Forms reload performs bounded reconstruction even while
+hidden. If old settings survive a guard, `native_incomplete` reports retained
+owners and dirty input continues blocking Save. Motion3 point and bindings have
+independent lanes, while whole-motion reload overlaps both. Native errors report
+partial input effects.
+
+Admission is separate from completion. Match action/lane/attempt in
+`live2dFormDiscard` or `motion3Discard.point/bindings/reload`. Complete local reply
+delivery and final input/document/authority checks precede one action after the
+current UI and Close/Quit boundary. Every authenticated ACP occurrence requires
+original-call human Allow once, including clean eligible input. At most 256
+new-family occurrences are reserved per owned prompt across permission changes.
+Failed or expired delivery, changed input/document, invalid authority and native
+Close invalidate pending work without automatic retry. Session history, files,
+other panels' inputs and human dialog answers stay intact. See [MCP API](mcp_api.md)
+for action names and outcome fields.
 
 The `motion3_raw_` CPU tests cover the actual editor frame, native Save action
 dispatch, host MCP save, replacement, Close, EOF, export, accessible numeric
