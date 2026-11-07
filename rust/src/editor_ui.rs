@@ -17104,6 +17104,12 @@ mod shell_flow_tests {
             "source={source} range={range}: closing={} close_sent={} close_requests={}",app.closing,app.close_sent,harness.close_requests);
         if source == "native" { assert!(cancelled,"the backend needs CancelClose in the same frame"); }
         if source == "remote" { assert!(matches!(app.remote_quit,RemoteQuit::Cancelled { .. })); }
+        if source == "eof" {
+            harness.click(Role::Button,"Reload and discard all object edits",|ctx|app.update(ctx,&mut frame));
+            assert!(!app.objects.has_draft());
+            assert!(!app.closing && harness.close_requests==0,"discarding later cannot revive a refused EOF");
+            assert_eq!(app.controller.snapshot(),&before);
+        }
     }
 
     #[test]
@@ -17167,6 +17173,44 @@ mod shell_flow_tests {
                 harness.click(Role::Button,"Cancel",|ctx|app.update(ctx,&mut frame));
                 assert!(!app.closing && app.unsaved.is_none() && harness.close_requests==0);
             }
+            assert_eq!(app.controller.snapshot(),&before);
+        }
+    }
+
+    #[test]
+    fn frame_close_eof_cannot_use_the_native_discard_setting() {
+        let (mut app,_)=app("frame-close-eof-no-discard");
+        edit(&mut app,"Modified");
+        window_shell::set_close_setting(&mut app.tools.store,window_shell::CloseSetting::DontSave).unwrap();
+        let before=app.controller.snapshot().clone();
+        let (sender,receiver)=std::sync::mpsc::channel(); app.host_rx=Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap();
+        let mut harness=Harness::new();
+        let mut frame=eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert!(app.stdin_closed && !app.closing && app.unsaved.is_none() && harness.close_requests==0);
+        assert_eq!(app.controller.snapshot(),&before);
+    }
+
+    #[test]
+    fn frame_close_simultaneous_native_and_eof_preserve_one_human_decision() {
+        for policy in ["clean","ask","discard"] {
+            let (mut app,_)=app(&format!("frame-close-both-{policy}"));
+            if policy!="clean" { edit(&mut app,"Modified"); }
+            if policy=="discard" {
+                window_shell::set_close_setting(&mut app.tools.store,window_shell::CloseSetting::DontSave).unwrap();
+            }
+            let before=app.controller.snapshot().clone();
+            let (sender,receiver)=std::sync::mpsc::channel(); app.host_rx=Some(receiver);
+            sender.send(HostMessage::StdinClosed).unwrap();
+            let mut harness=Harness::new();
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                .events.push(egui::ViewportEvent::Close)));
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(app.closing,policy!="ask","{policy}");
+            assert_eq!(app.unsaved.is_some(),policy=="ask","{policy}");
+            assert_eq!(harness.close_requests,usize::from(policy!="ask"),"one human decision for {policy}");
             assert_eq!(app.controller.snapshot(),&before);
         }
     }
