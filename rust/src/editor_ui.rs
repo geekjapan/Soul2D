@@ -8263,7 +8263,7 @@ impl eframe::App for EditorApp {
         }
         self.lightweight.follow(self.controller.playing(), &self.controller.snapshot()["values"]);
         self.sync_panel_drafts();
-        if self.close_blocked && self.controller.can_close() {
+        if self.close_blocked && self.controller.can_close() && !self.windows.has_document_draft() {
             self.close_blocked = false;
         }
         let confirmation_pending = self.unsaved.is_some();
@@ -13364,7 +13364,8 @@ impl EditorApp {
             self.notice = DIALOG_PENDING_MESSAGE.to_owned();
             return;
         }
-        if self.controller.draft_dirty() || self.motion3.has_draft() || self.forms.has_draft() || self.objects.has_draft()
+        if self.controller.draft_dirty() || self.windows.has_document_draft()
+            || self.motion3.has_draft() || self.forms.has_draft() || self.objects.has_draft()
             || self.parameters.values.has_draft() || self.can3_creation_dirty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_blocked = true;
@@ -21079,6 +21080,101 @@ mod editor_state_tests {
             harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
             assert_eq!(app.panel_discards[stale].state()["state"], "stale_input", "no revival: {case}");
             assert!(!app.motion3.has_draft()); assert_eq!(app.controller.snapshot(), &snapshot);
+        }
+    }
+
+    #[test]
+    fn flip_pairing_dirty_inputs_block_native_close_until_cancel_or_pair_aba() {
+        use base64::Engine;
+        use crate::editor_test_support::{texts, Harness};
+        use egui::accesskit::Role;
+
+        for setting in [window_shell::CloseSetting::Ask, window_shell::CloseSetting::DontSave] {
+            for release in ["Cancel", "Close window", "Remove row 2"] {
+                let mut app = app(&format!("flip-close-{setting:?}-{release}"));
+                app.tools.store.set("firstrun_complete", true).unwrap();
+                app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+                app.tools.store.set("Outline.visible", false).unwrap();
+                window_shell::set_close_setting(&mut app.tools.store, setting).unwrap();
+                let key = crate::editor_windows::FLIP_CONFIG_KEY;
+                let payload = base64::engine::general_purpose::STANDARD.encode(br#"[{"uuid1":1,"uuid2":4294967295}]"#);
+                assert_eq!(app.controller.core_request(&json!({"op":"extdata.set", "key":key, "base64":payload}))["succeeded"], true);
+                let source = app.controller.project_path().unwrap().parent().unwrap().join("stored-pairs.inx");
+                assert_eq!(app.controller.core_request(&json!({"op":"save", "path":source}))["succeeded"], true);
+                let source_bytes = std::fs::read(&source).unwrap();
+                let stored = app.controller.core_request(&json!({"op":"extdata.get", "key":key}));
+                let mut harness = Harness::new();
+                harness.screen = egui::vec2(1800.0, 1600.0);
+                let mut frame = eframe::Frame::_new_kittest();
+                harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+                harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+                harness.click(Role::Button, "Face (Part)", |ctx|app.update(ctx, &mut frame));
+                harness.click(Role::Button, "Add as new row", |ctx|app.update(ctx, &mut frame));
+                assert!(app.windows.has_document_draft() && app.controller.can_close());
+                let snapshot = app.controller.snapshot().clone();
+
+                harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                    .events.push(egui::ViewportEvent::Close)));
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert!(!app.closing && harness.close_requests == 0, "dirty Flip inputs must survive native Close");
+                assert!(app.unsaved.is_none() && app.windows.has_document_draft());
+                let output = harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert!(texts(&output).iter().any(|text|text == "Apply or discard drafts before closing"));
+                assert_eq!(app.controller.snapshot(), &snapshot);
+
+                let saved = source.parent().unwrap().join("ordinary-save.inx");
+                let save = call(&mut app, "save", json!({"path":saved}));
+                assert!(saved.exists(), "ordinary document Save remains available: {save}");
+                assert!(app.windows.has_document_draft());
+                let before_release = app.controller.snapshot().clone();
+                harness.click(Role::Button, release, |ctx|app.update(ctx, &mut frame));
+                assert!(!app.windows.has_document_draft());
+                assert_eq!(app.controller.snapshot(), &before_release);
+                assert_eq!(app.controller.core_request(&json!({"op":"extdata.get", "key":key})), stored);
+                assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+                let output = harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert!(!texts(&output).iter().any(|text|text == "Apply or discard drafts before closing"));
+
+                harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                    .events.push(egui::ViewportEvent::Close)));
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert!(app.closing && harness.close_requests == 1);
+                assert_eq!(app.controller.snapshot(), &before_release);
+                assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_pairing_clean_transients_allow_native_close() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+
+        for transient in [false, true] {
+            let mut app = app(&format!("flip-close-clean-{transient}"));
+            app.tools.store.set("firstrun_complete", true).unwrap();
+            app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+            app.tools.store.set("Outline.visible", false).unwrap();
+            let source = app.controller.project_path().unwrap().to_owned();
+            let source_bytes = std::fs::read(&source).unwrap();
+            let snapshot = app.controller.snapshot().clone();
+            let mut harness = Harness::new();
+            harness.screen = egui::vec2(1800.0, 1600.0);
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+            harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+            if transient {
+                harness.text("Part 1", "owned private pattern", |ctx|app.update(ctx, &mut frame));
+                harness.click(Role::Button, "Face (Part)", |ctx|app.update(ctx, &mut frame));
+            }
+            assert!(!app.windows.has_document_draft());
+            harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                .events.push(egui::ViewportEvent::Close)));
+            harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            assert!(app.closing && harness.close_requests == 1);
+            assert!(app.unsaved.is_none());
+            assert_eq!(app.controller.snapshot(), &snapshot);
+            assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
         }
     }
 
