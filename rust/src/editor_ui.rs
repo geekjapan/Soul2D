@@ -17092,13 +17092,17 @@ mod shell_flow_tests {
             harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
                 .events.push(egui::ViewportEvent::Close)));
         }
-        let output=harness.frame(vec![key(true),egui::Event::Text("same-frame-input".into()),key(false)],
-            |ctx|app.update(ctx,&mut frame));
+        let mut cancelled=false;
+        let output=harness.frame(vec![key(true),egui::Event::Text("same-frame-input".into()),key(false)],|ctx| {
+            app.update(ctx,&mut frame);
+            cancelled=ctx.viewport(|viewport|viewport.commands.contains(&egui::ViewportCommand::CancelClose));
+        });
         assert!(app.objects.has_draft(),"the full App frame must actually consume the new input");
         assert!(crate::editor_test_support::texts(&output).iter().any(|text|text=="same-frame-input"));
         assert_eq!(app.controller.snapshot(),&before);
         assert!(!app.closing && harness.close_requests==0,
             "source={source} range={range}: closing={} close_sent={} close_requests={}",app.closing,app.close_sent,harness.close_requests);
+        if source == "native" { assert!(cancelled,"the backend needs CancelClose in the same frame"); }
         if source == "remote" { assert!(matches!(app.remote_quit,RemoteQuit::Cancelled { .. })); }
     }
 
