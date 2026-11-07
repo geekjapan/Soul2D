@@ -241,9 +241,9 @@ or accepted Soul2D behavior.
 - GEO19, [Issue #13](https://github.com/geekjapan/Soul2D/issues/13). The official
   [Deform Paths manual](https://docs.live2d.com/en/cubism-editor-manual/deformpath/)
   defines control paths on ArtMeshes. Editing path points and deforming the mesh
-  are different modes. The remaining definition work is the source representation
-  and deformation calculation, with a legitimate minimal example. An INX
-  PathDeformer or an ArtPath is not a substitute.
+  are different modes. An INX PathDeformer or an ArtPath is not a substitute.
+  The 2026-11-07 checks below supersede the earlier missing-example conclusion;
+  deformation behavior still requires a concrete operation definition.
 - PAR06/PAR07, [Issue #14](https://github.com/geekjapan/Soul2D/issues/14). The
   [interpolation-type manual](https://docs.live2d.com/en/cubism-editor-manual/extended-type/)
   describes controls and trajectories but supplies no complete construction
@@ -257,6 +257,44 @@ or accepted Soul2D behavior.
   It does not settle asymmetric/even key pairing or the exact nested-space
   transformation. A three-key, single-deformer observation is the next bounded
   definition check; these notes are not implementation or vendor acceptance.
+
+### GEO19 evidence update on 2026-11-07
+
+A read-only scan of the existing private official-sample cache verified the
+recorded hashes of 59 archives and 90 distinct CMO3 byte contents. In 57 files,
+1,694 ArtMesh-attached `CControllerExtension` records have nonempty curve and
+point collections. These are controller-record and file counts, not counts of
+individual paths or unique rigs; locale variants may share rig structures.
+The earlier claim that these samples contain no Deform Paths was based on a
+source projection that omits this extension and is withdrawn. See the
+[sample-verification boundary](official-sample-verification.md).
+
+Saved examples contain edit levels 2/3, an open curve with three points, owner
+and curve-point references, and a main/sub-ArtMesh relationship. The main mesh
+is identified by the extension's owner, rather than a saved
+`mainArtMeshGuid` field. Static inspection of the pinned Cubism 5.3.04 artifact
+independently identifies that property as computed and excluded by its default
+serializer's read-only/no-backing-field rule. This is evidence of the stored
+representation, not of Soul2D support for editing it.
+
+On one cached model with 13 controllers, the owned Soul2D headless binary at
+`4693e60197a90e14358888e0095a9365fc2a1201` saved the unchanged file byte-exactly.
+After one ArtMesh rename, only that name element changed in the main XML;
+all other XML bytes and non-main payloads remained equal. Undo/Redo restored
+the models, save/reopen preserved the edited model, and the original input
+and binary hashes stayed unchanged. This bounds preservation to that model
+and operation. No model, geometry or vendor code is distributed with this record.
+
+GEO19 remains open. Define placement separately from mesh deformation, including
+binding and influence calculations, selected parameter keyforms, coordinate
+spaces, levels and main/sub targets. A control-point metadata setter alone does
+not establish deformation. An independently owned minimal fixture must exercise
+the supported contract through Session, MCP, resource readback, operating
+guidance and the GUI, including revisions, atomic refusal, Undo/Redo and
+save/reopen with unrelated data retained. The Cubism workflow, geometry and
+render comparisons remain **NOT_RUN**; the ledger's S5 source identifier does
+not mean implementation or acceptance. Private evidence is indexed in
+[Issue #13](https://github.com/geekjapan/Soul2D/issues/13#issuecomment-6699283423).
 
 ### Successor feature backlog
 

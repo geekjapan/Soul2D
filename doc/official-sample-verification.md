@@ -47,6 +47,21 @@ reading, or the final comparison as its stage. Missing archives leave the run
 incomplete; malformed archives or failed CMO3 checks fail it. CAN3 and runtime
 files remain outside this particular check.
 
+This is a projection comparison, not an inventory of every XML class or
+extension. In particular, the oracle's ArtMesh extension handling covers
+`CEditableMeshExtension`, not `CControllerExtension` (Deform Paths). Agreement
+between the reader and oracle, or a count of recognized source kinds, cannot
+establish that an omitted extension is absent or supported.
+
+On 2026-11-07, a separate raw-XML scan of the existing private cache verified
+59 archive hashes and 90 distinct CMO3 member hashes. It found nonempty curve
+and point collections in 1,694 ArtMesh-attached controller records across
+57 files, correcting an earlier claim that the corpus had no Deform Paths.
+These are not individual-path or unique-rig counts, and no redistribution
+permission is inferred. The [GEO19 evidence update](cubism-feature-ledger.md#geo19-evidence-update-on-2026-11-07)
+separates stored examples and bounded preservation from path-authoring and
+vendor acceptance. Original assets and detailed receipts remain private.
+
 Older CMO3 files can store generated normal forms in `extendedKeyforms`, before
 the separate `normalExtendedKeyforms` and `morphTargetExtendedKeyforms` lists.
 The reader maps that historical list to the same normal-form response. It
