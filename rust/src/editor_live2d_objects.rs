@@ -301,6 +301,54 @@ mod tests {
     }
 
     #[test]
+    fn object_drafts_applying_one_named_field_keeps_the_other_input() {
+        for first in ["Apply name", "Apply ID"] {
+            let (mut controller, mut editor, mut harness, _) = open_rotation(
+                &format!("objects-sibling-{first}"), &crate::editor_test_support::artpath_cmo3_xml());
+            for (field, value) in [("Name","Unapplied mesh name"), ("ID","ArtMeshFace")] {
+                harness.text(field,value,|ctx| {
+                    egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+                });
+            }
+            let before = controller.snapshot().clone();
+            assert!(editor.has_draft());
+            click(&mut harness,&mut editor,&mut controller,first);
+            assert!(editor.error.is_empty(),"{}",editor.error);
+            assert_eq!(controller.snapshot()["revision"].as_u64().unwrap(),before["revision"].as_u64().unwrap()+1);
+            assert_eq!(editor.name,"Unapplied mesh name","applying ID must preserve pending Name input");
+            assert_eq!(editor.id,"ArtMeshFace","applying Name must preserve pending ID input");
+            assert!(editor.has_draft(),"the other field has not been applied");
+            let output = harness.frame(Vec::new(),|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+            });
+            let sibling = if first == "Apply name" {"ID"} else {"Name"};
+            let expected = if first == "Apply name" {"ArtMeshFace"} else {"Unapplied mesh name"};
+            assert_eq!(crate::editor_test_support::find(&output,Role::TextInput,sibling).unwrap().value(),Some(expected));
+        }
+    }
+
+    #[test]
+    fn object_drafts_external_revision_keeps_actual_named_input_until_explicit_resolution() {
+        let (mut controller, mut editor, mut harness, _) = open_rotation(
+            "objects-external-draft",&crate::editor_test_support::artpath_cmo3_xml());
+        harness.text("Name","Pending local name",|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        let loaded = editor.revision;
+        let response = controller.core_request(&json!({"op":"live2d.set_id","guid":"mesh-guid","id":"RemoteID",
+            "expectedRevision":controller.snapshot()["revision"]}));
+        assert_eq!(response["succeeded"],true,"{response}");
+        let before = controller.snapshot().clone();
+        harness.frame(Vec::new(),|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { editor.show(ui,&mut controller); });
+        });
+        assert_eq!(editor.name,"Pending local name","an external revision must not erase unsent input");
+        assert!(editor.has_draft());
+        assert_eq!(editor.revision,loaded,"an external revision cannot silently authorize stale input");
+        assert_eq!(controller.snapshot(),&before);
+    }
+
+    #[test]
     fn rotation_destination_controls_preserve_the_model_except_target_and_positions_with_one_undo() {
         let (mut controller, mut editor, mut harness, _path) = open_rotation("object-rotation-success", include_str!("../tests/fixtures/rotation-reparent.xml"));
         let before = controller.snapshot().clone();

@@ -16549,6 +16549,78 @@ mod shell_flow_tests {
         assert_eq!(app.controller.snapshot(), &before);
     }
 
+    fn object_draft_app(name: &str) -> (EditorApp, PathBuf, Harness) {
+        let (mut app, dir) = app(name);
+        let source = dir.join("object.cmo3");
+        std::fs::write(&source,crate::editor_test_support::caff_with_xml(
+            &crate::editor_test_support::artpath_cmo3_xml())).unwrap();
+        app.command(json!({"op":"open","path":source}));
+        assert_eq!(app.controller.snapshot()["documentFormat"],"live2d.cmo3");
+        let mut harness = Harness::new(); harness.screen = egui::vec2(1200.0,1800.0);
+        harness.text("Name","Pending object name",|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+        });
+        assert!(app.objects.has_draft());
+        assert!(!modified(&app));
+        (app,dir,harness)
+    }
+
+    #[test]
+    fn object_drafts_block_native_save_over_actual_named_input() {
+        let (mut app,dir,_) = object_draft_app("objects-native-save-draft");
+        let before = app.controller.snapshot().clone(); let target = dir.join("blocked.cmo3");
+        app.command(json!({"op":"save","path":target}));
+        assert!(!target.exists(),"Save must not silently omit pending object input");
+        assert_eq!(app.controller.snapshot(),&before);
+        assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_drafts_block_dialog_save_over_actual_named_input() {
+        let (mut app,dir,_) = object_draft_app("objects-dialog-save-draft");
+        let before = app.controller.snapshot().clone(); let target = dir.join("blocked.cmo3");
+        assert!(app.save_for_dialog(target.to_str().unwrap()).is_err(),"dialog Save must retain object input");
+        assert!(!target.exists()); assert_eq!(app.controller.snapshot(),&before);
+        assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_drafts_block_mcp_save_over_actual_named_input() {
+        let (mut app,dir,_) = object_draft_app("objects-mcp-save-draft");
+        let before = app.controller.snapshot().clone(); let target = dir.join("blocked.cmo3");
+        app.sync_panel_drafts(); let ctx = egui::Context::default();
+        let message = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"save","arguments":{"path":target}}});
+        let reply = editor_view!(app,&ctx).mcp(&mut app.controller,&message,McpOrigin::Client).into_message().unwrap();
+        assert_eq!(reply["result"]["isError"],true,"MCP Save must preserve the same input: {reply}");
+        assert!(!target.exists()); assert_eq!(app.controller.snapshot(),&before);
+        assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_drafts_block_native_close_over_actual_named_input() {
+        let (mut app,_,mut harness) = object_draft_app("objects-native-close-draft");
+        let before = app.controller.snapshot().clone();
+        harness.next_input = Some(Box::new(|input| input.viewports.entry(egui::ViewportId::ROOT).or_default()
+            .events.push(egui::ViewportEvent::Close)));
+        harness.frame(Vec::new(),|ctx| app.handle_close_request(ctx));
+        assert!(!app.closing && app.close_blocked && harness.close_requests == 0,"native Close must preserve object input");
+        assert_eq!(app.controller.snapshot(),&before); assert!(app.objects.has_draft());
+    }
+
+    #[test]
+    fn object_drafts_are_observable_as_panel_work_over_actual_named_input() {
+        let (mut app,_,_) = object_draft_app("objects-panel-observer-draft");
+        let before = app.controller.snapshot().clone();
+        app.sync_panel_drafts(); assert!(app.controller.panel_drafts,"controller must observe object work");
+        let ctx = egui::Context::default(); let message = json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
+            "params":{"uri":"resource://soul2d/editor/state"}});
+        let reply = editor_view!(app,&ctx).mcp(&mut app.controller,&message,McpOrigin::Client).into_message().unwrap();
+        let state: Value = serde_json::from_str(reply["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(state["drafts"]["panels"],true);
+        assert_eq!(app.controller.snapshot(),&before); assert!(app.objects.has_draft());
+    }
+
     #[test]
     fn the_window_size_is_remembered_at_exit() {
         let (mut app, dir) = app("flow-geometry");
