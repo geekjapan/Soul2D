@@ -17064,8 +17064,8 @@ mod shell_flow_tests {
         }
     }
 
-    fn frame_close_with_new_object_input(eof: bool, range: bool) {
-        let name = format!("frame-close-{}-{}",if eof {"eof"}else{"native"},if range {"range"}else{"name"});
+    fn frame_close_with_new_object_input(source: &str, range: bool) {
+        let name = format!("frame-close-{source}-{}",if range {"range"}else{"name"});
         let (mut app,_,mut harness) = object_range_app(&name);
         harness.screen=egui::vec2(1800.0,2400.0);
         let mut frame=eframe::Frame::_new_kittest();
@@ -17077,9 +17077,17 @@ mod shell_flow_tests {
         let before=app.controller.snapshot().clone();
         let key=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,
             modifiers:egui::Modifiers::COMMAND};
-        if eof {
+        if source == "eof" {
             let (sender,receiver)=std::sync::mpsc::channel(); app.host_rx=Some(receiver);
             sender.send(HostMessage::StdinClosed).unwrap();
+        } else if source == "remote" {
+            let ctx=egui::Context::default();
+            let request=json!({"jsonrpc":"2.0","id":"same-frame-quit","method":"tools/call",
+                "params":{"name":"editor_quit","arguments":{}}});
+            app.sync_panel_drafts();
+            let reply=editor_view!(app,&ctx).mcp(&mut app.controller,&request,McpOrigin::Client);
+            assert!(matches!(app.remote_quit,RemoteQuit::Waiting { .. }));
+            reply.write_line(&mut Vec::new()).unwrap();
         } else {
             harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
                 .events.push(egui::ViewportEvent::Close)));
@@ -17090,20 +17098,26 @@ mod shell_flow_tests {
         assert!(crate::editor_test_support::texts(&output).iter().any(|text|text=="same-frame-input"));
         assert_eq!(app.controller.snapshot(),&before);
         assert!(!app.closing && harness.close_requests==0,
-            "eof={eof} range={range}: closing={} close_sent={} close_requests={}",app.closing,app.close_sent,harness.close_requests);
+            "source={source} range={range}: closing={} close_sent={} close_requests={}",app.closing,app.close_sent,harness.close_requests);
+        if source == "remote" { assert!(matches!(app.remote_quit,RemoteQuit::Cancelled { .. })); }
     }
 
     #[test]
-    fn frame_close_native_retains_new_object_range_input() { frame_close_with_new_object_input(false,true); }
+    fn frame_close_native_retains_new_object_range_input() { frame_close_with_new_object_input("native",true); }
 
     #[test]
-    fn frame_close_native_retains_new_object_name_input() { frame_close_with_new_object_input(false,false); }
+    fn frame_close_native_retains_new_object_name_input() { frame_close_with_new_object_input("native",false); }
 
     #[test]
-    fn frame_close_eof_retains_new_object_range_input() { frame_close_with_new_object_input(true,true); }
+    fn frame_close_eof_retains_new_object_range_input() { frame_close_with_new_object_input("eof",true); }
 
     #[test]
-    fn frame_close_eof_retains_new_object_name_input() { frame_close_with_new_object_input(true,false); }
+    fn frame_close_eof_retains_new_object_name_input() { frame_close_with_new_object_input("eof",false); }
+
+    #[test]
+    fn frame_close_delivered_remote_quit_retains_new_object_input() {
+        for range in [false,true] { frame_close_with_new_object_input("remote",range); }
+    }
 
     #[test]
     fn the_window_size_is_remembered_at_exit() {
