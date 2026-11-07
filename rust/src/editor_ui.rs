@@ -275,6 +275,7 @@ fn pending_action_kind(action: &PendingAction) -> &'static str {
 const DRAFT_BLOCKS_MESSAGE: &str = "Apply or discard the open draft before replacing or closing the document";
 const MOTION3_DRAFT_MESSAGE: &str = "Apply or discard Motion3 drafts before saving";
 const FORM_DRAFT_MESSAGE: &str = "Apply or reload the Live2D form draft before saving";
+const OBJECT_DRAFT_MESSAGE: &str = "Apply the edits in Live2D objects, or reload and discard them first";
 const CAN3_CURVE_DRAFT_MESSAGE: &str = "Add or discard the new CAN3 curve before saving";
 const CAN3_KEY_DRAFT_MESSAGE: &str = "Add or discard the new CAN3 key before saving";
 const CAN3_TRACK_DRAFT_MESSAGE: &str = "Add or discard the new CAN3 track before saving";
@@ -2573,6 +2574,10 @@ impl EditorApp {
             }
             if self.forms.has_draft() {
                 self.notice = FORM_DRAFT_MESSAGE.to_owned();
+                return;
+            }
+            if self.objects.has_draft() {
+                self.notice = OBJECT_DRAFT_MESSAGE.to_owned();
                 return;
             }
         }
@@ -7807,8 +7812,8 @@ impl eframe::App for EditorApp {
         } else {
             self.last_tick = None;
         }
-        // After the tick: the values the next frame's panels show.
         self.lightweight.follow(self.controller.playing(), &self.controller.snapshot()["values"]);
+        self.sync_panel_drafts();
         if self.close_blocked && self.controller.can_close() {
             self.close_blocked = false;
         }
@@ -8237,6 +8242,7 @@ impl eframe::App for EditorApp {
         self.can3_delete_dialog(ctx);
         self.draw_recovery_offer(ctx);
         self.guide_settings_window(ctx);
+        self.sync_panel_drafts();
         self.finish_remote_quit(ctx);
     }
 
@@ -12760,6 +12766,10 @@ impl EditorApp {
     }
 
     fn resolve_prompt(&mut self, choice: PromptChoice) {
+        if choice != PromptChoice::Cancel && self.objects.has_draft() {
+            self.notice = OBJECT_DRAFT_MESSAGE.to_owned();
+            return;
+        }
         let Some(prompt) = self.tools.prompt.take() else { return };
         let Some(config_dir) = self.tools.config_dir.clone() else { return };
         if choice == PromptChoice::Restore {
@@ -12814,8 +12824,11 @@ impl EditorApp {
         }
     }
 
-    /// Does what the user asked for once the unsaved changes are saved or given up (`discard`).
     fn carry_out(&mut self, action: PendingAction, discard: bool) {
+        if self.objects.has_draft() {
+            self.notice = OBJECT_DRAFT_MESSAGE.to_owned();
+            return;
+        }
         self.discarding = discard;
         match action {
             PendingAction::Request(request) => self.run_command(request),
@@ -12842,7 +12855,6 @@ impl EditorApp {
         }
     }
 
-    /// Saves for the dialog's Save button: to the typed path, else the document's own path.
     fn save_for_dialog(&mut self, typed: &str) -> Result<(), String> {
         if self.can3_key_draft.is_some() {
             return Err(CAN3_KEY_DRAFT_MESSAGE.to_owned());
@@ -12861,6 +12873,9 @@ impl EditorApp {
         }
         if self.forms.has_draft() {
             return Err(FORM_DRAFT_MESSAGE.to_owned());
+        }
+        if self.objects.has_draft() {
+            return Err(OBJECT_DRAFT_MESSAGE.to_owned());
         }
         let target = window_shell::save_target(self.controller.project_path(), typed).ok_or("Enter a path to save to")?;
         if autosave::is_recovery_path(Path::new(&target)) {
@@ -12894,7 +12909,6 @@ impl EditorApp {
         }
     }
 
-    /// A window close request: drafts refuse it, unsaved changes ask (or are given up under "Don't save").
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|input| input.viewport().close_requested()) || self.closing {
             return;
@@ -12904,7 +12918,8 @@ impl EditorApp {
             self.notice = DIALOG_PENDING_MESSAGE.to_owned();
             return;
         }
-        if self.controller.draft_dirty() || self.motion3.has_draft() || self.forms.has_draft() || self.parameters.values.has_draft() || self.can3_creation_dirty() {
+        if self.controller.draft_dirty() || self.motion3.has_draft() || self.forms.has_draft() || self.objects.has_draft()
+            || self.parameters.values.has_draft() || self.can3_creation_dirty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_blocked = true;
             return;
@@ -13006,12 +13021,10 @@ impl EditorApp {
             || self.can3_key_draft.is_some()
     }
 
-    /// Answers the waiting connections once per frame, through the controller so the same refusals apply as
-    /// for stdin MCP (unsaved changes, open drafts).
-    /// Panel drafts live outside the controller; every MCP entry point refreshes the flag first.
     fn sync_panel_drafts(&mut self) {
         self.controller.panel_drafts =
-            self.motion3.has_draft() || self.forms.has_draft() || self.parameters.values.has_draft() || self.can3_creation_dirty();
+            self.motion3.has_draft() || self.forms.has_draft() || self.objects.has_draft()
+                || self.parameters.values.has_draft() || self.can3_creation_dirty();
     }
 
     fn serve_mcp(&mut self, ctx: &egui::Context) {
@@ -16717,6 +16730,94 @@ mod shell_flow_tests {
     #[test]
     fn object_drafts_late_autosave_cancel_preserves_input_and_backup() {
         object_draft_during_restore_prompt(PromptChoice::Cancel);
+    }
+
+    #[test]
+    fn object_drafts_survive_a_real_cpu_frame_and_keep_close_blocked() {
+        let (mut app,_,mut harness) = object_draft_app("objects-full-frame");
+        assert!(!app.controller.panel_drafts,"the component created input before the aggregate observed it");
+        app.close_blocked = true;
+        let before = app.controller.snapshot().clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.frame(Vec::new(),|ctx| app.update(ctx,&mut frame));
+        assert!(app.close_blocked && app.controller.panel_drafts && app.objects.has_draft());
+        assert!(!app.closing && harness.close_requests == 0);
+        for key in ["model","revision","history","modified"] { assert_eq!(app.controller.snapshot()[key],before[key]); }
+    }
+
+    #[test]
+    fn object_drafts_invalidate_admitted_quit_preserve_replacements_and_eof_and_release_on_discard() {
+        let (mut app,dir,mut harness) = object_draft_app("objects-quit-eof");
+        app.objects.reset(); app.sync_panel_drafts();
+        let ctx = egui::Context::default();
+        let quit = json!({"jsonrpc":"2.0","id":"object-quit","method":"tools/call",
+            "params":{"name":"editor_quit","arguments":{}}});
+        let admitted = editor_view!(app,&ctx).mcp(&mut app.controller,&quit,McpOrigin::Client);
+        fn draw(app: &mut EditorApp,ctx: &egui::Context) {
+            egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+        }
+        harness.text("Name","Input after Quit admission",|ctx| draw(&mut app,ctx));
+        assert!(app.objects.has_draft()); let before = app.controller.snapshot().clone();
+        admitted.write_line(&mut Vec::new()).unwrap();
+        harness.frame(Vec::new(),|ctx| app.finish_remote_quit(ctx));
+        assert!(!app.closing && harness.close_requests == 0);
+        app.command(json!({"op":"new"})); assert!(app.unsaved.is_none());
+        app.guard_replace(PendingAction::ImportLayers); assert!(app.unsaved.is_none());
+        app.handle_drop(&[dir.join("object.cmo3"),dir.join("layers.psd")]);
+        app.sync_panel_drafts();
+        for (name,arguments) in [("new",json!({})),("open",json!({"path":dir.join("object.cmo3")})),("editor_quit",json!({}))] {
+            let message = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+            let reply = editor_view!(app,&ctx).mcp(&mut app.controller,&message,McpOrigin::Client).into_message().unwrap();
+            assert_eq!(reply["result"]["isError"],true,"{reply}");
+        }
+        let (sender,receiver) = std::sync::mpsc::channel(); app.host_rx = Some(receiver);
+        sender.send(HostMessage::StdinClosed).unwrap(); harness.frame(Vec::new(),|ctx| app.drain_host(ctx));
+        assert!(app.stdin_closed && app.close_blocked && !app.closing && harness.close_requests == 0);
+        assert!(app.objects.has_draft()); assert_eq!(app.controller.snapshot(),&before);
+        harness.click(Role::Button,"Reload and discard all object edits",|ctx| draw(&mut app,ctx));
+        app.sync_panel_drafts(); assert!(!app.objects.has_draft() && !app.controller.panel_drafts);
+        assert_eq!(app.controller.snapshot(),&before);
+        let target = dir.join("after-discard.cmo3"); app.command(json!({"op":"save","path":target}));
+        assert_eq!(std::fs::read(target).unwrap(),std::fs::read(dir.join("object.cmo3")).unwrap());
+    }
+
+    #[test]
+    fn object_drafts_actual_http_save_refuses_until_the_native_discard() {
+        use std::io::{Read,Write};
+        use std::net::{Shutdown,TcpStream};
+        let (mut app,dir,mut harness) = object_draft_app("objects-http-save");
+        let server = mcp_listener::McpServer::start(&McpSettings {
+            enabled:true,host:"127.0.0.1".into(),port:0,auth:true,
+        },Some("owned-object-draft-token".into())).unwrap();
+        let address = server.url().strip_prefix("http://").unwrap().split('/').next().unwrap().to_owned();
+        app.mcp_server = Some(server);
+        let target = dir.join("http-save.cmo3"); let before = app.controller.snapshot().clone();
+        for blocked in [true,false] {
+            if !blocked {
+                harness.click(Role::Button,"Reload and discard all object edits",|ctx| {
+                    egui::CentralPanel::default().show(ctx,|ui| { app.objects.show(ui,&mut app.controller); });
+                });
+                assert_eq!(app.controller.snapshot(),&before);
+            }
+            let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"save","arguments":{"path":target}}}).to_string();
+            let address = address.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                write!(stream,"POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer owned-object-draft-token\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+                stream.shutdown(Shutdown::Write).unwrap(); let mut response = String::new(); stream.read_to_string(&mut response).unwrap(); response
+            });
+            let deadline = Instant::now()+Duration::from_secs(5); let ctx = egui::Context::default();
+            while !client.is_finished() { assert!(Instant::now()<deadline,"owned HTTP reply did not finish");app.serve_mcp(&ctx);std::thread::yield_now(); }
+            let response = client.join().unwrap(); assert!(response.starts_with("HTTP/1.1 200 OK"));
+            let reply: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(reply["result"]["isError"],blocked,"{reply}");
+            if blocked { assert!(!target.exists());assert_eq!(app.controller.snapshot(),&before);assert!(app.objects.has_draft()); }
+        }
+        app.mcp_server = None;
+        assert_eq!(std::fs::read(target).unwrap(),std::fs::read(dir.join("object.cmo3")).unwrap());
     }
 
     #[test]

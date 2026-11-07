@@ -1417,6 +1417,34 @@ with the current `expectedRevision`:
 No object can be created from nothing: every new object is a copy of one the
 file already holds.
 
+In **Live2D objects**, Name, ID, Parent Part, Rotation destination and parameter
+range are retained input groups. Each Apply commits its group through the
+existing Session operation. A successful Apply, including a no-op, keeps the
+other pending groups and their original comparison values. Duplicate and
+Add/Delete key operate on the stored object and keep pending metadata on the
+original object. A copy does not inherit that unapplied input. Delete waits
+until the object's pending input is applied or explicitly discarded.
+
+An external edit or Undo/Redo preserves pending input and its loaded identity
+and revision. Stale or missing objects cannot be applied or silently replaced by
+another selection. Missing relationship choices show their retained GUIDs.
+**Reload and discard all object edits** discards all five groups and reads the
+current object, or selects an available object if the old one is gone. Reload
+changes no document or history. Key axis and Key remain action inputs rather
+than authored drafts. Actual document replacement still resets the old panel.
+This replaces the earlier disposable-input behaviour; the stored reparenting
+and geometry restrictions above are unchanged.
+
+Pending object input blocks native/dialog/MCP Save, document replacement and
+window Close, as well as Quit and stdin EOF. An older unsaved-changes dialog
+cannot bypass this check after new object input appears. The Restore Autosave
+prompt also rechecks before Restore or Discard; refusal keeps
+the prompt and backup, and Cancel remains available. The editor resource's
+`drafts.panels` reports the pending work without exposing its contents. Local
+Reload/discard has no MCP counterpart and remains GUI-only resolution tracked
+under Issue #2. Existing Session setters do not clear a person's pending input.
+CPU egui and HTTP checks do not establish physical native input or vendor parity.
+
 The stored settings of a primary form and of a source are edited with
 `live2d_form_set` and `live2d_source_set`. `live2d_form_set` covers draw order
 of ArtMesh and existing private ArtPath primary forms, colours of ArtMesh and Part forms, angle, origin, scale

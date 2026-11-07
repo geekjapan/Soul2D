@@ -15396,6 +15396,9 @@
     {
       "description": "Delete one source of the active CMO3 (ArtMesh, deformer, empty Part, Glue or ArtPath, by guid) that no other source names as parent, deformer, clipping mask or Glue target; its texture goes too when no other ArtMesh uses it, and so do the objects only it uses (its GUID object, extensions, keyform grid) and a Cubism 2.1 conversion record that names it. The root Part, a Part with children and a source the file names from anywhere else are refused, and the message says where. An unused ArtPath brush can also be deleted; any remaining source or XML reference refuses deletion. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_delete",
       "inputSchema": {
@@ -15423,6 +15426,9 @@
     {
       "description": "Copy one ArtMesh, ArtPath, deformer, Glue or empty Part of the active CMO3 (by guid) under the same parent, after the last source of its kind, or one parameter that no source keys and the physics settings do not use, at the end and in its group. The copy is the original's own XML with new identifiers. An ArtPath brush can also be copied at the end of the brush list, with its current settings and texture metadata but without duplicating image bytes. A texture setting embedded in another model object is refused. It keeps the name and takes id (default <id>_copy). A source the file names from outside the sources, for example from a registry, is refused. The reply carries the copy's guid. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_duplicate",
       "inputSchema": {
@@ -15830,6 +15836,9 @@
     {
       "description": "Add a key to one ArtMesh or warp deformer of the active CMO3 (sourceGuid) on its axis for one parameter (parameterGuid). key lies in the parameter's range and is not a key yet. Each new form takes the vertices and opacity interpolated linearly between its neighbours on the axis (or those of the end form) and is written as a copy of a form the file stores. Sources with blend shapes or extended interpolation forms are refused. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_keyform_add",
       "inputSchema": {
@@ -15865,6 +15874,9 @@
     {
       "description": "Delete one key, and the forms on it, from the axis of one ArtMesh or warp deformer of the active CMO3 (sourceGuid) for one parameter (parameterGuid). The last key of an axis stays. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_keyform_delete",
       "inputSchema": {
@@ -15928,6 +15940,9 @@
     {
       "description": "Delete one parameter of the active CMO3 (by guid) that no source keys and the physics settings do not use, with its places in parameter groups and the objects only it uses. A parameter the file names from anywhere else is refused, and the message says where. Motions that use its ID are not changed. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_parameter_delete",
       "inputSchema": {
@@ -15955,6 +15970,9 @@
     {
       "description": "Change the stored minimum, maximum, default and repeat flag of one parameter of the active CMO3 (by guid); each key is optional. The default must lie in the range, and so must every key a source has on the parameter. A field the file does not store is copied from another parameter. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_parameter_edit",
       "inputSchema": {
@@ -16436,6 +16454,9 @@
     {
       "description": "Set the display name of one ArtMesh, ArtPath, Part, deformer or Glue (its localName), of one parameter or of one ArtPath brush in the active CMO3 document, with shared revision and undo/redo. guid is the source, parameter or brush GUID from live2d_authoring_read; the ID string is not changed. Requires the current expectedRevision. A name stored as a shared string, or an object without a name field, is rejected.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_rename",
       "inputSchema": {
@@ -16557,6 +16578,9 @@
     {
       "description": "Change the ID string of one ArtMesh, Part, deformer, Glue or ArtPath, of one parameter or of one ArtPath brush, in the active CMO3 (by guid). id is 1 to 63 ASCII letters, digits or underscores and unused among the sources (or the parameters, or the brushes). A parameter's keyform axes and morph weights follow; motions, expressions and physics files that name the old ID are not changed. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels"
+      ],
       "headless_ok": true,
       "id": "live2d_set_id",
       "inputSchema": {

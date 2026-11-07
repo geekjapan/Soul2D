@@ -375,6 +375,12 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "CAN3 Outline > New CAN3 curve > PartOpacity > Refresh Part choices",
         "Live2D panels",
     ]),
+    ("live2d_delete", &[
+        "Live2D panels",
+    ]),
+    ("live2d_duplicate", &[
+        "Live2D panels",
+    ]),
     ("live2d_expression_import", &[
         "Live2D runtime panels",
     ]),
@@ -384,8 +390,20 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("live2d_form_set", &[
         "Live2D panels",
     ]),
+    ("live2d_keyform_add", &[
+        "Live2D panels",
+    ]),
+    ("live2d_keyform_delete", &[
+        "Live2D panels",
+    ]),
     ("live2d_model_attach", &[
         "Live2D runtime panels",
+    ]),
+    ("live2d_parameter_delete", &[
+        "Live2D panels",
+    ]),
+    ("live2d_parameter_edit", &[
+        "Live2D panels",
     ]),
     ("live2d_parameter_set", &[
         "Live2D runtime panels",
@@ -423,10 +441,16 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("live2d_pose_reset", &[
         "Live2D runtime panels",
     ]),
+    ("live2d_rename", &[
+        "Live2D panels",
+    ]),
     ("live2d_reparent", &[
         "Live2D panels",
     ]),
     ("live2d_reparent_deformer", &[
+        "Live2D panels",
+    ]),
+    ("live2d_set_id", &[
         "Live2D panels",
     ]),
     ("live2d_source_set", &[
