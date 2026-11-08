@@ -317,6 +317,36 @@ fn dispatch_message(handler: &mut dyn FnMut(&Value) -> Option<Value>, message: &
     }
 }
 
+fn write_all_before(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "MCP response write timed out");
+    let outcome = (|| {
+        stream.set_nonblocking(true)?;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(timed_out()); }
+            if bytes.is_empty() { break; }
+            match stream.write(bytes) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "MCP response write stopped")),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() { return Err(timed_out()); }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        stream.flush()?;
+        if Instant::now() >= deadline { return Err(timed_out()); }
+        Ok(())
+    })();
+    let restored = stream.set_nonblocking(false);
+    outcome.and(restored)?;
+    if Instant::now() >= deadline { return Err(timed_out()); }
+    Ok(())
+}
+
 fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &str, budget: Duration) -> io::Result<()> {
     let mut out = format!("HTTP/1.1 {status} {}\r\nConnection: close\r\n", reason(status));
     if status != 204 {
@@ -327,20 +357,9 @@ fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)],
     }
     out.push_str("\r\n");
     out.push_str(body);
-    // One slow reader must not hold the only server thread forever.
-    // The budget covers the whole response: a reader that trickles must not reset it on every write.
-    // The peer may already be gone; there is nobody to report that to.
+    // Blocking socket timeouts can restart on progress; enforce the absolute send deadline in user space.
     let write_deadline = Instant::now() + budget;
-    let mut rest = out.as_bytes();
-    while !rest.is_empty() {
-        let left = write_deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "MCP response write timed out")); }
-        stream.set_write_timeout(Some(left))?;
-        let written = stream.write(rest)?;
-        if written == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "MCP response write stopped")); }
-        rest = &rest[written..];
-    }
-    stream.flush()?;
+    write_all_before(stream, out.as_bytes(), write_deadline)?;
     // Half-close, then swallow whatever the client still sends so closing does not reset the reply.
     stream.shutdown(Shutdown::Write)?;
     let deadline = (Instant::now() + DRAIN_BUDGET.min(budget)).min(write_deadline);
@@ -491,6 +510,10 @@ pub fn random_token() -> Result<String, String> {
 fn fill_random(bytes: &mut [u8]) -> Result<(), String> {
     getrandom::fill(bytes).map_err(|error| format!("cannot read random bytes: {error}"))
 }
+
+#[cfg(test)]
+#[path = "mcp_http_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 mod reply_delivery_tests {
