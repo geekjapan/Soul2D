@@ -77,6 +77,16 @@ run_ime_probe() {
     return "$status"
 }
 
+query_wayland_capabilities() {
+    local status=0
+    timeout --kill-after=5s 30s "${SOUL2D_WAYLAND_CAPABILITIES:?compiled query required}" \
+        > "$out/wayland-ime-capabilities.log" 2>&1 || status=$?
+    cat "$out/wayland-ime-capabilities.log"
+    echo "wayland-ime-capabilities: exit=$status scope=OWNED_WESTON_REGISTRY_CAPABILITIES_ONLY" \
+        | tee "$out/wayland-ime-capabilities.status"
+    return "$status"
+}
+
 shoot_wayland() {
     # Not on PATH in every package; weston only lets it capture because of --debug.
     local shooter
@@ -111,6 +121,36 @@ all)
     rustc --edition=2021 --crate-name soul2d_ime_adapter_probe "$root/tools/ime-adapter-probe.rs" \
         --extern "egui_winit=${libraries[0]}" -L "dependency=$root/out/rust/debug/deps" \
         -o "$SOUL2D_IME_ADAPTER_PROBE"
+    {
+        for crate in wayland_client wayland_protocols wayland_protocols_misc winit; do
+            count=0
+            for library in "$root"/out/rust/debug/deps/lib"$crate"-*.rlib; do
+                [ -f "$library" ] || continue
+                count=$((count + 1))
+                printf 'rlib.%s.file=%s\n' "$crate" "${library##*/}"
+            done
+            printf 'rlib.%s.count=%s\n' "$crate" "$count"
+        done
+        for tool in weston-keyboard weston-simple-im weston-editor wayland-info; do
+            command_path=$(command -v "$tool" || true)
+            printf 'executable.%s.path=%s\n' "$tool" "${command_path:-NOT_ON_PATH}"
+            for prefix in /usr/libexec /usr/lib/weston; do
+                if [ -x "$prefix/$tool" ]; then
+                    printf 'executable.%s.known=%s\n' "$tool" "$prefix/$tool"
+                fi
+            done
+        done
+    } > "$out/wayland-ime-inventory.log"
+    cat "$out/wayland-ime-inventory.log"
+    wayland_libraries=("$root"/out/rust/debug/deps/libwayland_client-*.rlib)
+    if [ "${#wayland_libraries[@]}" -ne 1 ] || [ ! -f "${wayland_libraries[0]}" ]; then
+        echo "FAIL: expected exactly one compiled wayland-client rlib" >&2
+        exit 1
+    fi
+    export SOUL2D_WAYLAND_CAPABILITIES="$probe_dir/wayland-ime-capabilities"
+    rustc --edition=2021 --crate-name soul2d_wayland_ime_capabilities "$root/tools/wayland-ime-capabilities.rs" \
+        --extern "wayland_client=${wayland_libraries[0]}" -L "dependency=$root/out/rust/debug/deps" \
+        -o "$SOUL2D_WAYLAND_CAPABILITIES"
     rm -f "$out/fixture.inx"
     build_fixture
     xvfb-run -a -s "-screen 0 1280x800x24" "$0" "$out" x11-inner
@@ -122,6 +162,8 @@ all)
         > "$out/weston.log" 2>&1 &
     weston_pid=$!
     for _ in $(seq 20); do [ -S "$XDG_RUNTIME_DIR/soul2d-launch" ] && break; sleep 0.5; done
+    env -u DISPLAY -u WAYLAND_SOCKET WAYLAND_DISPLAY=soul2d-launch bash -c \
+        "$(declare -f query_wayland_capabilities); out=\$1; query_wayland_capabilities" _ "$out"
     env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c \
         "$(declare -f run_ime_probe); out=\$1; run_ime_probe wayland" _ "$out"
     env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c "$(declare -f painted launch shoot_wayland); out='$out' editor='$editor' launch wayland shoot_wayland"
