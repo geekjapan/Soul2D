@@ -2138,6 +2138,12 @@ enum PaletteAction {
     Refresh,
 }
 
+enum PaletteActivation {
+    Run,
+    Enter,
+    DoubleClick,
+}
+
 struct Palette {
     tools: Vec<Entry>,
     query: String,
@@ -2185,7 +2191,7 @@ impl Palette {
     fn show(&mut self, env: &Env) -> (bool, Option<PaletteAction>) {
         let mut open = true;
         let mut action = None;
-        let mut activate = false;
+        let mut activate = None;
         let mut entries = action_entries();
         entries.extend(self.tools.iter().cloned());
         let ctx = env.ctx;
@@ -2194,7 +2200,7 @@ impl Palette {
             .open(&mut open)
             .default_size([760.0, 480.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                let search_focused = ui.horizontal(|ui| {
                     let caption = ui.label(env.t("Search"));
                     let field = ui.add(egui::TextEdit::singleline(&mut self.query).desired_width(320.0));
                     field.clone().labelled_by(caption.id);
@@ -2210,9 +2216,10 @@ impl Palette {
                     }
                     if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                         field.request_focus();
-                        activate = true;
+                        activate = Some(PaletteActivation::Enter);
                     }
-                });
+                    field.has_focus()
+                }).inner;
                 if let Some(error) = &self.list_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Tools unavailable: {error}"));
                 }
@@ -2221,21 +2228,22 @@ impl Palette {
                 let step = ui.input(|input| {
                     i32::from(input.key_pressed(egui::Key::ArrowDown)) - i32::from(input.key_pressed(egui::Key::ArrowUp))
                 });
-                if step != 0 && !found.is_empty() {
-                    let next = position.map_or(0, |at| (at as i32 + step).clamp(0, found.len() as i32 - 1) as usize);
-                    let entry = found[next].clone();
-                    self.choose(&entry);
-                } else if position.is_none() && !found.is_empty() {
-                    let entry = found[0].clone();
-                    self.choose(&entry);
+                let navigation = (step != 0 && !found.is_empty()).then(|| {
+                    position.map_or(0, |at| (at as i32 + step).clamp(0, found.len() as i32 - 1) as usize)
+                });
+                if position.is_none() && !found.is_empty() {
+                    self.choose(found[0]);
                 }
                 ui.separator();
                 ui.columns(2, |columns| {
+                    let mut list_focused = false;
+                    let mut selection_clicked = false;
+                    let mut navigation_response = None;
                     egui::ScrollArea::vertical().id_salt("palette_list").show(&mut columns[0], |ui| {
                         if found.is_empty() {
                             ui.label(env.t("No commands match the filter."));
                         }
-                        for entry in &found {
+                        for (index, entry) in found.iter().enumerate() {
                             let text = if entry.category.is_empty() {
                                 entry.label.clone()
                             } else {
@@ -2245,12 +2253,26 @@ impl Palette {
                             let response = ui.selectable_label(selected, text);
                             if response.clicked() {
                                 self.choose(entry);
+                                ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                                response.request_focus();
+                                selection_clicked = true;
                             }
+                            list_focused |= response.has_focus();
+                            if navigation == Some(index) { navigation_response = Some(response.clone()); }
                             if response.double_clicked() {
-                                activate = true;
+                                activate = Some(PaletteActivation::DoubleClick);
                             }
                         }
                     });
+                    if !selection_clicked && (search_focused || list_focused) {
+                        if let Some(next) = navigation {
+                            self.choose(found[next]);
+                            if list_focused {
+                                ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                                if let Some(response) = navigation_response { response.request_focus(); }
+                            }
+                        }
+                    }
                     let selected = entries.iter().find(|entry| Some(&entry.id) == self.chosen.as_ref()).cloned();
                     egui::ScrollArea::vertical().id_salt("palette_detail").show(&mut columns[1], |ui| {
                         if let Some(entry) = selected {
@@ -2261,8 +2283,8 @@ impl Palette {
                     });
                 });
             });
-        if activate && action.is_none() {
-            action = self.activate(&entries, env);
+        if action.is_none() {
+            if let Some(gesture) = activate { action = self.activate(&entries, env, gesture); }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             open = false;
@@ -2270,35 +2292,36 @@ impl Palette {
         (open, action)
     }
 
-    /// Enter or a double click: run an action, call a tool that needs no arguments, or leave a tool
-    /// that does need them selected for the argument box.
-    fn activate(&mut self, entries: &[Entry], env: &Env) -> Option<PaletteAction> {
-        let found = filter_entries(entries, &self.query);
-        let entry = found.iter().find(|entry| Some(&entry.id) == self.chosen.as_ref())?;
+    fn activation_allowed(&self, entry: &Entry, env: &Env, gesture: PaletteActivation) -> bool {
+        if self.running || Some(&entry.id) != self.chosen.as_ref()
+            || filter_entries(std::slice::from_ref(entry), &self.query).is_empty() {
+            return false;
+        }
         match &entry.kind {
-            EntryKind::Action => env.command_enabled(&entry.id).then(|| PaletteAction::Run(entry.id.clone())),
-            EntryKind::Tool(schema)
-                if required_fields(schema).is_empty()
-                    && schema["properties"].as_object().is_none_or(|properties| properties.is_empty()) =>
-            {
-                self.tool_call(entry, schema)
-            }
-            EntryKind::Tool(_) => None,
+            EntryKind::Action => env.command_enabled(&entry.id),
+            EntryKind::Tool(schema) => matches!(gesture, PaletteActivation::Run)
+                || (required_fields(schema).is_empty()
+                    && schema["properties"].as_object().is_none_or(|properties| properties.is_empty())),
         }
     }
 
-    fn tool_call(&mut self, entry: &Entry, schema: &Value) -> Option<PaletteAction> {
-        match validate_arguments(&self.args, schema) {
-            Ok(arguments) => {
-                self.args_error = None;
-                self.running = true;
-                self.outcome = None;
-                Some(PaletteAction::Call { name: entry.id.clone(), arguments })
-            }
-            Err(error) => {
-                self.args_error = Some(error);
-                None
-            }
+    fn activate(&mut self, entries: &[Entry], env: &Env, gesture: PaletteActivation) -> Option<PaletteAction> {
+        let entry = entries.iter().find(|entry| Some(&entry.id) == self.chosen.as_ref())?;
+        if !self.activation_allowed(entry, env, gesture) { return None; }
+        match &entry.kind {
+            EntryKind::Action => Some(PaletteAction::Run(entry.id.clone())),
+            EntryKind::Tool(schema) => match validate_arguments(&self.args, schema) {
+                Ok(arguments) => {
+                    self.args_error = None;
+                    self.running = true;
+                    self.outcome = None;
+                    Some(PaletteAction::Call { name: entry.id.clone(), arguments })
+                }
+                Err(error) => {
+                    self.args_error = Some(error);
+                    None
+                }
+            },
         }
     }
 
@@ -2315,9 +2338,9 @@ impl Palette {
                 if !shortcut.is_empty() {
                     ui.label(format!("{}: {shortcut}", env.t("Shortcut")));
                 }
-                let enabled = env.command_enabled(&entry.id);
+                let enabled = self.activation_allowed(entry, env, PaletteActivation::Run);
                 if ui.add_enabled(enabled, egui::Button::new(env.t("Run Command"))).clicked() {
-                    action = Some(PaletteAction::Run(entry.id.clone()));
+                    action = self.activate(std::slice::from_ref(entry), env, PaletteActivation::Run);
                 }
             }
             EntryKind::Tool(schema) => {
@@ -2328,8 +2351,9 @@ impl Palette {
                 if let Some(error) = &self.args_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error.as_str());
                 }
-                if ui.add_enabled(!self.running, egui::Button::new(env.t("Run Command"))).clicked() {
-                    action = self.tool_call(entry, schema);
+                let enabled = self.activation_allowed(entry, env, PaletteActivation::Run);
+                if ui.add_enabled(enabled, egui::Button::new(env.t("Run Command"))).clicked() {
+                    action = self.activate(std::slice::from_ref(entry), env, PaletteActivation::Run);
                 }
             }
         }
@@ -5322,6 +5346,166 @@ mod frame_tests {
     }
 
     #[test]
+    fn command_browser_native_protection_text_arrows_preserve_the_draft_and_selection() {
+        fn focus(ctx: &egui::Context, windows: &mut Windows, rig: &mut Rig, value: &str, arrow: Option<egui::Key>) {
+            frame(ctx, windows, rig, Vec::new());
+            let (_, output) = frame(ctx, windows, rig, Vec::new());
+            let (_, node) = nodes(&output).into_iter().find(|(_, node)|
+                matches!(node.role(), Role::TextInput | Role::MultilineTextInput) && node.value() == Some(value)).unwrap();
+            let b = node.bounds().unwrap();
+            let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+            let mut events = vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)];
+            if let Some(arrow) = arrow { events.push(key(arrow, false, false)); }
+            frame(ctx, windows, rig, events);
+        }
+        for result in [false, true] {
+            let ctx = context();
+            let mut rig = Rig::new();
+            rig.store.set("firstrun_complete", true).unwrap();
+            rig.store.set("hasDoneQuickSetup", true).unwrap();
+            let mut windows = Windows::new();
+            loaded_palette(&mut windows);
+            let id = if result { "history_summary" } else { "open" };
+            let query = if result { "history" } else { "open" };
+            choose(&mut windows, id);
+            windows.palette.as_mut().unwrap().query = query.into();
+            if result {
+                windows.palette.as_mut().unwrap().outcome = Some(Outcome { ok: true, text: "Owned result\nSecond line".into() });
+            }
+            let field = if result { "Owned result\nSecond line".into() } else { windows.palette.as_ref().unwrap().args.clone() };
+            focus(&ctx, &mut windows, &mut rig, &field, None);
+            let (_, typed) = frame(&ctx, &mut windows, &mut rig, vec![egui::Event::Text("owned-widget-entry".into())]);
+            assert!(texts(&typed).iter().any(|text| text.contains("owned-widget-entry")), "{result}");
+            let arguments = windows.palette.as_ref().unwrap().args.clone();
+            for arrow in [egui::Key::ArrowUp, egui::Key::ArrowDown] {
+                let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(arrow, false, false)]);
+                assert!(requests.is_empty());
+                assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some(id), "{result}: {arrow:?}");
+                assert_eq!(windows.palette.as_ref().unwrap().args, arguments, "{result}: {arrow:?}");
+            }
+            focus(&ctx, &mut windows, &mut rig, query, None);
+            let field = if result { "Owned result\nSecond line" } else { &arguments };
+            focus(&ctx, &mut windows, &mut rig, field, Some(egui::Key::ArrowUp));
+            assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some(id), "Same-frame focus change: {result}");
+            assert_eq!(windows.palette.as_ref().unwrap().args, arguments, "Same-frame focus change: {result}");
+            focus(&ctx, &mut windows, &mut rig, query, None);
+            frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::ArrowUp, false, false)]);
+            assert_ne!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some(id), "Search still navigates: {result}");
+            if result {
+                let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+                let (_, row) = nodes(&output).into_iter().find(|(_, node)| node.label() == Some("[history] history_clear")).unwrap();
+                let b = row.bounds().unwrap();
+                let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+                frame(&ctx, &mut windows, &mut rig, vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)]);
+                assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_clear"));
+                let (_, after_navigation) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::ArrowDown, false, false)]);
+                assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_goto"), "List still navigates");
+                let (expected_focus, _) = nodes(&after_navigation).into_iter().find(|(_, node)|
+                    node.label() == Some("[history] history_goto")).unwrap();
+                let focused = ctx.memory(|memory| memory.focused()).unwrap().value();
+                let args = windows.palette.as_ref().unwrap().args.clone();
+                let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
+                assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_goto"), "Enter after one list step");
+                assert_eq!(windows.palette.as_ref().unwrap().args, args);
+                assert!(requests.is_empty());
+                assert_eq!(focused, expected_focus.0, "Keyboard focus matches the selected row");
+                focus(&ctx, &mut windows, &mut rig, &args, Some(egui::Key::ArrowDown));
+                assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_goto"), "List-to-arguments focus change");
+                assert_eq!(windows.palette.as_ref().unwrap().args, args);
+                for (id, arrow) in [("history_clear", false), ("history_goto", true)] {
+                    let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+                    let label = format!("[history] {id}");
+                    let (row_id, row) = nodes(&output).into_iter().find(|(_, node)| node.label() == Some(label.as_str())).unwrap();
+                    let b = row.bounds().unwrap();
+                    let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+                    let mut events = vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)];
+                    if arrow { events.push(key(egui::Key::ArrowDown, false, false)); }
+                    frame(&ctx, &mut windows, &mut rig, events);
+                    assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some(id));
+                    if arrow {
+                        let args = windows.palette.as_ref().unwrap().args.clone();
+                        frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
+                        assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some(id), "Pointer row wins after arrow and Enter");
+                        assert_eq!(windows.palette.as_ref().unwrap().args, args);
+                        assert_eq!(ctx.memory(|memory| memory.focused()).unwrap().value(), row_id.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_browser_native_protection_hidden_selection_cannot_run() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        windows.palette.as_mut().unwrap().query = "owned-no-matches-a63f".into();
+        frame(&ctx, &mut windows, &mut rig, Vec::new());
+        let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        assert!(has(&output, "No commands match the filter."));
+        let (_, run) = nodes(&output).into_iter().find(|(_, node)| node.role() == Role::Button && node.label() == Some("Run Command")).unwrap();
+        assert!(run.is_disabled());
+        let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
+        assert!(requests.is_empty());
+        let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
+        assert!(requests.is_empty());
+        assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_summary"));
+        assert_eq!(windows.palette.as_ref().unwrap().args, "{}");
+        assert!(!windows.palette.as_ref().unwrap().running);
+    }
+
+    #[test]
+    fn command_browser_native_protection_busy_enter_cannot_dispatch_again() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        let palette = windows.palette.as_mut().unwrap();
+        palette.query = "history_summary".into();
+        palette.running = true;
+        frame(&ctx, &mut windows, &mut rig, Vec::new());
+        let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
+        assert!(requests.is_empty());
+        assert!(windows.palette.as_ref().unwrap().running);
+    }
+
+    #[test]
+    fn command_browser_native_protection_double_click_respects_busy_and_runs_when_available() {
+        for busy in [false, true] {
+            let ctx = context();
+            let mut rig = Rig::new();
+            rig.store.set("firstrun_complete", true).unwrap();
+            rig.store.set("hasDoneQuickSetup", true).unwrap();
+            let mut windows = Windows::new();
+            loaded_palette(&mut windows);
+            choose(&mut windows, "history_summary");
+            windows.palette.as_mut().unwrap().query = "history_summary".into();
+            windows.palette.as_mut().unwrap().running = busy;
+            let mut sent = Vec::new();
+            for _ in 0..2 {
+                frame(&ctx, &mut windows, &mut rig, Vec::new());
+                let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+                let (_, row) = nodes(&output).into_iter().find(|(_, node)| node.label() == Some("[history] history_summary")).unwrap();
+                let b = row.bounds().unwrap();
+                let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+                let (requests, _) = frame(&ctx, &mut windows, &mut rig,
+                    vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)]);
+                sent.extend(requests);
+            }
+            if busy { assert!(sent.is_empty()); }
+            else { assert_eq!(sent, [Request::Mcp(McpTarget::ToolCall, call_request("history_summary", json!({})))]); }
+            assert!(windows.palette.as_ref().unwrap().running);
+        }
+    }
+
+    #[test]
     fn the_palette_shortcut_opens_the_command_list_and_a_tool_runs_after_validation() {
         let ctx = context();
         let mut rig = Rig::new();
@@ -5524,11 +5708,11 @@ mod frame_tests {
         choose(&mut windows, "Node_Add_GridDeformer");
         let palette = windows.palette.as_mut().unwrap();
         palette.args = "{}".to_owned();
-        assert!(palette.activate(&entries, &env).is_none(), "Enter must not create a node");
+        assert!(palette.activate(&entries, &env, PaletteActivation::Enter).is_none(), "Enter must not create a node");
         // A tool that needs no argument still runs at once.
         choose(&mut windows, "nodes_list");
         let palette = windows.palette.as_mut().unwrap();
-        assert!(matches!(palette.activate(&entries, &env), Some(PaletteAction::Call { name, .. }) if name == "nodes_list"));
+        assert!(matches!(palette.activate(&entries, &env, PaletteActivation::Enter), Some(PaletteAction::Call { name, .. }) if name == "nodes_list"));
     }
 
     #[test]
