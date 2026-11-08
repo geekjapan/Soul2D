@@ -8214,6 +8214,7 @@ impl EditorApp {
             Request::McpApply => self.apply_mcp(),
             Request::Core(request) => self.command(request),
             Request::Mcp(target, call) => {
+                if !self.windows.accepts_mcp_target(target) { return; }
                 self.sync_panel_drafts();
                 let response = editor_view!(self, ctx).mcp(&mut self.controller, &call, McpOrigin::Internal).into_message();
                 self.preview_dirty = true;
@@ -29987,6 +29988,54 @@ mod editor_state_tests {
     }
 
     #[test]
+    fn command_browser_owner_stale_queued_native_call_cannot_clear_history() {
+        use crate::editor_test_support::Harness;
+        use crate::editor_windows::{Host, Request};
+        use egui::accesskit::Role;
+
+        fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
+            let mcp = app.mcp_status();
+            app.windows.show(ctx, Host {
+                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
+                store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
+                shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
+                tr:&tr, mcp:&mcp,
+            })
+        }
+
+        let mut app = app("browser-stale-native-call");
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        call(&mut app, "node_rename", json!({"id":2,"name":"Queued history"}));
+        assert_eq!(app.controller.snapshot()["canUndo"], true);
+        call(&mut app, "editor_command_browser_set", json!({"open":true}));
+        let mut harness = Harness::new();
+        let mut pending = Vec::new();
+        harness.frame(Vec::new(), |ctx| pending.extend(draw(&mut app, ctx)));
+        for request in pending.drain(..) { app.apply_window_request(&harness.ctx, request); }
+        harness.text("Search", "history_clear", |ctx| pending.extend(draw(&mut app, ctx)));
+        assert!(pending.is_empty());
+        harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw(&mut app, ctx)));
+        assert_eq!(pending.len(), 1);
+        let queued = pending.pop().unwrap();
+        assert!(matches!(&queued, Request::Mcp(_, request) if request["params"]["name"] == "history_clear"));
+        call(&mut app, "editor_command_browser_set", json!({"open":false}));
+        call(&mut app, "editor_command_browser_set", json!({"open":true}));
+        let before = document(&app);
+        app.apply_window_request(&harness.ctx, queued);
+        assert_eq!(document(&app), before);
+        assert_eq!(app.controller.snapshot()["canUndo"], true);
+        harness.frame(Vec::new(), |ctx| pending.extend(draw(&mut app, ctx)));
+        for request in pending.drain(..) { app.apply_window_request(&harness.ctx, request); }
+        harness.text("Search", "history_clear", |ctx| pending.extend(draw(&mut app, ctx)));
+        harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw(&mut app, ctx)));
+        assert_eq!(pending.len(), 1);
+        app.apply_window_request(&harness.ctx, pending.pop().unwrap());
+        assert_eq!(app.controller.snapshot()["canUndo"], false);
+    }
+
+    #[test]
     fn command_browser_visibility_validates_without_document_settings_or_draft_changes() {
         use crate::editor_agent::HostApproval;
         use crate::editor_test_support::Harness;
@@ -30116,12 +30165,29 @@ mod editor_state_tests {
 
     #[test]
     fn command_browser_visibility_retains_owner_lifetime_in_all_formats_and_closed_tool_delivery() {
+        use crate::editor_test_support::Harness;
+        use crate::editor_windows::{Host, Request};
+        use egui::accesskit::Role;
+
+        fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
+            let mcp = app.mcp_status();
+            app.windows.show(ctx, Host {
+                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
+                store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
+                shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
+                tr:&tr, mcp:&mcp,
+            })
+        }
+
         for format in ["inx", "live2d.cmo3", "live2d.can3"] {
             let mut app = match format {
                 "live2d.cmo3" => runtime_export_app("browser-cmo3", false),
                 "live2d.can3" => can3_scene_app("browser-can3"),
                 _ => app("browser-inx"),
             };
+            app.tools.store.set("firstrun_complete", true).unwrap();
+            app.tools.store.set("hasDoneQuickSetup", true).unwrap();
             assert_eq!(app.controller.snapshot()["documentFormat"], format);
             assert_eq!(state(&mut app)["windows"]["commandBrowser"], false);
             let before = app.controller.snapshot().clone();
@@ -30137,9 +30203,24 @@ mod editor_state_tests {
                 "params":{"name":"editor_command_browser_set","arguments":{"open":true}}});
             assert_eq!(agent_rpc(&mut app, &mut approval, &message).unwrap()["result"]["isError"], false);
             for open in [false, true] {
-                app.apply_window_request(&egui::Context::default(), crate::editor_windows::Request::Mcp(
-                    crate::editor_windows::McpTarget::ToolCall,
-                    crate::editor_windows::call_request("editor_command_browser_set", json!({"open":open}))));
+                call(&mut app, "editor_command_browser_set", json!({"open":true}));
+                let mut harness = Harness::new();
+                let mut pending = Vec::new();
+                harness.frame(Vec::new(), |ctx| pending.extend(draw(&mut app, ctx)));
+                for request in pending.drain(..) { app.apply_window_request(&harness.ctx, request); }
+                harness.text("Search", "editor_command_browser_set", |ctx| pending.extend(draw(&mut app, ctx)));
+                harness.click(Role::MultilineTextInput, "Arguments (JSON object); required: open",
+                    |ctx| pending.extend(draw(&mut app, ctx)));
+                let select_all = |pressed| egui::Event::Key {key:egui::Key::A, physical_key:None, pressed,
+                    repeat:false, modifiers:egui::Modifiers::COMMAND};
+                harness.frame(vec![select_all(true), egui::Event::Text(json!({"open":open}).to_string()), select_all(false)],
+                    |ctx| pending.extend(draw(&mut app, ctx)));
+                harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw(&mut app, ctx)));
+                assert_eq!(pending.len(), 1);
+                assert!(matches!(&pending[0], Request::Mcp(_, request)
+                    if request["params"]["name"] == "editor_command_browser_set"
+                        && request["params"]["arguments"] == json!({"open":open})));
+                app.apply_window_request(&harness.ctx, pending.pop().unwrap());
                 assert_eq!(state(&mut app)["windows"]["commandBrowser"], open,
                     "browser-origin tool response must not resurrect or reset visibility: {format}");
             }

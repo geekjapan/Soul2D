@@ -129,12 +129,18 @@ const CREDITS: &[(&str, &[&str])] = &[
 
 // ------------------------------------------------------------------------------------------ requests
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserRequest {
+    owner: egui::Id,
+    sequence: InputEpoch,
+}
+
 /// Which pending MCP call an answer belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTarget {
     AddressDialog,
-    ToolList,
-    ToolCall,
+    ToolList(BrowserRequest),
+    ToolCall(BrowserRequest),
     /// The `texture_get` answer for the albedo (0), emissive (1) or bump (2) slot of the viewer's Part.
     Texture(u8),
     /// An editor layout or window-visibility call from View.
@@ -2144,33 +2150,43 @@ enum PaletteActivation {
     DoubleClick,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum PaletteList {
+    Needed,
+    Pending { request: BrowserRequest, error: Option<String> },
+    Ready,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PaletteExecution {
+    Idle(Option<Outcome>),
+    Running(BrowserRequest),
+}
+
 struct Palette {
+    owner: egui::Id,
     tools: Vec<Entry>,
     query: String,
     chosen: Option<String>,
     args: String,
     args_error: Option<String>,
-    list_error: Option<String>,
-    need_list: bool,
-    list_sent: bool,
-    running: bool,
-    outcome: Option<Outcome>,
+    listing: PaletteList,
+    execution: PaletteExecution,
     focus: bool,
 }
 
 impl Palette {
     fn new() -> Self {
         Self {
+            owner: new_input_view(),
             tools: Vec::new(),
             query: String::new(),
             chosen: None,
             args: String::new(),
             args_error: None,
-            list_error: None,
-            need_list: true,
-            list_sent: false,
-            running: false,
-            outcome: None,
+            listing: PaletteList::Needed,
+            execution: PaletteExecution::Idle(None),
             focus: true,
         }
     }
@@ -2183,7 +2199,21 @@ impl Palette {
                 EntryKind::Action => String::new(),
             };
             self.args_error = None;
-            self.outcome = None;
+            if let PaletteExecution::Idle(outcome) = &mut self.execution { *outcome = None; }
+        }
+    }
+
+    fn running(&self) -> bool { matches!(self.execution, PaletteExecution::Running(_)) }
+
+    fn outcome(&self) -> Option<&Outcome> {
+        match &self.execution { PaletteExecution::Idle(outcome) => outcome.as_ref(), PaletteExecution::Running(_) => None }
+    }
+
+    fn list_error(&self) -> Option<&str> {
+        match &self.listing {
+            PaletteList::Pending {error, ..} => error.as_deref(),
+            PaletteList::Failed(error) => Some(error),
+            PaletteList::Needed | PaletteList::Ready => None,
         }
     }
 
@@ -2211,7 +2241,7 @@ impl Palette {
                     if ui.button(env.t("Refresh")).clicked() {
                         action = Some(PaletteAction::Refresh);
                     }
-                    if self.need_list || self.running {
+                    if matches!(self.listing, PaletteList::Needed | PaletteList::Pending {..}) || self.running() {
                         ui.spinner();
                     }
                     if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -2220,7 +2250,7 @@ impl Palette {
                     }
                     field.has_focus()
                 }).inner;
-                if let Some(error) = &self.list_error {
+                if let Some(error) = self.list_error() {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Tools unavailable: {error}"));
                 }
                 let found = filter_entries(&entries, &self.query);
@@ -2293,7 +2323,7 @@ impl Palette {
     }
 
     fn activation_allowed(&self, entry: &Entry, env: &Env, gesture: PaletteActivation) -> bool {
-        if self.running || Some(&entry.id) != self.chosen.as_ref()
+        if self.running() || Some(&entry.id) != self.chosen.as_ref()
             || filter_entries(std::slice::from_ref(entry), &self.query).is_empty() {
             return false;
         }
@@ -2313,8 +2343,7 @@ impl Palette {
             EntryKind::Tool(schema) => match validate_arguments(&self.args, schema) {
                 Ok(arguments) => {
                     self.args_error = None;
-                    self.running = true;
-                    self.outcome = None;
+                    self.execution = PaletteExecution::Idle(None);
                     Some(PaletteAction::Call { name: entry.id.clone(), arguments })
                 }
                 Err(error) => {
@@ -2357,7 +2386,7 @@ impl Palette {
                 }
             }
         }
-        if let Some(outcome) = &self.outcome {
+        if let Some(outcome) = self.outcome() {
             ui.separator();
             let color = if outcome.ok { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_RED };
             ui.colored_label(color, if outcome.ok { "Succeeded" } else { "Failed" });
@@ -2944,6 +2973,7 @@ pub struct Windows {
     settings: Option<SettingsWindow>,
     about: bool,
     palette: Option<Palette>,
+    browser_requests: InputEpochs,
     texture: Option<TextureViewer>,
     /// The texture answers a load of the viewer still waits for.
     texture_request: Option<TextureLoad>,
@@ -3211,6 +3241,55 @@ impl Windows {
         }
     }
 
+    fn allocate_browser_request(&mut self) -> Option<BrowserRequest> {
+        let owner = self.palette.as_ref()?.owner;
+        self.browser_requests.try_next().map(|sequence| BrowserRequest {owner, sequence})
+    }
+
+    fn begin_browser_list(&mut self) -> Option<BrowserRequest> {
+        let request = self.allocate_browser_request();
+        let palette = self.palette.as_mut()?;
+        match request {
+            Some(request) => {
+                palette.listing = PaletteList::Pending {request, error:palette.list_error().map(str::to_owned)};
+                Some(request)
+            }
+            None => {
+                palette.listing = PaletteList::Failed("Command Browser request identity is unavailable".into());
+                None
+            }
+        }
+    }
+
+    fn begin_browser_call(&mut self) -> Option<BrowserRequest> {
+        if self.palette.as_ref()?.running() { return None; }
+        let request = self.allocate_browser_request();
+        let palette = self.palette.as_mut()?;
+        match request {
+            Some(request) => {
+                palette.execution = PaletteExecution::Running(request);
+                Some(request)
+            }
+            None => {
+                palette.execution = PaletteExecution::Idle(Some(Outcome {
+                    ok:false, text:"Command Browser request identity is unavailable".into(),
+                }));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn accepts_mcp_target(&self, target: McpTarget) -> bool {
+        match target {
+            McpTarget::ToolList(request) => self.palette.as_ref().is_some_and(|palette|
+                palette.owner == request.owner && matches!(palette.listing,
+                    PaletteList::Pending {request:pending, ..} if pending == request)),
+            McpTarget::ToolCall(request) => self.palette.as_ref().is_some_and(|palette|
+                palette.owner == request.owner && palette.execution == PaletteExecution::Running(request)),
+            _ => true,
+        }
+    }
+
     pub fn texture_viewer_open(&self) -> bool {
         self.texture.is_some()
     }
@@ -3358,24 +3437,23 @@ impl Windows {
 
     /// Hands back the endpoint's answer to an `Request::Mcp`.
     pub fn deliver(&mut self, target: McpTarget, response: Option<Value>) {
+        if !self.accepts_mcp_target(target) { return; }
         match target {
-            McpTarget::ToolList => {
+            McpTarget::ToolList(_) => {
                 if let Some(palette) = self.palette.as_mut() {
-                    match response.as_ref().map(parse_tools) {
+                    palette.listing = match response.as_ref().map(parse_tools) {
                         Some(Ok(tools)) => {
                             palette.tools = tools;
-                            palette.list_error = None;
+                            PaletteList::Ready
                         }
-                        Some(Err(error)) => palette.list_error = Some(error),
-                        None => palette.list_error = Some("the endpoint sent no response".to_owned()),
-                    }
-                    palette.need_list = false;
+                        Some(Err(error)) => PaletteList::Failed(error),
+                        None => PaletteList::Failed("the endpoint sent no response".to_owned()),
+                    };
                 }
             }
-            McpTarget::ToolCall => {
+            McpTarget::ToolCall(_) => {
                 if let Some(palette) = self.palette.as_mut() {
-                    palette.outcome = Some(call_outcome(response.as_ref()));
-                    palette.running = false;
+                    palette.execution = PaletteExecution::Idle(Some(call_outcome(response.as_ref())));
                 }
             }
             McpTarget::Texture(position) => self.texture_answer(usize::from(position).min(2), response),
@@ -3882,12 +3960,8 @@ impl Windows {
         }
         let browser_frame = self.palette.as_mut().map(|palette| {
             let (keep, action) = palette.show(env);
-            let refresh = keep && ((palette.need_list && !palette.list_sent)
+            let refresh = keep && (matches!(palette.listing, PaletteList::Needed)
                 || matches!(&action, Some(PaletteAction::Refresh)));
-            if refresh {
-                palette.need_list = true;
-                palette.list_sent = true;
-            }
             (keep, action, refresh)
         });
         if let Some((keep, action, refresh)) = browser_frame {
@@ -3899,12 +3973,16 @@ impl Windows {
                         self.run_command(&id, env);
                     }
                     Some(PaletteAction::Call { name, arguments }) => {
-                        env.out.push(Request::Mcp(McpTarget::ToolCall, call_request(&name, arguments)));
+                        if let Some(request) = self.begin_browser_call() {
+                            env.out.push(Request::Mcp(McpTarget::ToolCall(request), call_request(&name, arguments)));
+                        }
                     }
                     Some(PaletteAction::Refresh) | None => {}
                 }
                 if refresh {
-                    env.out.push(Request::Mcp(McpTarget::ToolList, list_request()));
+                    if let Some(request) = self.begin_browser_list() {
+                        env.out.push(Request::Mcp(McpTarget::ToolList(request), list_request()));
+                    }
                 }
             }
             if close {
@@ -4626,7 +4704,8 @@ mod frame_tests {
     fn loaded_palette(windows: &mut Windows) {
         let mut session = soul2d_core::Session::new();
         windows.set_command_browser_open(true);
-        windows.deliver(McpTarget::ToolList, session.handle_mcp(&list_request()));
+        let request = windows.begin_browser_list().unwrap();
+        windows.deliver(McpTarget::ToolList(request), session.handle_mcp(&list_request()));
     }
 
     fn choose(windows: &mut Windows, id: &str) {
@@ -4699,7 +4778,7 @@ mod frame_tests {
             assert!(has(&output, expected), "palette: missing {expected:?} in {:?}", texts(&output));
         }
         checked += assert_all_named(&output, "palette");
-        windows.palette.as_mut().unwrap().outcome = Some(Outcome { ok: false, text: "no such file".to_owned() });
+        windows.palette.as_mut().unwrap().execution = PaletteExecution::Idle(Some(Outcome { ok: false, text: "no such file".to_owned() }));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(has(&output, "Failed") && has(&output, "no such file") && has(&output, "Result"));
         checked += assert_all_named(&output, "palette result");
@@ -5370,7 +5449,7 @@ mod frame_tests {
             choose(&mut windows, id);
             windows.palette.as_mut().unwrap().query = query.into();
             if result {
-                windows.palette.as_mut().unwrap().outcome = Some(Outcome { ok: true, text: "Owned result\nSecond line".into() });
+                windows.palette.as_mut().unwrap().execution = PaletteExecution::Idle(Some(Outcome { ok: true, text: "Owned result\nSecond line".into() }));
             }
             let field = if result { "Owned result\nSecond line".into() } else { windows.palette.as_ref().unwrap().args.clone() };
             focus(&ctx, &mut windows, &mut rig, &field, None);
@@ -5455,7 +5534,7 @@ mod frame_tests {
         assert!(requests.is_empty());
         assert_eq!(windows.palette.as_ref().unwrap().chosen.as_deref(), Some("history_summary"));
         assert_eq!(windows.palette.as_ref().unwrap().args, "{}");
-        assert!(!windows.palette.as_ref().unwrap().running);
+        assert!(!windows.palette.as_ref().unwrap().running());
     }
 
     #[test]
@@ -5467,13 +5546,12 @@ mod frame_tests {
         let mut windows = Windows::new();
         loaded_palette(&mut windows);
         choose(&mut windows, "history_summary");
-        let palette = windows.palette.as_mut().unwrap();
-        palette.query = "history_summary".into();
-        palette.running = true;
+        windows.palette.as_mut().unwrap().query = "history_summary".into();
+        windows.begin_browser_call().unwrap();
         frame(&ctx, &mut windows, &mut rig, Vec::new());
         let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
         assert!(requests.is_empty());
-        assert!(windows.palette.as_ref().unwrap().running);
+        assert!(windows.palette.as_ref().unwrap().running());
     }
 
     #[test]
@@ -5487,7 +5565,7 @@ mod frame_tests {
             loaded_palette(&mut windows);
             choose(&mut windows, "history_summary");
             windows.palette.as_mut().unwrap().query = "history_summary".into();
-            windows.palette.as_mut().unwrap().running = busy;
+            if busy { windows.begin_browser_call().unwrap(); }
             let mut sent = Vec::new();
             for _ in 0..2 {
                 frame(&ctx, &mut windows, &mut rig, Vec::new());
@@ -5500,9 +5578,194 @@ mod frame_tests {
                 sent.extend(requests);
             }
             if busy { assert!(sent.is_empty()); }
-            else { assert_eq!(sent, [Request::Mcp(McpTarget::ToolCall, call_request("history_summary", json!({})))]); }
-            assert!(windows.palette.as_ref().unwrap().running);
+            else { palette_call(sent, call_request("history_summary", json!({}))); }
+            assert!(windows.palette.as_ref().unwrap().running());
         }
+    }
+
+    fn palette_mcp(requests: Vec<Request>) -> (McpTarget, Value) {
+        match only(requests) {
+            Request::Mcp(target, call) => (target, call),
+            request => panic!("expected an MCP request, got {request:?}"),
+        }
+    }
+
+    fn palette_list(requests: Vec<Request>) -> McpTarget {
+        let (target, call) = palette_mcp(requests);
+        assert!(matches!(target, McpTarget::ToolList(_)));
+        assert_eq!(call, list_request());
+        target
+    }
+
+    fn palette_call(requests: Vec<Request>, expected: Value) -> McpTarget {
+        let (target, call) = palette_mcp(requests);
+        assert!(matches!(target, McpTarget::ToolCall(_)));
+        assert_eq!(call, expected);
+        target
+    }
+
+    fn owned_catalogue(name: &str) -> Option<Value> {
+        Some(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{
+            "name":name,"description":"Owned catalogue fixture","inputSchema":{"type":"object","properties":{}}
+        }]}}))
+    }
+
+    #[test]
+    fn command_browser_owner_reopened_ignores_old_catalogue_delivery() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        windows.set_command_browser_open(true);
+        let (old, _) = palette_mcp(frame(&ctx, &mut windows, &mut rig, Vec::new()).0);
+        windows.set_command_browser_open(false);
+        windows.deliver(old, owned_catalogue("owned_closed"));
+        assert!(!windows.command_browser_open());
+        windows.set_command_browser_open(true);
+        let (current, _) = palette_mcp(frame(&ctx, &mut windows, &mut rig, Vec::new()).0);
+        windows.deliver(old, owned_catalogue("owned_old"));
+        assert!(windows.palette.as_ref().unwrap().tools.is_empty());
+        windows.deliver(current, owned_catalogue("owned_current"));
+        assert_eq!(windows.palette.as_ref().unwrap().tools[0].id, "owned_current");
+    }
+
+    #[test]
+    fn command_browser_owner_superseded_refresh_keeps_the_catalogue_and_error() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        let before = windows.palette.as_ref().unwrap().tools.clone();
+        let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh").0);
+        let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh").0);
+        windows.deliver(old, owned_catalogue("owned_stale_refresh"));
+        assert!(windows.palette.as_ref().unwrap().tools == before, "stale Refresh changed the catalogue");
+        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":1,
+            "error":{"code":-32000,"message":"owned refresh failure"}})));
+        assert!(windows.palette.as_ref().unwrap().tools == before, "failed Refresh changed the catalogue");
+        let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        assert!(texts(&output).iter().any(|text| text.contains("owned refresh failure")));
+        let (requests, pending) = click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh");
+        let current = palette_list(requests);
+        assert!(texts(&pending).iter().any(|text| text.contains("owned refresh failure")));
+        assert!(windows.palette.as_ref().unwrap().tools == before);
+        windows.deliver(current, owned_catalogue("owned_recovered"));
+        let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        assert!(!texts(&output).iter().any(|text| text.contains("owned refresh failure")));
+        assert_eq!(windows.palette.as_ref().unwrap().tools[0].id, "owned_recovered");
+    }
+
+    #[test]
+    fn command_browser_owner_duplicate_completion_does_not_release_a_new_call() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        windows.palette.as_mut().unwrap().query = "history_summary".into();
+        let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
+        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":false,"content":[{"type":"text","text":"owned first result"}]}})));
+        let (_, laid_out) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        let at = center(&laid_out, Role::Button, "Run Command");
+        let (requests, activated) = frame(&ctx, &mut windows, &mut rig,
+            vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)]);
+        assert!(!texts(&activated).iter().any(|text| text.contains("owned first result")),
+            "Run clears the previous result in its activation frame");
+        let (current, _) = palette_mcp(requests);
+        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":false,"content":[{"type":"text","text":"owned duplicate result"}]}})));
+        assert!(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0.is_empty());
+        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":true,"content":[{"type":"text","text":"owned current failure"}]}})));
+        let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        assert!(texts(&output).iter().any(|text| text.contains("owned current failure")));
+        assert!(has(&output, "Failed"));
+    }
+
+    #[test]
+    fn command_browser_owner_reopened_ignores_old_tool_completion() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        windows.palette.as_mut().unwrap().query = "history_summary".into();
+        let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
+        windows.set_command_browser_open(false);
+        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        assert!(!windows.command_browser_open());
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        windows.palette.as_mut().unwrap().query = "history_summary".into();
+        let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
+        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":false,"content":[{"type":"text","text":"wrong owner result"}]}})));
+        assert!(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0.is_empty());
+        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":false,"content":[{"type":"text","text":"current owner result"}]}})));
+        let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
+        assert!(texts(&output).iter().any(|text| text.contains("current owner result")));
+    }
+
+    #[test]
+    fn command_browser_owner_tickets_do_not_cross_window_instances() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut old_windows = Windows::new();
+        loaded_palette(&mut old_windows);
+        choose(&mut old_windows, "history_summary");
+        old_windows.palette.as_mut().unwrap().query = "history_summary".into();
+        let (old, _) = palette_mcp(click(&ctx, &mut old_windows, &mut rig, Role::Button, "Run Command").0);
+        let mut current_windows = Windows::new();
+        loaded_palette(&mut current_windows);
+        choose(&mut current_windows, "history_summary");
+        current_windows.palette.as_mut().unwrap().query = "history_summary".into();
+        let (current, _) = palette_mcp(click(&ctx, &mut current_windows, &mut rig, Role::Button, "Run Command").0);
+        assert_ne!(old, current);
+        assert!(!current_windows.accepts_mcp_target(old));
+        assert!(current_windows.accepts_mcp_target(current));
+        current_windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        assert!(current_windows.palette.as_ref().unwrap().running());
+        current_windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+            "result":{"isError":false,"content":[{"type":"text","text":"current instance result"}]}})));
+        assert!(!current_windows.palette.as_ref().unwrap().running());
+        assert_eq!(current_windows.palette.as_ref().unwrap().outcome().unwrap().text, "current instance result");
+    }
+
+    #[test]
+    fn command_browser_owner_checked_request_allocation_fails_closed_and_native_needs_no_instance_token() {
+        let ctx = context();
+        let mut rig = Rig::new();
+        rig.store.set("firstrun_complete", true).unwrap();
+        rig.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut windows = Windows::new();
+        loaded_palette(&mut windows);
+        choose(&mut windows, "history_summary");
+        windows.palette.as_mut().unwrap().query = "history_summary".into();
+        windows.browser_requests.fail_instance_for_test();
+        let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
+        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        windows.browser_requests.exhaust_for_test();
+        let (requests, output) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
+        assert!(requests.is_empty());
+        assert!(!windows.palette.as_ref().unwrap().running());
+        assert!(texts(&output).iter().any(|text| text.contains("request identity is unavailable")));
+        let before = windows.palette.as_ref().unwrap().tools.clone();
+        let (requests, output) = click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh");
+        assert!(requests.is_empty());
+        assert!(texts(&output).iter().any(|text| text.contains("request identity is unavailable")));
+        assert!(windows.palette.as_ref().unwrap().tools == before);
+        assert!(windows.command_browser_open());
     }
 
     #[test]
@@ -5518,17 +5781,17 @@ mod frame_tests {
         assert!(!windows.command_browser_open());
         windows.set_command_browser_open(true);
         let (requests, _) = frame(&ctx, &mut windows, &mut rig, Vec::new());
-        assert_eq!(requests, [Request::Mcp(McpTarget::ToolList, list_request())]);
+        let list_target = palette_list(requests);
         assert!(windows.palette.is_some());
         let (requests, _) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(requests.is_empty(), "the tool list is asked for once");
 
         let mut session = soul2d_core::Session::new();
-        windows.deliver(McpTarget::ToolList, session.handle_mcp(&list_request()));
+        windows.deliver(list_target, session.handle_mcp(&list_request()));
         {
             let palette = windows.palette.as_mut().unwrap();
             assert!(palette.tools.len() > 50, "{} tools", palette.tools.len());
-            assert!(!palette.need_list);
+            assert_eq!(palette.listing, PaletteList::Ready);
             palette.query = "open".to_owned();
         }
         // Selecting `open` fills a template; running it with the empty path is refused locally.
@@ -5540,12 +5803,12 @@ mod frame_tests {
         windows.palette.as_mut().unwrap().args = r#"{"path": "/tmp/none.inx"}"#.to_owned();
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
         let call = call_request("open", json!({"path": "/tmp/none.inx"}));
-        assert_eq!(only(requests), Request::Mcp(McpTarget::ToolCall, call.clone()));
+        let call_target = palette_call(requests, call.clone());
         // The failing answer of the real session is shown as a failure with its message.
-        windows.deliver(McpTarget::ToolCall, session.handle_mcp(&call));
+        windows.deliver(call_target, session.handle_mcp(&call));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(has(&output, "Failed"), "{:?}", texts(&output));
-        assert!(!windows.palette.as_ref().unwrap().running);
+        assert!(!windows.palette.as_ref().unwrap().running());
     }
 
     #[test]
@@ -5562,14 +5825,14 @@ mod frame_tests {
             frame(&ctx, &mut windows, &mut rig, Vec::new());
             let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Enter, false, false)]);
             if runs {
-                assert_eq!(requests, [Request::Mcp(McpTarget::ToolCall, call_request(id, json!({})))]);
+                palette_call(requests, call_request(id, json!({})));
             } else {
                 assert!(requests.is_empty(), "{id} ran before its arguments were confirmed: {requests:?}");
             }
             if id == "parameter_group_create" {
                 assert_eq!(windows.palette.as_ref().unwrap().args, "{}");
                 let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
-                assert_eq!(requests, [Request::Mcp(McpTarget::ToolCall, call_request(id, json!({})))]);
+                palette_call(requests, call_request(id, json!({})));
             }
         }
     }
@@ -5582,8 +5845,7 @@ mod frame_tests {
         rig.store.set("hasDoneQuickSetup", true).unwrap();
         let mut windows = Windows::new();
         windows.set_command_browser_open(true);
-        windows.palette.as_mut().unwrap().need_list = false;
-        windows.palette.as_mut().unwrap().list_sent = true;
+        windows.palette.as_mut().unwrap().listing = PaletteList::Ready;
         windows.palette.as_mut().unwrap().query = "redo".to_owned();
         windows.palette.as_mut().unwrap().chosen = Some("EditCommand.Undo".to_owned());
         frame(&ctx, &mut windows, &mut rig, Vec::new());
@@ -5602,10 +5864,10 @@ mod frame_tests {
 
     #[test]
     fn command_browser_duplicate_and_self_open_preserve_its_payload() {
-        let contents = |palette: &Palette| (palette.tools.clone(), palette.query.clone(), palette.chosen.clone(),
-            palette.args.clone(), palette.args_error.clone(), palette.list_error.clone(), palette.need_list,
-            palette.list_sent, palette.running, palette.outcome.clone(), palette.focus);
-        for id in ["EditCommand.ShowCommandBrowserWindow", PALETTE_ID] {
+        let contents = |palette: &Palette| (palette.owner, palette.tools.clone(), palette.query.clone(), palette.chosen.clone(),
+            palette.args.clone(), palette.args_error.clone(), palette.listing.clone(), palette.execution.clone(), palette.focus);
+        for (id, busy) in [("EditCommand.ShowCommandBrowserWindow", false), ("EditCommand.ShowCommandBrowserWindow", true),
+            (PALETTE_ID, false), (PALETTE_ID, true)] {
             let ctx = context();
             let mut rig = Rig::new();
             rig.store.set("firstrun_complete", true).unwrap();
@@ -5617,17 +5879,19 @@ mod frame_tests {
             palette.chosen = Some(id.into());
             palette.args = "retained argument draft".into();
             palette.args_error = Some("retained validation message".into());
-            palette.list_error = Some("retained listing message".into());
-            palette.list_sent = true;
-            palette.running = true;
-            palette.outcome = Some(Outcome { ok: true, text: "retained result".into() });
+            palette.listing = PaletteList::Failed("retained listing message".into());
+            palette.execution = PaletteExecution::Idle(Some(Outcome { ok: true, text: "retained result".into() }));
             palette.focus = false;
-            let before = contents(palette);
+            let pending = busy.then(|| windows.begin_browser_call().unwrap());
+            let before = contents(windows.palette.as_ref().unwrap());
             windows.set_command_browser_open(true);
             windows.set_command_browser_open(true);
             assert_eq!(contents(windows.palette.as_ref().unwrap()), before);
 
-            windows.palette.as_mut().unwrap().running = false;
+            if let Some(request) = pending {
+                windows.deliver(McpTarget::ToolCall(request), Some(json!({"jsonrpc":"2.0","id":2,
+                    "result":{"isError":false,"content":[{"type":"text","text":"retained result"}]}})));
+            }
             frame(&ctx, &mut windows, &mut rig, Vec::new());
             let (_, laid_out) = frame(&ctx, &mut windows, &mut rig, Vec::new());
             let at = center(&laid_out, Role::Button, "Run Command");
@@ -5660,13 +5924,10 @@ mod frame_tests {
             call_request("editor_command_browser_set", json!({"open":false})))]);
         windows.set_command_browser_open(false);
         windows.set_command_browser_open(false);
-        let mut session = soul2d_core::Session::new();
-        windows.deliver(McpTarget::ToolList, session.handle_mcp(&list_request()));
-        windows.deliver(McpTarget::ToolCall, Some(json!({"result":{"isError":false}})));
-        assert!(!windows.command_browser_open(), "closed responses never recreate the browser");
+        assert!(!windows.command_browser_open(), "native dismissal stays closed");
         windows.set_command_browser_open(true);
         let palette = windows.palette.as_ref().unwrap();
-        assert!(palette.query.is_empty() && palette.chosen.is_none() && palette.args.is_empty() && palette.outcome.is_none());
+        assert!(palette.query.is_empty() && palette.chosen.is_none() && palette.args.is_empty() && palette.outcome().is_none());
     }
 
     #[test]
