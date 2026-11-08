@@ -54,6 +54,7 @@ CAN3 の Outline で Image または Guide トラックと読み取り可能な�
 
 - [チュートリアル](user-doc/tutorial/ja/01-model-structuring.md)：モデルの構成と
   [パラメータの定義](user-doc/tutorial/ja/02-parameter-definition.md)。
+- [コマンドブラウザー](user-doc/command-browser.ja.md)：エディタ内から操作とツールを実行します。
 - [ソースからのビルド](BUILD.md)と[エディタの翻訳](TRANSLATING.md)（英語）。
 - [開発者向けドキュメントの索引](doc/README.md)（英語）：[アーキテクチャ](doc/ARCHITECTURE.md)、
   [MCP API](doc/mcp_api.md)、[形式変換マップ](doc/format-conversion-map.md)。

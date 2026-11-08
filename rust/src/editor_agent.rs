@@ -3455,8 +3455,12 @@ mod tests {
         let status = crate::editor_windows::McpStatus::default();
         let mut harness = Harness::new();
         {
+            let browser_node_capture = |_|Err("No Browser operation in this approval fixture".into());
+            let browser_key_values = ||Err("No Browser operation in this approval fixture".into());
+            let browser_keys = [None,None];
             let mut draw = |ctx:&egui::Context| {windows.show(ctx, crate::editor_windows::Host {
-                all_keys:[false;2], snapshot:controller.snapshot(), selected_node:None, project_path:None,
+                all_keys:[false;2], browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values, browser_keys:&browser_keys,
+                snapshot:controller.snapshot(), selected_node:None, project_path:None,
                 store:&mut store, store_path:None, shortcuts:&mut shortcuts, locales:&[], lang:"en", tr:&str::to_owned, mcp:&status,
             });};
             harness.click(egui::accesskit::Role::Button, "Tools", &mut draw);

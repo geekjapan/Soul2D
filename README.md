@@ -57,6 +57,7 @@ Use copies of your models for experiments.
 
 - [Tutorials](user-doc/tutorial/en/01-model-structuring.md): structure a model and
   [define its parameters](user-doc/tutorial/en/02-parameter-definition.md).
+- [Command Browser](user-doc/command-browser.md): run actions and tools inside the editor.
 - [Build from source](BUILD.md) and [translate the editor](TRANSLATING.md).
 - [Developer documentation index](doc/README.md): [architecture](doc/ARCHITECTURE.md),
   [MCP API](doc/mcp_api.md), and [format conversion map](doc/format-conversion-map.md).

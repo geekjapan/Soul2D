@@ -10,7 +10,7 @@
 use eframe::egui;
 use serde_json::{json, Value};
 use soul2d_core::autosave;
-use soul2d_core::editor_controller::{FlipEdit, FlipOperation, FlipSlot, FlipTextField};
+use soul2d_core::editor_controller::{FlipEdit, FlipOperation, FlipSlot, FlipTextField, NodeClipboardAction, PreparedKeyValues, PreparedNodeClipboard};
 use soul2d_core::i18n::LocaleEntry;
 use soul2d_core::mcp_listener::McpSettings;
 use soul2d_core::settings::{Chord, Platform, Settings, ShortcutRegistry};
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use crate::editor_input_epoch::{InputEpoch, InputEpochs, InputRefusal};
-use crate::editor_number_input::new_input_view;
+use crate::editor_number_input::{new_input_view, try_new_input_view};
 use crate::editor_agent::ObjectDiscardDocument;
 
 // ------------------------------------------------------------------------------------------ constants
@@ -44,27 +44,34 @@ fn opens_command_browser(id: &str) -> bool {
     matches!(id, "EditCommand.ShowCommandBrowserWindow" | PALETTE_ID)
 }
 
-/// The editor's commands, as (D command id, shortcut table category, label, description).
-const COMMANDS: &[(&str, &str, &str, &str)] = &[
-    ("FileCommand.NewFile", "File", "New", "Create new project."),
-    ("FileCommand.ShowOpenFileDialog", "File", "Open", "Show \"Open\" dialog."),
-    ("FileCommand.ShowSaveFileDialog", "File", "Save", "Show \"Save\" dialog."),
-    ("FileCommand.ShowSaveFileAsDialog", "File", "Save As...", "Show \"Save as\" dialog."),
-    ("EditCommand.Undo", "Edit", "Undo", "Undo last action"),
-    ("EditCommand.Redo", "Edit", "Redo", "Redo previously undone action"),
-    ("EditCommand.ShowSettingsWindow", "Edit", "Settings", "Show settings window"),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserAction { New, Open, Save, SaveAs, Undo, Redo, Settings, Browser, Cut, Copy, Paste, KeyAll, UnkeyAll, Palette }
+
+impl BrowserAction {
+    fn from_id(id: &str) -> Option<Self> { COMMANDS.iter().find(|row|row.0 == id).map(|row|row.4) }
+}
+
+const COMMANDS: &[(&str, &str, &str, &str, BrowserAction)] = &[
+    ("FileCommand.NewFile", "File", "New", "Create new project.", BrowserAction::New),
+    ("FileCommand.ShowOpenFileDialog", "File", "Open", "Show \"Open\" dialog.", BrowserAction::Open),
+    ("FileCommand.ShowSaveFileDialog", "File", "Save", "Show \"Save\" dialog.", BrowserAction::Save),
+    ("FileCommand.ShowSaveFileAsDialog", "File", "Save As...", "Show \"Save as\" dialog.", BrowserAction::SaveAs),
+    ("EditCommand.Undo", "Edit", "Undo", "Undo last action", BrowserAction::Undo),
+    ("EditCommand.Redo", "Edit", "Redo", "Redo previously undone action", BrowserAction::Redo),
+    ("EditCommand.ShowSettingsWindow", "Edit", "Settings", "Show settings window", BrowserAction::Settings),
     (
         "EditCommand.ShowCommandBrowserWindow",
         "Edit",
         "Command Browser",
         "Inspect available commands and their inputs/outputs.",
+        BrowserAction::Browser,
     ),
-    ("NodeCommand.CutNode", "Nodes", "Cut", "Cut Node"),
-    ("NodeCommand.CopyNode", "Nodes", "Copy", "Copy Node"),
-    ("NodeCommand.PasteNode", "Nodes", "Paste", "Paste Node"),
-    ("AnimationCommand.KeyAll", "Animation", "Key All", "Key every parameter on the timeline's frame"),
-    ("AnimationCommand.UnkeyAll", "Animation", "Unkey All", "Delete every key on the timeline's frame"),
-    (PALETTE_ID, "Palette", "Show Command Palette.", "Show Command Palette."),
+    ("NodeCommand.CutNode", "Nodes", "Cut", "Cut Node", BrowserAction::Cut),
+    ("NodeCommand.CopyNode", "Nodes", "Copy", "Copy Node", BrowserAction::Copy),
+    ("NodeCommand.PasteNode", "Nodes", "Paste", "Paste Node", BrowserAction::Paste),
+    ("AnimationCommand.KeyAll", "Animation", "Key All", "Key every parameter on the timeline's frame", BrowserAction::KeyAll),
+    ("AnimationCommand.UnkeyAll", "Animation", "Unkey All", "Delete every key on the timeline's frame", BrowserAction::UnkeyAll),
+    (PALETTE_ID, "Palette", "Show Command Palette.", "Show Command Palette.", BrowserAction::Palette),
 ];
 
 /// Shortcut ids this module dispatches itself; `editor_ui` handles the file and undo ones.
@@ -135,12 +142,117 @@ pub struct BrowserRequest {
     sequence: InputEpoch,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserReplyTarget { List(BrowserRequest), Call(BrowserRequest) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BrowserTimeline {
+    pub name: String,
+    pub fallback: Option<f64>,
+    pub playhead: f64,
+    pub from_preview: bool,
+    pub request: Value,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum CapturedBrowserOperation {
+    List,
+    Tool(Value),
+    Action(CapturedBrowserAction),
+    Close,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum CapturedBrowserAction {
+    New, OpenPrompt, Save(String), SaveAsPrompt, Undo(Value), Redo(Value), Settings, OpenBrowser,
+    Node(PreparedNodeClipboard),
+    KeyAll {timeline:BrowserTimeline,values:PreparedKeyValues},
+    UnkeyAll(BrowserTimeline),
+}
+
+impl CapturedBrowserAction {
+    pub(crate) fn keeps_open(&self) -> bool { matches!(self,Self::OpenBrowser) }
+
+    fn capture(action: BrowserAction, env: &Env) -> Result<Self, String> {
+        Ok(match action {
+            BrowserAction::New => Self::New,
+            BrowserAction::Open => Self::OpenPrompt,
+            BrowserAction::Save => match env.project {
+                Some(path) => Self::Save(path.to_str().ok_or("The saved path is not UTF-8")?.to_owned()),
+                None => Self::SaveAsPrompt,
+            },
+            BrowserAction::SaveAs => Self::SaveAsPrompt,
+            BrowserAction::Undo | BrowserAction::Redo => {
+                let history = env.snapshot["history"].as_object().ok_or("The history position is unavailable")?;
+                if action == BrowserAction::Undo {Self::Undo(Value::Object(history.clone()))}
+                else {Self::Redo(Value::Object(history.clone()))}
+            }
+            BrowserAction::Settings => Self::Settings,
+            BrowserAction::Browser | BrowserAction::Palette => Self::OpenBrowser,
+            BrowserAction::Cut => Self::Node((env.browser_node_capture)(NodeClipboardAction::Cut)?),
+            BrowserAction::Copy => Self::Node((env.browser_node_capture)(NodeClipboardAction::Copy)?),
+            BrowserAction::Paste => Self::Node((env.browser_node_capture)(NodeClipboardAction::Paste)?),
+            BrowserAction::KeyAll => Self::KeyAll {
+                timeline:env.browser_keys[0].clone().ok_or("The timeline target is unavailable")?,
+                values:(env.browser_key_values)()?,
+            },
+            BrowserAction::UnkeyAll => Self::UnkeyAll(env.browser_keys[1].clone().ok_or("The timeline target is unavailable")?),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BrowserInputCapture {
+    query: String,
+    chosen: Option<String>,
+    args: String,
+    entry: Option<Entry>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct NativeBrowserRequest {
+    target: BrowserReplyTarget,
+    view: InputEpoch,
+    document: crate::editor_agent::ObjectDiscardDocument,
+    input: Option<BrowserInputCapture>,
+    pub(crate) operation: CapturedBrowserOperation,
+}
+
+#[derive(Default)]
+enum BrowserLocalView {
+    #[default]
+    Initial,
+    Live(InputEpoch),
+    Exhausted,
+}
+
+pub(crate) struct BrowserExecutionFrame {
+    pub captured: CapturedBrowserOperation,
+    pub context: BrowserExecutionContext,
+}
+
+pub(crate) struct BrowserExecutionContext {
+    target: BrowserReplyTarget,
+    delivery: Option<(InputEpoch, crate::editor_agent::ObjectDiscardDocument)>,
+    pub transitions: usize,
+    retained: BrowserRetainedResult,
+}
+
+enum BrowserRetainedResult { Publish, Keep(Option<Outcome>) }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloseObservation { pub issued: bool }
+
+impl CloseObservation {
+    pub(crate) fn merge(&mut self, other: Self) { self.issued |= other.issued; }
+}
+
+pub struct WindowFrame { pub requests: Vec<Request>, pub close: CloseObservation }
+
 /// Which pending MCP call an answer belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTarget {
     AddressDialog,
-    ToolList(BrowserRequest),
-    ToolCall(BrowserRequest),
     /// The `texture_get` answer for the albedo (0), emissive (1) or bump (2) slot of the viewer's Part.
     Texture(u8),
     /// An editor layout or window-visibility call from View.
@@ -193,6 +305,7 @@ pub fn panel_visible(store: &Settings, key: &str) -> bool {
 /// What `editor_ui` must do on behalf of a window.
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    Browser(NativeBrowserRequest),
     /// A D command id that `editor_ui` maps to its own editor action (new, save, undo, redo).
     Command(String),
     /// Open this path (goes through the autosave restore prompt).
@@ -240,6 +353,9 @@ pub struct McpStatus {
 pub struct Host<'a> {
     /// Whether key all and unkey all can run on the timeline's frame, in that order.
     pub all_keys: [bool; 2],
+    pub browser_node_capture: &'a dyn Fn(NodeClipboardAction) -> Result<PreparedNodeClipboard,String>,
+    pub browser_key_values: &'a dyn Fn() -> Result<PreparedKeyValues,String>,
+    pub browser_keys: &'a [Option<BrowserTimeline>; 2],
     pub snapshot: &'a Value,
     pub selected_node: Option<u64>,
     pub project_path: Option<&'a Path>,
@@ -592,7 +708,7 @@ pub fn shortcut_list(store: &Settings, shortcuts: &ShortcutRegistry) -> Vec<Valu
     let swap = mac_swap(store);
     COMMANDS
         .iter()
-        .map(|(id, _, label, _)| {
+        .map(|(id, _, label, _, _)| {
             let binding = shortcuts.binding_for(id);
             let chord = binding.map(|binding| chord_text(&binding.chord, Platform::current(), swap));
             json!({"command": id, "label": label, "shortcut": chord,
@@ -830,7 +946,7 @@ impl Entry {
 pub fn action_entries() -> Vec<Entry> {
     COMMANDS
         .iter()
-        .map(|(id, category, label, description)| Entry {
+        .map(|(id, category, label, description, _)| Entry {
             id: (*id).to_owned(),
             label: (*label).to_owned(),
             description: (*description).to_owned(),
@@ -1272,6 +1388,9 @@ pub fn tree_nodes(nodes: &Value) -> Vec<(u32, String, String)> {
 /// What the windows of one frame share: the host's data plus the requests collected so far.
 struct Env<'a> {
     all_keys: [bool; 2],
+    browser_node_capture: &'a dyn Fn(NodeClipboardAction) -> Result<PreparedNodeClipboard,String>,
+    browser_key_values: &'a dyn Fn() -> Result<PreparedKeyValues,String>,
+    browser_keys: &'a [Option<BrowserTimeline>; 2],
     ctx: &'a egui::Context,
     snapshot: &'a Value,
     selected: Option<u64>,
@@ -1284,6 +1403,7 @@ struct Env<'a> {
     tr: &'a dyn Fn(&str) -> String,
     mcp: &'a McpStatus,
     out: Vec<Request>,
+    close: CloseObservation,
 }
 
 impl Env<'_> {
@@ -1755,7 +1875,7 @@ impl SettingsWindow {
                         ui.strong(env.t("Shortcut"));
                         ui.strong(env.t("Edit"));
                         ui.end_row();
-                        for (id, _, label, _) in rows {
+                        for (id, _, label, _, _) in rows {
                             let label = env.t(label);
                             ui.label(label.as_str());
                             let capturing = self.capture.as_ref().is_some_and(|capture| capture.command == *id);
@@ -2153,19 +2273,44 @@ enum PaletteActivation {
 #[derive(Clone, Debug, PartialEq)]
 enum PaletteList {
     Needed,
-    Pending { request: BrowserRequest, error: Option<String> },
+    Pending { request: BrowserRequest, previous: SettledPaletteList },
     Ready,
     Failed(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum SettledPaletteList { Needed, Ready, Failed(String) }
+
+impl PaletteList {
+    fn settled(&self) -> SettledPaletteList {
+        match self {
+            Self::Needed => SettledPaletteList::Needed,
+            Self::Ready => SettledPaletteList::Ready,
+            Self::Failed(error) => SettledPaletteList::Failed(error.clone()),
+            Self::Pending { previous, .. } => previous.clone(),
+        }
+    }
+
+    fn cancel(&mut self) {
+        if let Self::Pending { previous, .. } = self {
+            *self = match previous.clone() {
+                SettledPaletteList::Needed => Self::Needed,
+                SettledPaletteList::Ready => Self::Ready,
+                SettledPaletteList::Failed(error) => Self::Failed(error),
+            };
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum PaletteExecution {
     Idle(Option<Outcome>),
-    Running(BrowserRequest),
+    Queued { request: BrowserRequest, previous: Option<Outcome> },
+    Executing(BrowserRequest),
 }
 
 struct Palette {
-    owner: egui::Id,
+    owner: Option<egui::Id>,
     tools: Vec<Entry>,
     query: String,
     chosen: Option<String>,
@@ -2179,7 +2324,7 @@ struct Palette {
 impl Palette {
     fn new() -> Self {
         Self {
-            owner: new_input_view(),
+            owner: try_new_input_view(),
             tools: Vec::new(),
             query: String::new(),
             chosen: None,
@@ -2203,17 +2348,24 @@ impl Palette {
         }
     }
 
-    fn running(&self) -> bool { matches!(self.execution, PaletteExecution::Running(_)) }
+    fn running(&self) -> bool { !matches!(self.execution, PaletteExecution::Idle(_)) }
 
     fn outcome(&self) -> Option<&Outcome> {
-        match &self.execution { PaletteExecution::Idle(outcome) => outcome.as_ref(), PaletteExecution::Running(_) => None }
+        match &self.execution { PaletteExecution::Idle(outcome) => outcome.as_ref(), _ => None }
+    }
+
+    fn retained_outcome(&self) -> Option<&Outcome> {
+        match &self.execution {
+            PaletteExecution::Idle(outcome) | PaletteExecution::Queued {previous:outcome,..} => outcome.as_ref(),
+            PaletteExecution::Executing(_) => None,
+        }
     }
 
     fn list_error(&self) -> Option<&str> {
         match &self.listing {
-            PaletteList::Pending {error, ..} => error.as_deref(),
+            PaletteList::Pending {previous:SettledPaletteList::Failed(error), ..} => Some(error),
             PaletteList::Failed(error) => Some(error),
-            PaletteList::Needed | PaletteList::Ready => None,
+            _ => None,
         }
     }
 
@@ -2377,14 +2529,14 @@ impl Palette {
                 let caption = ui.label(format!("Arguments (JSON object); required: {}", required.join(", ")));
                 ui.add(egui::TextEdit::multiline(&mut self.args).code_editor().desired_rows(6).desired_width(f32::INFINITY))
                     .labelled_by(caption.id);
-                if let Some(error) = &self.args_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error.as_str());
-                }
                 let enabled = self.activation_allowed(entry, env, PaletteActivation::Run);
                 if ui.add_enabled(enabled, egui::Button::new(env.t("Run Command"))).clicked() {
                     action = self.activate(std::slice::from_ref(entry), env, PaletteActivation::Run);
                 }
             }
+        }
+        if let Some(error) = &self.args_error {
+            ui.colored_label(egui::Color32::LIGHT_RED,error.as_str());
         }
         if let Some(outcome) = self.outcome() {
             ui.separator();
@@ -2974,6 +3126,7 @@ pub struct Windows {
     about: bool,
     palette: Option<Palette>,
     browser_requests: InputEpochs,
+    browser_view: BrowserLocalView,
     texture: Option<TextureViewer>,
     /// The texture answers a load of the viewer still waits for.
     texture_request: Option<TextureLoad>,
@@ -3235,15 +3388,191 @@ impl Windows {
 
     pub fn set_command_browser_open(&mut self, open: bool) {
         if open {
+            if matches!(self.browser_view, BrowserLocalView::Initial) { self.next_browser_view(); }
             self.palette.get_or_insert_with(Palette::new);
         } else {
             self.palette = None;
         }
     }
 
+    fn next_browser_view(&mut self) -> Option<InputEpoch> {
+        let next = self.browser_requests.try_next();
+        self.browser_view = next.map_or(BrowserLocalView::Exhausted, BrowserLocalView::Live);
+        next
+    }
+
+    fn current_browser_view(&self) -> Option<InputEpoch> {
+        match self.browser_view { BrowserLocalView::Live(view) => Some(view), _ => None }
+    }
+
+    fn browser_input(&self) -> Option<BrowserInputCapture> {
+        let palette = self.palette.as_ref()?;
+        let entry = palette.chosen.as_ref().and_then(|id|
+            palette.tools.iter().find(|entry|&entry.id == id).cloned()
+                .or_else(||action_entries().into_iter().find(|entry|&entry.id == id)));
+        Some(BrowserInputCapture {query:palette.query.clone(), chosen:palette.chosen.clone(), args:palette.args.clone(), entry})
+    }
+
+    fn propose_browser(&mut self, env: &Env, target: BrowserReplyTarget, operation: CapturedBrowserOperation) -> Option<NativeBrowserRequest> {
+        let document = crate::editor_agent::ObjectDiscardDocument {
+            revision:env.snapshot["revision"].as_u64()?, path:env.project.map(Path::to_owned),
+        };
+        let view = self.current_browser_view()?;
+        if document.revision == u64::MAX { return None; }
+        let input = (!matches!(&operation, CapturedBrowserOperation::List | CapturedBrowserOperation::Close))
+            .then(||self.browser_input()).flatten();
+        Some(NativeBrowserRequest {target, view, document, input, operation})
+    }
+
+    pub(crate) fn browser_request_is_current(&self, request: &NativeBrowserRequest,
+        document: &crate::editor_agent::ObjectDiscardDocument) -> bool {
+        document.revision != u64::MAX && &request.document == document
+            && self.current_browser_view() == Some(request.view) && self.accepts_browser_target(request.target)
+            && request.input.as_ref().is_none_or(|input|self.browser_input().as_ref() == Some(input))
+    }
+
+    pub(crate) fn activate_browser(&mut self, request: NativeBrowserRequest,
+        document: &crate::editor_agent::ObjectDiscardDocument) -> Result<BrowserExecutionFrame, ()> {
+        if !self.browser_request_is_current(&request, document) { return Err(()); }
+        let previous = if let BrowserReplyTarget::Call(ticket) = request.target {
+            let palette = self.palette.as_mut().ok_or(())?;
+            let previous = match &mut palette.execution {
+                PaletteExecution::Queued {request:pending,previous} if *pending == ticket => previous.take(),
+                _ => return Err(()),
+            };
+            palette.execution = PaletteExecution::Executing(ticket);
+            previous
+        } else { None };
+        let retained = if matches!(&request.operation,CapturedBrowserOperation::Action(action) if action.keeps_open()) {
+            BrowserRetainedResult::Keep(previous)
+        } else { BrowserRetainedResult::Publish };
+        Ok(BrowserExecutionFrame {captured:request.operation,context:BrowserExecutionContext {
+            target:request.target,delivery:Some((request.view,request.document)),transitions:0,retained,
+        }})
+    }
+
+    pub(crate) fn observe_browser_document(&mut self, document: &crate::editor_agent::ObjectDiscardDocument,
+        mut execution: Option<&mut BrowserExecutionContext>) {
+        let old_view = self.current_browser_view();
+        let own = execution.as_ref().filter(|frame|frame.delivery.as_ref().is_some_and(|(view,_)|Some(*view) == old_view))
+            .filter(|frame|self.accepts_browser_target(frame.target)).map(|frame|frame.target);
+        let next = self.next_browser_view();
+        let own = own.filter(|_|next.is_some());
+        if let Some(frame) = execution.as_deref_mut() {
+            frame.transitions = frame.transitions.saturating_add(1);
+            frame.delivery = (own == Some(frame.target)).then_some(next).flatten().map(|view|(view,document.clone()));
+        }
+        if let Some(palette) = self.palette.as_mut() {
+            if !matches!(own,Some(BrowserReplyTarget::List(_))) { palette.listing.cancel(); }
+            if !matches!(own,Some(BrowserReplyTarget::Call(_))) { palette.execution = PaletteExecution::Idle(None); }
+        }
+    }
+
+    pub(crate) fn complete_browser(&mut self, mut frame: BrowserExecutionContext,
+        document: &crate::editor_agent::ObjectDiscardDocument, response: Option<Value>, outcome: Outcome) -> bool {
+        if let Some((_, anchor)) = frame.delivery.as_mut() {
+            if anchor.path == document.path { anchor.revision = document.revision; }
+            else { frame.delivery = None; }
+        }
+        let live = frame.delivery.as_ref().is_some_and(|(view,anchor)|self.current_browser_view() == Some(*view) && anchor == document)
+            && self.accepts_browser_target(frame.target)
+            && match frame.target {
+                BrowserReplyTarget::Call(ticket) => self.palette.as_ref().is_some_and(|palette|palette.execution == PaletteExecution::Executing(ticket)),
+                BrowserReplyTarget::List(_) => true,
+            };
+        if !live {
+            if self.accepts_browser_target(frame.target) {
+                if let Some(palette) = self.palette.as_mut() {
+                    match frame.target {
+                        BrowserReplyTarget::List(_) => palette.listing.cancel(),
+                        BrowserReplyTarget::Call(ticket) if palette.execution == PaletteExecution::Executing(ticket) => {
+                            palette.execution = PaletteExecution::Idle(None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return false;
+        }
+        let outcome = match frame.retained {BrowserRetainedResult::Publish=>Some(outcome),BrowserRetainedResult::Keep(previous)=>previous};
+        self.store_browser_reply(frame.target, response, outcome);
+        true
+    }
+
+    fn store_browser_reply(&mut self, target: BrowserReplyTarget, response: Option<Value>, outcome: Option<Outcome>) {
+        if !self.accepts_browser_target(target) { return; }
+        let Some(palette) = self.palette.as_mut() else { return; };
+        match target {
+            BrowserReplyTarget::List(_) => {
+                let outcome = outcome.unwrap_or(Outcome {ok:false,text:"The catalogue result is unknown".into()});
+                palette.listing = if outcome.ok {
+                    match response.as_ref().map(parse_tools) {
+                        Some(Ok(tools)) => { palette.tools = tools; PaletteList::Ready },
+                        Some(Err(error)) => PaletteList::Failed(error),
+                        None => PaletteList::Failed("the endpoint sent no response".into()),
+                    }
+                } else { PaletteList::Failed(outcome.text) };
+            }
+            BrowserReplyTarget::Call(_) => { palette.execution = PaletteExecution::Idle(outcome); }
+        }
+    }
+
+    #[cfg(test)]
+    fn deliver_browser(&mut self, target: BrowserReplyTarget, response: Option<Value>) {
+        let outcome = match target {
+            BrowserReplyTarget::List(_) => Outcome {ok:response.as_ref().is_some_and(|reply|parse_tools(reply).is_ok()),
+                text:response.as_ref().and_then(|reply|parse_tools(reply).err()).unwrap_or_else(||"the endpoint sent no response".into())},
+            BrowserReplyTarget::Call(_) => call_outcome(response.as_ref()),
+        };
+        self.store_browser_reply(target, response, Some(outcome));
+    }
+
+    pub(crate) fn browser_action_window(&mut self, action: BrowserAction, project: Option<&Path>) {
+        match action {
+            BrowserAction::Open => self.prompt = Some(PathPrompt::new(PromptKind::Open, String::new())),
+            BrowserAction::Save | BrowserAction::SaveAs => {
+                self.prompt = Some(PathPrompt::new(PromptKind::SaveAs, project.map(|path|path.display().to_string()).unwrap_or_default()));
+            }
+            BrowserAction::Settings => { self.settings.get_or_insert_with(SettingsWindow::default); }
+            BrowserAction::Browser | BrowserAction::Palette => self.set_command_browser_open(true),
+            _ => {}
+        }
+    }
+
     fn allocate_browser_request(&mut self) -> Option<BrowserRequest> {
-        let owner = self.palette.as_ref()?.owner;
-        self.browser_requests.try_next().map(|sequence| BrowserRequest {owner, sequence})
+        let owner = self.palette.as_ref()?.owner?;
+        match self.browser_requests.try_next() {
+            Some(sequence) => Some(BrowserRequest {owner, sequence}),
+            None => {
+                self.browser_view = BrowserLocalView::Exhausted;
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.listing.cancel();
+                    palette.execution = PaletteExecution::Idle(None);
+                }
+                None
+            }
+        }
+    }
+
+    fn reject_browser_target(&mut self, target: BrowserReplyTarget, reason: &str) {
+        if !self.accepts_browser_target(target) { return; }
+        let Some(palette) = self.palette.as_mut() else { return; };
+        match target {
+            BrowserReplyTarget::List(_) => palette.listing.cancel(),
+            BrowserReplyTarget::Call(ticket) => {
+                if let PaletteExecution::Queued {request, previous} = &mut palette.execution {
+                    if *request == ticket {
+                        let previous = previous.take();
+                        palette.execution = PaletteExecution::Idle(previous);
+                        palette.args_error = Some(reason.into());
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reject_browser(&mut self, request: &NativeBrowserRequest, reason: &str) {
+        self.reject_browser_target(request.target, reason);
     }
 
     fn begin_browser_list(&mut self) -> Option<BrowserRequest> {
@@ -3251,7 +3580,7 @@ impl Windows {
         let palette = self.palette.as_mut()?;
         match request {
             Some(request) => {
-                palette.listing = PaletteList::Pending {request, error:palette.list_error().map(str::to_owned)};
+                palette.listing = PaletteList::Pending {request, previous:palette.listing.settled()};
                 Some(request)
             }
             None => {
@@ -3267,7 +3596,8 @@ impl Windows {
         let palette = self.palette.as_mut()?;
         match request {
             Some(request) => {
-                palette.execution = PaletteExecution::Running(request);
+                let previous = palette.retained_outcome().cloned();
+                palette.execution = PaletteExecution::Queued {request,previous};
                 Some(request)
             }
             None => {
@@ -3279,14 +3609,14 @@ impl Windows {
         }
     }
 
-    pub(crate) fn accepts_mcp_target(&self, target: McpTarget) -> bool {
+    fn accepts_browser_target(&self, target: BrowserReplyTarget) -> bool {
         match target {
-            McpTarget::ToolList(request) => self.palette.as_ref().is_some_and(|palette|
-                palette.owner == request.owner && matches!(palette.listing,
+            BrowserReplyTarget::List(request) => self.palette.as_ref().is_some_and(|palette|
+                palette.owner == Some(request.owner) && matches!(palette.listing,
                     PaletteList::Pending {request:pending, ..} if pending == request)),
-            McpTarget::ToolCall(request) => self.palette.as_ref().is_some_and(|palette|
-                palette.owner == request.owner && palette.execution == PaletteExecution::Running(request)),
-            _ => true,
+            BrowserReplyTarget::Call(request) => self.palette.as_ref().is_some_and(|palette|
+                palette.owner == Some(request.owner) && matches!(palette.execution,
+                    PaletteExecution::Queued {request:pending,..} | PaletteExecution::Executing(pending) if pending == request)),
         }
     }
 
@@ -3406,9 +3736,12 @@ impl Windows {
     }
 
     /// Draws the menu bar and every open window; call once at the top of the editor's `update`.
-    pub fn show(&mut self, ctx: &egui::Context, host: Host<'_>) -> Vec<Request> {
+    pub fn show(&mut self, ctx: &egui::Context, host: Host<'_>) -> WindowFrame {
         let mut env = Env {
             all_keys: host.all_keys,
+            browser_node_capture: host.browser_node_capture,
+            browser_key_values: host.browser_key_values,
+            browser_keys: host.browser_keys,
             ctx,
             snapshot: host.snapshot,
             selected: host.selected_node,
@@ -3421,6 +3754,7 @@ impl Windows {
             tr: host.tr,
             mcp: host.mcp,
             out: Vec::new(),
+            close: CloseObservation::default(),
         };
         self.ctx = Some(ctx.clone());
         self.apply_look(&env);
@@ -3432,30 +3766,12 @@ impl Windows {
         self.menu_bar(&mut env);
         self.draw_windows(&mut env);
         env.out.extend(self.notices.drain(..).map(Request::Notice));
-        env.out
+        WindowFrame {requests:env.out, close:env.close}
     }
 
     /// Hands back the endpoint's answer to an `Request::Mcp`.
     pub fn deliver(&mut self, target: McpTarget, response: Option<Value>) {
-        if !self.accepts_mcp_target(target) { return; }
         match target {
-            McpTarget::ToolList(_) => {
-                if let Some(palette) = self.palette.as_mut() {
-                    palette.listing = match response.as_ref().map(parse_tools) {
-                        Some(Ok(tools)) => {
-                            palette.tools = tools;
-                            PaletteList::Ready
-                        }
-                        Some(Err(error)) => PaletteList::Failed(error),
-                        None => PaletteList::Failed("the endpoint sent no response".to_owned()),
-                    };
-                }
-            }
-            McpTarget::ToolCall(_) => {
-                if let Some(palette) = self.palette.as_mut() {
-                    palette.execution = PaletteExecution::Idle(Some(call_outcome(response.as_ref())));
-                }
-            }
             McpTarget::Texture(position) => self.texture_answer(usize::from(position).min(2), response),
             McpTarget::Viewport => {
                 if let Err(error) = structured(response.as_ref()) {
@@ -3918,7 +4234,10 @@ impl Windows {
             Some(MenuAction::Textures) => env.out.push(Request::Mcp(McpTarget::Layout,
                 call_request("editor_texture_viewer_set", json!({"open":true})))),
             Some(MenuAction::FlipPairs) => self.open_flip(env),
-            Some(MenuAction::Quit) => env.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Some(MenuAction::Quit) => {
+                env.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                env.close.issued = true;
+            }
             None => {}
         }
     }
@@ -3965,29 +4284,51 @@ impl Windows {
             (keep, action, refresh)
         });
         if let Some((keep, action, refresh)) = browser_frame {
-            let mut close = !keep;
-            if keep {
+            if !keep {
+                if let Some(ticket) = self.allocate_browser_request() {
+                    let palette = self.palette.as_mut().unwrap();
+                    let previous = palette.retained_outcome().cloned();
+                    palette.execution = PaletteExecution::Queued {request:ticket,previous};
+                    let target = BrowserReplyTarget::Call(ticket);
+                    if let Some(request) = self.propose_browser(env, target, CapturedBrowserOperation::Close) {
+                        env.out.push(Request::Browser(request));
+                    } else { self.reject_browser_target(target, "Command Browser lifetime is unavailable"); }
+                }
+            } else {
                 match action {
                     Some(PaletteAction::Run(id)) => {
-                        close = !opens_command_browser(&id);
-                        self.run_command(&id, env);
+                        if env.command_enabled(&id) {
+                            if let Some(action) = BrowserAction::from_id(&id) {
+                                match CapturedBrowserAction::capture(action, env) {
+                                    Err(error) => self.palette.as_mut().unwrap().args_error = Some(error),
+                                    Ok(captured) => if let Some(ticket) = self.begin_browser_call() {
+                                        let target = BrowserReplyTarget::Call(ticket);
+                                        if let Some(request) = self.propose_browser(env, target, CapturedBrowserOperation::Action(captured)) {
+                                            env.out.push(Request::Browser(request));
+                                        } else { self.reject_browser_target(target, "Command Browser lifetime is unavailable"); }
+                                    }
+                                }
+                            }
+                        }
                     }
                     Some(PaletteAction::Call { name, arguments }) => {
                         if let Some(request) = self.begin_browser_call() {
-                            env.out.push(Request::Mcp(McpTarget::ToolCall(request), call_request(&name, arguments)));
+                            let target = BrowserReplyTarget::Call(request);
+                            if let Some(request) = self.propose_browser(env, target, CapturedBrowserOperation::Tool(call_request(&name, arguments))) {
+                                env.out.push(Request::Browser(request));
+                            } else { self.reject_browser_target(target, "Command Browser lifetime is unavailable"); }
                         }
                     }
                     Some(PaletteAction::Refresh) | None => {}
                 }
                 if refresh {
                     if let Some(request) = self.begin_browser_list() {
-                        env.out.push(Request::Mcp(McpTarget::ToolList(request), list_request()));
+                        let target = BrowserReplyTarget::List(request);
+                        if let Some(request) = self.propose_browser(env, target, CapturedBrowserOperation::List) {
+                            env.out.push(Request::Browser(request));
+                        } else { self.reject_browser_target(target, "Command Browser lifetime is unavailable"); }
                     }
                 }
-            }
-            if close {
-                env.out.push(Request::Mcp(McpTarget::Layout,
-                    call_request("editor_command_browser_set", json!({"open":false}))));
             }
         }
         let load_pending = self.texture_request.is_some();
@@ -4507,8 +4848,18 @@ mod frame_tests {
     use egui::accesskit::Role;
     use std::collections::HashMap;
 
+    fn unavailable_browser_node_capture(_:NodeClipboardAction) -> Result<PreparedNodeClipboard,String> {
+        Err("No native node capture in this window-only fixture".into())
+    }
+
+    fn unavailable_browser_key_values() -> Result<PreparedKeyValues,String> {
+        Err("No native key values in this window-only fixture".into())
+    }
+
     /// Everything a frame needs, owned.
     struct Rig {
+        project: Option<std::path::PathBuf>,
+        browser_keys: [Option<BrowserTimeline>; 2],
         snapshot: Value,
         store: Settings,
         store_path: Option<std::path::PathBuf>,
@@ -4526,8 +4877,11 @@ mod frame_tests {
             let eye = json!({"uuid": 12, "name": "Eye_L", "type": "Node", "children": []});
             let eye2 = json!({"uuid": 13, "name": "Eye_R", "type": "Node", "children": []});
             Self {
+                project:None,
+                browser_keys:[None,None],
                 snapshot: json!({
                     "documentFormat": "inx", "revision": 3, "canUndo": true, "canRedo": false,
+                    "history": {"position":1,"count":1},
                     "clipboard": [{"uuid": 1}],
                     "model": {"nodes": {"uuid": 1, "name": "Root", "type": "Node", "children": [part, eye, eye2]}},
                 }),
@@ -4585,21 +4939,29 @@ mod frame_tests {
     }
 
     fn frame(ctx: &egui::Context, windows: &mut Windows, rig: &mut Rig, events: Vec<egui::Event>) -> (Vec<Request>, Out) {
+        frame_with_node_capture(ctx,windows,rig,events,&unavailable_browser_node_capture)
+    }
+
+    fn frame_with_node_capture(ctx: &egui::Context, windows: &mut Windows, rig: &mut Rig, events: Vec<egui::Event>,
+        capture: &dyn Fn(NodeClipboardAction) -> Result<PreparedNodeClipboard,String>) -> (Vec<Request>, Out) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
             events,
             ..Default::default()
         };
         let tr = |msgid: &str| if MARK_TR.get() { format!("[{msgid}]") } else { msgid.to_owned() };
+        let browser_keys = [None, None];
         let mut requests = Vec::new();
         let output = ctx.run(input, |ctx| {
             requests = windows.show(
                 ctx,
                 Host {
                     all_keys: [false; 2],
+                    browser_node_capture:capture, browser_key_values:&unavailable_browser_key_values,
+                    browser_keys:&browser_keys,
                     snapshot: &rig.snapshot,
                     selected_node: rig.selected,
-                    project_path: None,
+                    project_path: rig.project.as_deref(),
                     store: &mut rig.store,
                     store_path: rig.store_path.as_deref(),
                     shortcuts: &mut rig.shortcuts,
@@ -4608,7 +4970,7 @@ mod frame_tests {
                     tr: &tr,
                     mcp: &rig.mcp,
                 },
-            );
+            ).requests;
             rig.keys_left = ctx.input(|input| input.events.iter().filter(|event| matches!(event, egui::Event::Key { .. })).count());
         });
         (requests, TREE.with(|tree| tree.borrow_mut().absorb(&output)))
@@ -4705,7 +5067,7 @@ mod frame_tests {
         let mut session = soul2d_core::Session::new();
         windows.set_command_browser_open(true);
         let request = windows.begin_browser_list().unwrap();
-        windows.deliver(McpTarget::ToolList(request), session.handle_mcp(&list_request()));
+        windows.deliver_browser(BrowserReplyTarget::List(request), session.handle_mcp(&list_request()));
     }
 
     fn choose(windows: &mut Windows, id: &str) {
@@ -5379,6 +5741,8 @@ mod frame_tests {
         let tr = |msgid: &str| msgid.to_owned();
         let env = |rig: &mut Rig, selected: Option<u64>| {
             let mut copy = Rig {
+                project:None,
+                browser_keys:[None,None],
                 snapshot: rig.snapshot.clone(),
                 store: Settings::empty(),
                 store_path: None,
@@ -5391,6 +5755,9 @@ mod frame_tests {
             let outcome = {
                 let e = Env {
                     all_keys: [true, false],
+                    browser_node_capture:&unavailable_browser_node_capture, browser_key_values:&unavailable_browser_key_values,
+                    browser_keys:&copy.browser_keys,
+                    close:CloseObservation::default(),
                     ctx: &ctx,
                     snapshot: &copy.snapshot,
                     selected: copy.selected,
@@ -5583,23 +5950,30 @@ mod frame_tests {
         }
     }
 
-    fn palette_mcp(requests: Vec<Request>) -> (McpTarget, Value) {
+    fn palette_mcp(requests: Vec<Request>) -> (BrowserReplyTarget, Value) {
         match only(requests) {
-            Request::Mcp(target, call) => (target, call),
-            request => panic!("expected an MCP request, got {request:?}"),
+            Request::Browser(request) => {
+                let message = match request.operation {
+                    CapturedBrowserOperation::List => list_request(),
+                    CapturedBrowserOperation::Tool(message) => message,
+                    other => panic!("expected a Browser MCP operation, got {other:?}"),
+                };
+                (request.target, message)
+            }
+            request => panic!("expected a Browser request, got {request:?}"),
         }
     }
 
-    fn palette_list(requests: Vec<Request>) -> McpTarget {
+    fn palette_list(requests: Vec<Request>) -> BrowserReplyTarget {
         let (target, call) = palette_mcp(requests);
-        assert!(matches!(target, McpTarget::ToolList(_)));
+        assert!(matches!(target, BrowserReplyTarget::List(_)));
         assert_eq!(call, list_request());
         target
     }
 
-    fn palette_call(requests: Vec<Request>, expected: Value) -> McpTarget {
+    fn palette_call(requests: Vec<Request>, expected: Value) -> BrowserReplyTarget {
         let (target, call) = palette_mcp(requests);
-        assert!(matches!(target, McpTarget::ToolCall(_)));
+        assert!(matches!(target, BrowserReplyTarget::Call(_)));
         assert_eq!(call, expected);
         target
     }
@@ -5608,6 +5982,188 @@ mod frame_tests {
         Some(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{
             "name":name,"description":"Owned catalogue fixture","inputSchema":{"type":"object","properties":{}}
         }]}}))
+    }
+
+    #[test]
+    fn command_browser_same_state_replacements_rotate_and_cancel_refresh_to_empty_ready() {
+        let ctx=context();let mut rig=Rig::new();let mut windows=Windows::new();
+        rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+        windows.set_command_browser_open(true);
+        let initial=windows.begin_browser_list().unwrap();
+        windows.deliver_browser(BrowserReplyTarget::List(initial),Some(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}})));
+        assert_eq!(windows.palette.as_ref().unwrap().listing,PaletteList::Ready);
+        let pending=windows.begin_browser_list().unwrap();
+        let document=crate::editor_agent::ObjectDiscardDocument {revision:3,path:None};
+        let before=windows.current_browser_view();windows.observe_browser_document(&document,None);
+        let middle=windows.current_browser_view();windows.observe_browser_document(&document,None);
+        assert_ne!(before,middle);assert_ne!(middle,windows.current_browser_view());
+        windows.deliver_browser(BrowserReplyTarget::List(pending),owned_catalogue("retired"));
+        assert!(windows.palette.as_ref().unwrap().tools.is_empty());
+        assert_eq!(windows.palette.as_ref().unwrap().listing,PaletteList::Ready);
+        assert!(frame(&ctx,&mut windows,&mut rig,Vec::new()).0.is_empty(),"an empty Ready catalogue is not Needed");
+    }
+
+    #[test]
+    fn command_browser_unavailable_owner_exhausted_requests_and_saturated_revision_cannot_propose() {
+        for unavailable in ["owner","requests","revision"] {
+            let ctx=context();let mut rig=Rig::new();let mut windows=Windows::new();
+            rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+            loaded_palette(&mut windows);choose(&mut windows,"history_clear");
+            windows.palette.as_mut().unwrap().query="history_clear".into();
+            match unavailable {
+                "owner" => windows.palette.as_mut().unwrap().owner=None,
+                "requests" => windows.browser_requests.exhaust_for_test(),
+                _ => rig.snapshot["revision"]=json!(u64::MAX),
+            }
+            let (requests,_)=click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command");
+            assert!(requests.is_empty(),"{unavailable}: {requests:?}");
+            assert!(windows.command_browser_open());assert!(!windows.palette.as_ref().unwrap().running());
+            if unavailable == "requests" {assert!(matches!(windows.browser_view,BrowserLocalView::Exhausted));}
+        }
+    }
+
+    #[test]
+    fn command_browser_consumed_list_cannot_release_newer_same_owner_or_reopened_slot() {
+        for reopened in [false,true] {
+            let ctx=context();let mut rig=Rig::new();let mut windows=Windows::new();
+            rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+            windows.set_command_browser_open(true);
+            let document=crate::editor_agent::ObjectDiscardDocument {revision:3,path:None};
+            let Request::Browser(old)=only(frame(&ctx,&mut windows,&mut rig,Vec::new()).0) else {panic!("expected Browser list")};
+            let old=windows.activate_browser(old,&document).unwrap();
+            let requests=if reopened {
+                windows.set_command_browser_open(false);windows.set_command_browser_open(true);
+                frame(&ctx,&mut windows,&mut rig,Vec::new()).0
+            } else {click(&ctx,&mut windows,&mut rig,Role::Button,"Refresh").0};
+            let Request::Browser(current)=only(requests) else {panic!("expected fresh Browser list")};
+            let current=windows.activate_browser(current,&document).unwrap();
+            let mut session=soul2d_core::Session::new();
+            let reply=session.handle_mcp(&list_request());
+            assert!(!windows.complete_browser(old.context,&document,reply.clone(),Outcome {ok:true,text:"old".into()}));
+            assert!(matches!(windows.palette.as_ref().unwrap().listing,PaletteList::Pending {..}));
+            assert!(windows.complete_browser(current.context,&document,reply,Outcome {ok:true,text:"current".into()}));
+            assert_eq!(windows.palette.as_ref().unwrap().listing,PaletteList::Ready);
+        }
+    }
+
+    #[test]
+    fn command_browser_consumed_call_cannot_retire_a_newer_executing_slot() {
+        for reopened in [false,true] {
+            let ctx=context();let mut session=soul2d_core::Session::new();let mut rig=Rig::new();let mut windows=Windows::new();
+            rig.snapshot=session.snapshot();rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+            loaded_palette(&mut windows);choose(&mut windows,"history_summary");windows.palette.as_mut().unwrap().query="history_summary".into();
+            let before=crate::editor_agent::ObjectDiscardDocument {revision:rig.snapshot["revision"].as_u64().unwrap(),path:None};
+            let Request::Browser(request)=only(click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command").0) else {panic!("expected first call")};
+            let old=windows.activate_browser(request,&before).unwrap();
+            let CapturedBrowserOperation::Tool(message)=old.captured else {panic!("expected tool")};let old_reply=session.handle_mcp(&message);
+            assert_eq!(session.handle_request(&json!({"op":"new"}))["succeeded"],true);
+            rig.snapshot=session.snapshot();
+            let after=crate::editor_agent::ObjectDiscardDocument {revision:rig.snapshot["revision"].as_u64().unwrap(),path:None};
+            windows.observe_browser_document(&after,None);
+            if reopened {windows.set_command_browser_open(false);loaded_palette(&mut windows);choose(&mut windows,"history_summary");}
+            windows.palette.as_mut().unwrap().query="history_summary".into();
+            let Request::Browser(request)=only(click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command").0) else {panic!("expected second call")};
+            let current=windows.activate_browser(request,&after).unwrap();
+            let CapturedBrowserOperation::Tool(message)=current.captured else {panic!("expected tool")};let reply=session.handle_mcp(&message);
+            assert!(!windows.complete_browser(old.context,&after,old_reply,Outcome {ok:true,text:"old".into()}));
+            assert!(windows.palette.as_ref().unwrap().running(),"late old completion must preserve newer execution: {reopened}");
+            assert!(windows.complete_browser(current.context,&after,reply,Outcome {ok:true,text:"current".into()}));
+            assert!(!windows.palette.as_ref().unwrap().running());assert_eq!(windows.palette.as_ref().unwrap().outcome().unwrap().text,"current");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_browser_native_capture_compares_exact_non_utf8_paths_without_lossy_aliasing() {
+        use std::os::unix::ffi::OsStringExt;
+        let first=std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/browser-\xff.inp".to_vec()));
+        let second=std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/browser-\xfe.inp".to_vec()));
+        assert_eq!(first.to_string_lossy(),second.to_string_lossy());assert_ne!(first,second);
+        let ctx=context();let mut rig=Rig::new();let mut windows=Windows::new();
+        rig.project=Some(first.clone());
+        rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+        loaded_palette(&mut windows);choose(&mut windows,"history_summary");windows.palette.as_mut().unwrap().query="history_summary".into();
+        let Request::Browser(request)=only(click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command").0) else {panic!("expected Browser tool")};
+        let mut document=crate::editor_agent::ObjectDiscardDocument {revision:3,path:Some(first)};
+        assert!(windows.browser_request_is_current(&request,&document));
+        document.path=Some(second);
+        assert!(!windows.browser_request_is_current(&request,&document));
+    }
+
+    #[test]
+    fn command_browser_exhausted_own_transition_keeps_actual_reply_but_retires_running_slot() {
+        let ctx=context();let mut session=soul2d_core::Session::new();let mut rig=Rig::new();let mut windows=Windows::new();
+        rig.snapshot=session.snapshot();
+        rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+        loaded_palette(&mut windows);choose(&mut windows,"new");windows.palette.as_mut().unwrap().query="new".into();
+        let document=crate::editor_agent::ObjectDiscardDocument {revision:rig.snapshot["revision"].as_u64().unwrap(),path:None};
+        let Request::Browser(request)=only(click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command").0) else {panic!("expected Browser tool")};
+        let consumed=windows.activate_browser(request,&document).unwrap();
+        let CapturedBrowserOperation::Tool(message)=consumed.captured else {panic!("expected captured tool")};
+        let reply=session.handle_mcp(&message);
+        assert_eq!(reply.as_ref().unwrap()["result"]["isError"],false);
+        let post=crate::editor_agent::ObjectDiscardDocument {revision:session.snapshot()["revision"].as_u64().unwrap(),path:None};
+        assert_eq!(post.revision,document.revision+1);
+        let mut context=consumed.context;windows.browser_requests.exhaust_for_test();
+        windows.observe_browser_document(&post,Some(&mut context));
+        assert_eq!(context.transitions,1);assert!(matches!(windows.browser_view,BrowserLocalView::Exhausted));
+        assert!(!windows.complete_browser(context,&post,reply,Outcome {ok:true,text:"actual success".into()}));
+        assert!(!windows.palette.as_ref().unwrap().running(),"exhaustion must retire the protected executing slot");
+    }
+
+    #[test]
+    fn command_browser_unobserved_path_adoption_refuses_delivery_and_retires_only_its_running_slot() {
+        let ctx=context();let mut controller=soul2d_core::editor_controller::EditorController::new();
+        let mut rig=Rig::new();let mut windows=Windows::new();rig.snapshot=controller.snapshot().clone();
+        rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+        let dir=std::env::temp_dir().join(format!("soul2d-browser-unobserved-save-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();crate::scratch::scratch(dir.clone());let path=dir.join("adopted.inp");
+        loaded_palette(&mut windows);choose(&mut windows,"FileCommand_SaveFile");
+        windows.palette.as_mut().unwrap().query="SaveFile".into();
+        windows.palette.as_mut().unwrap().args=json!({"file":path}).to_string();
+        let before=crate::editor_agent::ObjectDiscardDocument {revision:rig.snapshot["revision"].as_u64().unwrap(),path:None};
+        let Request::Browser(request)=only(click(&ctx,&mut windows,&mut rig,Role::Button,"Run Command").0) else {panic!("expected Browser Save")};
+        let consumed=windows.activate_browser(request,&before).unwrap();
+        let CapturedBrowserOperation::Tool(message)=consumed.captured else {panic!("expected captured Save")};
+        let reply=controller.mcp_request(&message);
+        assert_eq!(reply.as_ref().unwrap()["result"]["isError"],false,"{reply:?}");
+        assert!(path.is_file());assert_eq!(controller.project_path(),Some(path.canonicalize().unwrap().as_path()));
+        let after=crate::editor_agent::ObjectDiscardDocument {revision:controller.snapshot()["revision"].as_u64().unwrap(),
+            path:controller.project_path().map(Path::to_owned)};
+        assert!(!windows.complete_browser(consumed.context,&after,reply,Outcome {ok:true,text:"Saved".into()}));
+        let palette=windows.palette.as_ref().unwrap();
+        assert!(!palette.running(),"a missing observation must not leave its old executing slot running");
+        assert!(palette.retained_outcome().is_none());assert!(windows.command_browser_open());
+    }
+
+    #[test]
+    fn command_browser_node_payload_is_captured_only_when_an_operation_is_proposed() {
+        use soul2d_core::editor_controller::{EditorController,NodeAction};
+        let ctx=context();let mut controller=EditorController::new();
+        let root=controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        let created=controller.core_request(&json!({"op":"node.create","className":"Node","parents":[root],"name":"Source"}));
+        assert_eq!(created["succeeded"],true);
+        controller.select_nodes(&[created["result"]["created"][0]["uuid"].as_u64().unwrap()]).unwrap();
+        assert_eq!(controller.node_action(NodeAction::Copy)["succeeded"],true);controller.select_nodes(&[root]).unwrap();
+        let mut rig=Rig::new();rig.snapshot=controller.snapshot().clone();rig.selected=Some(root);
+        rig.store.set("firstrun_complete",true).unwrap();rig.store.set("hasDoneQuickSetup",true).unwrap();
+        let calls=std::cell::Cell::new(0);let capture=|action| {
+            calls.set(calls.get()+1);controller.prepare_node_clipboard(action)
+        };
+        let mut windows=Windows::new();
+        frame_with_node_capture(&ctx,&mut windows,&mut rig,Vec::new(),&capture);
+        loaded_palette(&mut windows);windows.palette.as_mut().unwrap().query="paste".into();
+        windows.palette.as_mut().unwrap().chosen=Some("NodeCommand.PasteNode".into());
+        frame_with_node_capture(&ctx,&mut windows,&mut rig,Vec::new(),&capture);
+        let (_,output)=frame_with_node_capture(&ctx,&mut windows,&mut rig,Vec::new(),&capture);
+        assert_eq!(calls.get(),0,"idle frames and a selected row do not own a clipboard copy");
+        let at=center(&output,Role::Button,"Run Command");
+        let (requests,_)=frame_with_node_capture(&ctx,&mut windows,&mut rig,
+            vec![egui::Event::PointerMoved(at),press(at,true),press(at,false)],&capture);
+        let Request::Browser(request)=only(requests) else {panic!("expected Browser Paste")};
+        let CapturedBrowserOperation::Action(CapturedBrowserAction::Node(target))=request.operation else {panic!("expected captured Paste")};
+        assert_eq!(calls.get(),1);assert!(controller.node_clipboard_is_current(&target));
     }
 
     #[test]
@@ -5620,13 +6176,13 @@ mod frame_tests {
         windows.set_command_browser_open(true);
         let (old, _) = palette_mcp(frame(&ctx, &mut windows, &mut rig, Vec::new()).0);
         windows.set_command_browser_open(false);
-        windows.deliver(old, owned_catalogue("owned_closed"));
+        windows.deliver_browser(old, owned_catalogue("owned_closed"));
         assert!(!windows.command_browser_open());
         windows.set_command_browser_open(true);
         let (current, _) = palette_mcp(frame(&ctx, &mut windows, &mut rig, Vec::new()).0);
-        windows.deliver(old, owned_catalogue("owned_old"));
+        windows.deliver_browser(old, owned_catalogue("owned_old"));
         assert!(windows.palette.as_ref().unwrap().tools.is_empty());
-        windows.deliver(current, owned_catalogue("owned_current"));
+        windows.deliver_browser(current, owned_catalogue("owned_current"));
         assert_eq!(windows.palette.as_ref().unwrap().tools[0].id, "owned_current");
     }
 
@@ -5641,9 +6197,9 @@ mod frame_tests {
         let before = windows.palette.as_ref().unwrap().tools.clone();
         let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh").0);
         let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Refresh").0);
-        windows.deliver(old, owned_catalogue("owned_stale_refresh"));
+        windows.deliver_browser(old, owned_catalogue("owned_stale_refresh"));
         assert!(windows.palette.as_ref().unwrap().tools == before, "stale Refresh changed the catalogue");
-        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":1,
+        windows.deliver_browser(current, Some(json!({"jsonrpc":"2.0","id":1,
             "error":{"code":-32000,"message":"owned refresh failure"}})));
         assert!(windows.palette.as_ref().unwrap().tools == before, "failed Refresh changed the catalogue");
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
@@ -5652,7 +6208,7 @@ mod frame_tests {
         let current = palette_list(requests);
         assert!(texts(&pending).iter().any(|text| text.contains("owned refresh failure")));
         assert!(windows.palette.as_ref().unwrap().tools == before);
-        windows.deliver(current, owned_catalogue("owned_recovered"));
+        windows.deliver_browser(current, owned_catalogue("owned_recovered"));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(!texts(&output).iter().any(|text| text.contains("owned refresh failure")));
         assert_eq!(windows.palette.as_ref().unwrap().tools[0].id, "owned_recovered");
@@ -5669,7 +6225,7 @@ mod frame_tests {
         choose(&mut windows, "history_summary");
         windows.palette.as_mut().unwrap().query = "history_summary".into();
         let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
-        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+        windows.deliver_browser(old, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":false,"content":[{"type":"text","text":"owned first result"}]}})));
         let (_, laid_out) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         let at = center(&laid_out, Role::Button, "Run Command");
@@ -5678,10 +6234,10 @@ mod frame_tests {
         assert!(!texts(&activated).iter().any(|text| text.contains("owned first result")),
             "Run clears the previous result in its activation frame");
         let (current, _) = palette_mcp(requests);
-        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+        windows.deliver_browser(old, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":false,"content":[{"type":"text","text":"owned duplicate result"}]}})));
         assert!(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0.is_empty());
-        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+        windows.deliver_browser(current, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":true,"content":[{"type":"text","text":"owned current failure"}]}})));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(texts(&output).iter().any(|text| text.contains("owned current failure")));
@@ -5700,16 +6256,16 @@ mod frame_tests {
         windows.palette.as_mut().unwrap().query = "history_summary".into();
         let (old, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
         windows.set_command_browser_open(false);
-        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        windows.deliver_browser(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
         assert!(!windows.command_browser_open());
         loaded_palette(&mut windows);
         choose(&mut windows, "history_summary");
         windows.palette.as_mut().unwrap().query = "history_summary".into();
         let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
-        windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,
+        windows.deliver_browser(old, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":false,"content":[{"type":"text","text":"wrong owner result"}]}})));
         assert!(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0.is_empty());
-        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+        windows.deliver_browser(current, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":false,"content":[{"type":"text","text":"current owner result"}]}})));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(texts(&output).iter().any(|text| text.contains("current owner result")));
@@ -5732,11 +6288,11 @@ mod frame_tests {
         current_windows.palette.as_mut().unwrap().query = "history_summary".into();
         let (current, _) = palette_mcp(click(&ctx, &mut current_windows, &mut rig, Role::Button, "Run Command").0);
         assert_ne!(old, current);
-        assert!(!current_windows.accepts_mcp_target(old));
-        assert!(current_windows.accepts_mcp_target(current));
-        current_windows.deliver(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        assert!(!current_windows.accepts_browser_target(old));
+        assert!(current_windows.accepts_browser_target(current));
+        current_windows.deliver_browser(old, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
         assert!(current_windows.palette.as_ref().unwrap().running());
-        current_windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,
+        current_windows.deliver_browser(current, Some(json!({"jsonrpc":"2.0","id":2,
             "result":{"isError":false,"content":[{"type":"text","text":"current instance result"}]}})));
         assert!(!current_windows.palette.as_ref().unwrap().running());
         assert_eq!(current_windows.palette.as_ref().unwrap().outcome().unwrap().text, "current instance result");
@@ -5754,7 +6310,7 @@ mod frame_tests {
         windows.palette.as_mut().unwrap().query = "history_summary".into();
         windows.browser_requests.fail_instance_for_test();
         let (current, _) = palette_mcp(click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command").0);
-        windows.deliver(current, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
+        windows.deliver_browser(current, Some(json!({"jsonrpc":"2.0","id":2,"result":{"isError":false}})));
         windows.browser_requests.exhaust_for_test();
         let (requests, output) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
         assert!(requests.is_empty());
@@ -5787,7 +6343,7 @@ mod frame_tests {
         assert!(requests.is_empty(), "the tool list is asked for once");
 
         let mut session = soul2d_core::Session::new();
-        windows.deliver(list_target, session.handle_mcp(&list_request()));
+        windows.deliver_browser(list_target, session.handle_mcp(&list_request()));
         {
             let palette = windows.palette.as_mut().unwrap();
             assert!(palette.tools.len() > 50, "{} tools", palette.tools.len());
@@ -5805,7 +6361,7 @@ mod frame_tests {
         let call = call_request("open", json!({"path": "/tmp/none.inx"}));
         let call_target = palette_call(requests, call.clone());
         // The failing answer of the real session is shown as a failure with its message.
-        windows.deliver(call_target, session.handle_mcp(&call));
+        windows.deliver_browser(call_target, session.handle_mcp(&call));
         let (_, output) = frame(&ctx, &mut windows, &mut rig, Vec::new());
         assert!(has(&output, "Failed"), "{:?}", texts(&output));
         assert!(!windows.palette.as_ref().unwrap().running());
@@ -5855,8 +6411,8 @@ mod frame_tests {
         assert!(run.is_disabled());
         windows.palette.as_mut().unwrap().query = "undo".to_owned();
         let (requests, _) = click(&ctx, &mut windows, &mut rig, Role::Button, "Run Command");
-        assert_eq!(requests, [Request::Command("EditCommand.Undo".to_owned()),
-            Request::Mcp(McpTarget::Layout, call_request("editor_command_browser_set", json!({"open":false})))]);
+        assert!(matches!(only(requests),Request::Browser(request)
+            if matches!(request.operation,CapturedBrowserOperation::Action(CapturedBrowserAction::Undo(_)))));
         assert!(windows.command_browser_open(), "the shared operation applies after drawing");
         windows.set_command_browser_open(false);
         assert!(windows.palette.is_none(), "D closes the palette after a command ran");
@@ -5865,7 +6421,7 @@ mod frame_tests {
     #[test]
     fn command_browser_duplicate_and_self_open_preserve_its_payload() {
         let contents = |palette: &Palette| (palette.owner, palette.tools.clone(), palette.query.clone(), palette.chosen.clone(),
-            palette.args.clone(), palette.args_error.clone(), palette.listing.clone(), palette.execution.clone(), palette.focus);
+            palette.args.clone(), palette.args_error.clone(), palette.listing.clone(), palette.retained_outcome().cloned(), palette.focus);
         for (id, busy) in [("EditCommand.ShowCommandBrowserWindow", false), ("EditCommand.ShowCommandBrowserWindow", true),
             (PALETTE_ID, false), (PALETTE_ID, true)] {
             let ctx = context();
@@ -5887,9 +6443,10 @@ mod frame_tests {
             windows.set_command_browser_open(true);
             windows.set_command_browser_open(true);
             assert_eq!(contents(windows.palette.as_ref().unwrap()), before);
+            assert_eq!(windows.palette.as_ref().unwrap().running(),busy);
 
             if let Some(request) = pending {
-                windows.deliver(McpTarget::ToolCall(request), Some(json!({"jsonrpc":"2.0","id":2,
+                windows.deliver_browser(BrowserReplyTarget::Call(request), Some(json!({"jsonrpc":"2.0","id":2,
                     "result":{"isError":false,"content":[{"type":"text","text":"retained result"}]}})));
             }
             frame(&ctx, &mut windows, &mut rig, Vec::new());
@@ -5898,11 +6455,19 @@ mod frame_tests {
             let before = contents(windows.palette.as_ref().unwrap());
             let (requests, _) = frame(&ctx, &mut windows, &mut rig,
                 vec![egui::Event::PointerMoved(at), press(at, true), press(at, false)]);
-            assert_eq!(requests, [Request::Mcp(McpTarget::Layout,
-                call_request("editor_command_browser_set", json!({"open":true})))]);
+            let Request::Browser(request) = only(requests) else {panic!("expected a typed Browser action")};
+            assert_eq!(request.operation,CapturedBrowserOperation::Action(CapturedBrowserAction::OpenBrowser));
             assert_eq!(contents(windows.palette.as_ref().unwrap()), before, "{id}");
             windows.set_command_browser_open(true);
             assert_eq!(contents(windows.palette.as_ref().unwrap()), before, "{id}");
+            assert!(windows.palette.as_ref().unwrap().running());
+            let document = crate::editor_agent::ObjectDiscardDocument {revision:rig.snapshot["revision"].as_u64().unwrap(),path:None};
+            let consumed = windows.activate_browser(request,&document).unwrap();
+            assert_eq!(consumed.captured,CapturedBrowserOperation::Action(CapturedBrowserAction::OpenBrowser));
+            windows.browser_action_window(BrowserAction::Browser,None);
+            assert!(windows.complete_browser(consumed.context,&document,None,Outcome {ok:true,text:"Command completed".into()}));
+            assert_eq!(contents(windows.palette.as_ref().unwrap()),before,"actual retained completion: {id}");
+            assert!(!windows.palette.as_ref().unwrap().running());
         }
     }
 
@@ -5920,8 +6485,7 @@ mod frame_tests {
         assert!(!windows.command_browser_open());
         windows.set_command_browser_open(true);
         let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![key(egui::Key::Escape, false, false)]);
-        assert_eq!(requests, [Request::Mcp(McpTarget::Layout,
-            call_request("editor_command_browser_set", json!({"open":false})))]);
+        assert!(matches!(only(requests),Request::Browser(request) if request.operation == CapturedBrowserOperation::Close));
         windows.set_command_browser_open(false);
         windows.set_command_browser_open(false);
         assert!(!windows.command_browser_open(), "native dismissal stays closed");
@@ -5950,8 +6514,8 @@ mod frame_tests {
             let at = center(&laid_out, Role::Button, if action == "refresh" { "Refresh" } else { "Run Command" });
             let (requests, _) = frame(&ctx, &mut windows, &mut rig, vec![egui::Event::PointerMoved(at),
                 press(at, true), press(at, false), key(egui::Key::Escape, false, false)]);
-            assert_eq!(requests, [Request::Mcp(McpTarget::Layout,
-                call_request("editor_command_browser_set", json!({"open":false})))], "{action}");
+            assert!(matches!(only(requests),Request::Browser(request)
+                if request.operation == CapturedBrowserOperation::Close), "{action}");
             windows.set_command_browser_open(false);
             assert!(!windows.command_browser_open());
         }
@@ -6449,6 +7013,9 @@ mod frame_tests {
     ) -> Env<'a> {
         Env {
             all_keys: [false; 2],
+            browser_node_capture:&unavailable_browser_node_capture, browser_key_values:&unavailable_browser_key_values,
+            browser_keys:&rig.browser_keys,
+            close:CloseObservation::default(),
             ctx,
             snapshot: &rig.snapshot,
             selected: None,

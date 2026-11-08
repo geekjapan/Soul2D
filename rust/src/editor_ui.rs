@@ -931,10 +931,48 @@ impl RemoteQuit {
     }
 }
 
+#[derive(Default)]
+struct BrowserDispatchScope { replacement_observed: bool }
+
+fn browser_document(controller: &EditorController) -> crate::editor_agent::ObjectDiscardDocument {
+    crate::editor_agent::ObjectDiscardDocument {
+        revision:controller.snapshot()["revision"].as_u64().unwrap_or(u64::MAX),
+        path:controller.project_path().map(Path::to_owned),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserActionResult { Succeeded, PromptOpened, TargetFailed, TargetResultUnknown }
+
+fn browser_tool_result(message: &Value, response: Option<&Value>) -> (BrowserActionResult, crate::editor_windows::Outcome) {
+    let known = response.filter(|reply| reply["jsonrpc"] == "2.0" && message.get("id").is_some()
+        && reply.get("id") == message.get("id") && reply.get("error").is_none() && reply["result"].is_object()
+        && reply["result"]["isError"].is_boolean()
+        && reply["result"]["content"].as_array().is_some_and(|items|items.iter().all(|item| match item["type"].as_str() {
+            Some("text") => item["text"].is_string(),
+            Some("image" | "audio") => item["data"].is_string() && item["mimeType"].is_string(),
+            Some("resource") => item["resource"]["uri"].is_string()
+                && (item["resource"]["text"].is_string() || item["resource"]["blob"].is_string()),
+            Some("resource_link") => item["uri"].is_string() && item["name"].is_string(),
+            _ => false,
+        })));
+    match known {
+        Some(reply) => (if reply["result"]["isError"] == false {BrowserActionResult::Succeeded} else {BrowserActionResult::TargetFailed},
+            crate::editor_windows::call_outcome(Some(reply))),
+        None => (BrowserActionResult::TargetResultUnknown,crate::editor_windows::Outcome {
+            ok:false,text:"The command result is unknown. Check the document before retrying.".into(),
+        }),
+    }
+}
+
 /// The editor state MCP reads and sets (`resource://soul2d/editor/state`, the `editor_*` tools), borrowed
 /// apart from the controller, the listener and the agent panel so every MCP entry point can hold those too.
 /// All of it is view state: nothing here reaches the document, its history or its revision.
 struct EditorView<'a> {
+    browser_pending: &'a mut Option<crate::editor_windows::NativeBrowserRequest>,
+    browser_execution: Option<&'a mut crate::editor_windows::BrowserExecutionContext>,
+    #[cfg(test)]
+    browser_transitions_for_test: &'a mut Vec<crate::editor_agent::ObjectDiscardDocument>,
     object_discard: &'a mut RemoteObjectDiscard,
     panel_discards: &'a mut [RemotePanelDiscard; 6],
     remote_quit: &'a mut RemoteQuit,
@@ -1014,8 +1052,13 @@ struct EditorView<'a> {
 }
 
 macro_rules! editor_view {
-    ($app:expr, $ctx:expr) => {
+    ($app:expr, $ctx:expr) => { editor_view!($app, $ctx, None) };
+    ($app:expr, $ctx:expr, $execution:expr) => {
         EditorView {
+            browser_pending: &mut $app.browser_pending,
+            browser_execution: $execution,
+            #[cfg(test)]
+            browser_transitions_for_test: &mut $app.browser_transitions_for_test,
             object_discard: &mut $app.object_discard,
             panel_discards: &mut $app.panel_discards,
             remote_quit: &mut $app.remote_quit,
@@ -1128,6 +1171,8 @@ fn recovery_snapshots(config_dir: Option<&Path>, own: Option<&Path>) -> Result<V
 impl EditorView<'_> {
     /// One MCP message: the controller answers it and asks this view for the `editor.*` requests.
     fn mcp(&mut self, controller: &mut EditorController, message: &Value, mut origin: McpOrigin<'_>) -> RpcReply {
+        let before_path = controller.project_path().map(Path::to_owned);
+        let mut browser_scope = BrowserDispatchScope::default();
         let reply_capable = matches!(origin, McpOrigin::Client);
         let control_reply_capable = matches!(origin, McpOrigin::Client | McpOrigin::Agent(_));
         let identified_stop = control_reply_capable && message["jsonrpc"] == "2.0" && message.get("id").is_some_and(|id|
@@ -1709,7 +1754,7 @@ impl EditorView<'_> {
                 quit_receipt = Some((sender, accepted.clone()));
                 return Ok(accepted);
             }
-            self.handle(controller, call)
+            self.handle(controller, call, &mut browser_scope)
         });
         if let McpOrigin::Agent(approval) = &origin {
             if let Ok(target) = &panel_discard_target {
@@ -1783,8 +1828,10 @@ impl EditorView<'_> {
             // What the menu entries do after a replacement: nothing may still describe the old document (the
             // armed parameter id among it; the new document may use that id for another parameter). The toolbar
             // path is where Save As writes, so a stale one would put the new document over the old project.
-            self.after_document_replaced();
+            if !browser_scope.replacement_observed { self.after_document_replaced(&browser_document(controller), &mut browser_scope); }
             *self.file_path = controller.project_path().map(|path| path.display().to_string()).unwrap_or_default();
+        } else if !browser_scope.replacement_observed && before_path.as_deref() != controller.project_path() {
+            self.observe_browser_document(&browser_document(controller));
         }
         self.viewport.reconcile_views(controller.snapshot());
         self.parameters.reconcile(controller.snapshot(), self.animation_name, self.seek_frame);
@@ -1988,7 +2035,7 @@ impl EditorView<'_> {
 
     /// Runs one `editor.*` request (arguments already checked for shape by `mcp.rs`) and answers with the
     /// state after it.
-    fn handle(&mut self, controller: &mut EditorController, call: &Value) -> Result<Value, String> {
+    fn handle(&mut self, controller: &mut EditorController, call: &Value, browser_scope: &mut BrowserDispatchScope) -> Result<Value, String> {
         let ids = |value: &Value| value.as_array().into_iter().flatten().filter_map(Value::as_u64).collect::<Vec<u64>>();
         match call["op"].as_str().unwrap_or_default() {
             "editor.state" => {}
@@ -2143,7 +2190,7 @@ impl EditorView<'_> {
             "editor.recovery.keep" => self.recovery_offer.clear(),
             "editor.recovery.restore" => {
                 self.refuse_under_a_dialog()?;
-                self.restore_recovery(controller, call["id"].as_str().unwrap_or_default())?;
+                self.restore_recovery(controller, call["id"].as_str().unwrap_or_default(), browser_scope)?;
             }
             "editor.settings.get" => return Ok(self.settings()),
             "editor.settings.set" => {
@@ -2324,7 +2371,16 @@ impl EditorView<'_> {
 
     /// What every document replacement resets in the window. It releases this session's recovery snapshot,
     /// so a restored snapshot is adopted after it, not before.
-    fn after_document_replaced(&mut self) {
+    fn observe_browser_document(&mut self, document: &crate::editor_agent::ObjectDiscardDocument) {
+        #[cfg(test)]
+        self.browser_transitions_for_test.push(document.clone());
+        self.browser_pending.take();
+        self.windows.observe_browser_document(document, self.browser_execution.as_deref_mut());
+    }
+
+    fn after_document_replaced(&mut self, document: &crate::editor_agent::ObjectDiscardDocument, scope: &mut BrowserDispatchScope) {
+        self.observe_browser_document(document);
+        scope.replacement_observed = true;
         self.remote_quit.cancel("document_replaced");
         self.notice.clear();
         self.viewport.forget_views();
@@ -2389,7 +2445,7 @@ impl EditorView<'_> {
 
     /// The Restore button: open the snapshot as an untitled, modified document, then take it over as this
     /// session's snapshot. The document gate is the one `open` has, not the window's dialog.
-    fn restore_recovery(&mut self, controller: &mut EditorController, id: &str) -> Result<(), String> {
+    fn restore_recovery(&mut self, controller: &mut EditorController, id: &str, browser_scope: &mut BrowserDispatchScope) -> Result<(), String> {
         if let Some(reason) = self.replacement_refusal(controller.snapshot()) { return Err(reason); }
         let snapshots = self.recovery_snapshots()?;
         let path = autosave::recovery_named(&snapshots, id)?.to_path_buf();
@@ -2398,7 +2454,7 @@ impl EditorView<'_> {
         controller
             .replace_document(&autosave::recovery_open_request(&path)?)
             .map_err(|message| message.replace(&named, id))?;
-        self.after_document_replaced();
+        self.after_document_replaced(&browser_document(controller), browser_scope);
         *self.file_path = String::new();
         adopt_recovery(self.recovery_offer, self.tools.recovery.as_mut(), path);
         Ok(())
@@ -2674,6 +2730,11 @@ enum HostDrainEffect {
 }
 
 pub struct EditorApp {
+    browser_pending: Option<crate::editor_windows::NativeBrowserRequest>,
+    #[cfg(test)]
+    browser_transitions_for_test: Vec<crate::editor_agent::ObjectDiscardDocument>,
+    #[cfg(test)]
+    before_browser_result_for_test: Option<fn(&mut Option<Value>)>,
     remote_quit: RemoteQuit,
     agent_cancel: RemoteAgentCancel,
     agent_stop: RemoteAgentStop,
@@ -2813,6 +2874,11 @@ impl EditorApp {
     fn build(host_rx: Option<Receiver<HostMessage>>, open: Option<String>, config_dir: Result<PathBuf, String>) -> Self {
         let (tools, problems) = ToolsState::load(config_dir);
         let mut app = Self {
+            browser_pending: None,
+            #[cfg(test)]
+            browser_transitions_for_test: Vec::new(),
+            #[cfg(test)]
+            before_browser_result_for_test: None,
             remote_quit: RemoteQuit::Idle,
             agent_cancel: RemoteAgentCancel::Idle,
             agent_stop: RemoteAgentStop::Idle,
@@ -2931,14 +2997,36 @@ impl EditorApp {
     /// Runs a session request for the UI. A request that would replace the document first goes through the
     /// unsaved-changes flow (`guard_replace`).
     fn command(&mut self, request: Value) {
+        let _ = self.command_in(request, None);
+    }
+
+    fn command_in(&mut self, request: Value, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         if soul2d_core::editor_controller::replaces_document(&request) {
-            self.guard_replace(PendingAction::Request(request));
+            self.guard_replace_in(PendingAction::Request(request), execution)
         } else {
-            self.run_command(request);
+            self.run_command(request, execution)
         }
     }
 
-    fn run_command(&mut self, request: Value) {
+    fn native_save_refusal(&self, target: &str) -> Option<&'static str> {
+        if self.can3_key_draft.is_some() {return Some(CAN3_KEY_DRAFT_MESSAGE);}
+        if self.can3_curve_draft.as_ref().is_some_and(Can3CurveDraft::is_dirty) {return Some(CAN3_CURVE_DRAFT_MESSAGE);}
+        if self.can3_track_draft.as_ref().is_some_and(Can3TrackDraft::is_dirty) {return Some(CAN3_TRACK_DRAFT_MESSAGE);}
+        if self.can3_scene_draft.is_dirty() {return Some(CAN3_SCENE_DRAFT_MESSAGE);}
+        if autosave::is_recovery_path(Path::new(target)) {return Some(RECOVERY_PATH_MESSAGE);}
+        if self.motion3.has_draft() {return Some(MOTION3_DRAFT_MESSAGE);}
+        if self.forms.has_draft() {return Some(FORM_DRAFT_MESSAGE);}
+        if self.objects.has_draft() {return Some(OBJECT_DRAFT_MESSAGE);}
+        None
+    }
+
+    fn native_replace_has_draft(&mut self) -> bool {
+        self.controller.draft_dirty() || self.motion3.has_draft() || self.forms.has_draft()
+            || self.parameters.values.has_draft() || self.can3_creation_dirty()
+            || editor_view!(self, &egui::Context::default()).retained_document_edits(self.controller.snapshot())
+    }
+
+    fn run_command(&mut self, request: Value, mut execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         if !request["op"].as_str().is_some_and(|op| soul2d_core::manifest::effect_of(&op.replace('.', "_")) == Some("-")) {
             self.remote_quit.cancel("native_operation");
         }
@@ -2949,40 +3037,12 @@ impl EditorApp {
             self.controller.allow_replace_unsaved(self.discarding);
         }
         if request["op"] == "save" {
-            if self.can3_key_draft.is_some() {
-                self.notice = CAN3_KEY_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            if self.can3_curve_draft.as_ref().is_some_and(Can3CurveDraft::is_dirty) {
-                self.notice = CAN3_CURVE_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            if self.can3_track_draft.as_ref().is_some_and(Can3TrackDraft::is_dirty) {
-                self.notice = CAN3_TRACK_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            if self.can3_scene_draft.is_dirty() {
-                self.notice = CAN3_SCENE_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            let target = request["path"].as_str().unwrap_or_default();
-            if autosave::is_recovery_path(Path::new(target)) {
-                self.notice = RECOVERY_PATH_MESSAGE.to_owned();
-                return;
-            }
-            if self.motion3.has_draft() {
-                self.notice = MOTION3_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            if self.forms.has_draft() {
-                self.notice = FORM_DRAFT_MESSAGE.to_owned();
-                return;
-            }
-            if self.objects.has_draft() {
-                self.notice = OBJECT_DRAFT_MESSAGE.to_owned();
-                return;
+            if let Some(reason) = self.native_save_refusal(request["path"].as_str().unwrap_or_default()) {
+                self.notice = reason.into();
+                return BrowserActionResult::TargetFailed;
             }
         }
+        let before_path = self.controller.project_path().map(Path::to_owned);
         let response = self.controller.core_request(&request);
         if response["succeeded"].as_bool() == Some(true) {
             self.notice.clear();
@@ -2993,17 +3053,25 @@ impl EditorApp {
                 self.can3_part_choices = Can3PartChoices::default();
             }
             if replaces {
-                self.after_document_replaced();
+                self.after_document_replaced_in(execution.as_deref_mut());
                 self.file_path = self.controller.project_path().map(|path| path.display().to_string()).unwrap_or_default();
                 if request["untitled"] == true {
                     self.adopt_recovery(request["path"].as_str().unwrap_or_default());
                 }
+            } else if before_path.as_deref() != self.controller.project_path() {
+                let document = browser_document(&self.controller);
+                editor_view!(self, &egui::Context::default(), execution.as_deref_mut()).observe_browser_document(&document);
             }
         } else if replaces {
             self.notice = response["message"].as_str().unwrap_or("request failed").to_owned();
         }
         self.viewport.reconcile_views(self.controller.snapshot());
         self.parameters.reconcile(self.controller.snapshot(), &mut self.animation_name, &mut self.seek_frame);
+        match response["succeeded"].as_bool() {
+            Some(true) => BrowserActionResult::Succeeded,
+            Some(false) => BrowserActionResult::TargetFailed,
+            None => BrowserActionResult::TargetResultUnknown,
+        }
     }
 
     /// A restored crash snapshot becomes this session's snapshot, so the next one replaces it and a save
@@ -3015,23 +3083,34 @@ impl EditorApp {
     // Only a successful open becomes the document path; a failed path must not
     // turn into the next Save As destination.
     fn open_at(&mut self, path: &str) {
+        let _ = self.open_at_in(path, None);
+    }
+
+    fn open_at_in(&mut self, path: &str, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         self.controller.allow_replace_unsaved(self.discarding);
         let response = self.controller.core_request(&json!({"op":"open", "path":path}));
         if response["succeeded"].as_bool() == Some(true) {
             self.file_path = path.to_owned();
             crate::editor_windows::note_opened(path, &mut self.tools.store, self.tools.store_path.as_deref());
-            self.after_document_replaced();
+            self.after_document_replaced_in(execution);
+            BrowserActionResult::Succeeded
         } else {
             self.notice = format!(
                 "Open failed: {}",
                 response["message"].as_str().unwrap_or("open failed")
             );
+            BrowserActionResult::TargetFailed
         }
     }
 
     fn after_document_replaced(&mut self) {
+        self.after_document_replaced_in(None);
+    }
+
+    fn after_document_replaced_in(&mut self, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) {
         // ponytail: the reset never reads the context; a throwaway one keeps one reset for every caller.
-        editor_view!(self, &egui::Context::default()).after_document_replaced();
+        let document = browser_document(&self.controller);
+        editor_view!(self, &egui::Context::default(), execution).after_document_replaced(&document, &mut BrowserDispatchScope::default());
     }
 
     fn select_node_draft(&mut self, id: u64) {
@@ -3105,7 +3184,8 @@ impl EditorApp {
         }
     }
 
-    fn finish_close_requests(&mut self, ctx: &egui::Context, host_effect: HostDrainEffect, confirmation_pending: bool) {
+    fn finish_close_requests(&mut self, ctx: &egui::Context, host_effect: HostDrainEffect, confirmation_pending: bool) -> crate::editor_windows::CloseObservation {
+        let mut observed = crate::editor_windows::CloseObservation::default();
         self.sync_panel_drafts();
         let native_requested = ctx.input(|input| input.viewport().close_requested());
         if native_requested && confirmation_pending && self.unsaved.is_none() && !self.closing {
@@ -3116,12 +3196,14 @@ impl EditorApp {
         if self.closing && !self.close_sent {
             self.close_sent = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            observed.issued = true;
         }
         match host_effect {
             HostDrainEffect::Eof if !native_requested && !self.closing => {
                 if matches!(self.remote_quit, RemoteQuit::Idle)
                     && editor_view!(self, ctx).quit_refusal(&self.controller).is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    observed.issued = true;
                 } else {
                     self.close_blocked = true;
                     ctx.request_repaint();
@@ -3133,6 +3215,7 @@ impl EditorApp {
             }
             _ => {},
         }
+        observed
     }
 
     fn observe_remote_quit(&mut self, ctx: &egui::Context) {
@@ -3503,7 +3586,13 @@ impl EditorApp {
         self.agent_send = RemoteAgentSend::Finished { attempt, outcome };
     }
 
-    fn finish_remote_quit(&mut self, ctx: &egui::Context) {
+    fn finish_remote_quit(&mut self, ctx: &egui::Context) -> crate::editor_windows::CloseObservation {
+        let mut observed = crate::editor_windows::CloseObservation::default();
+        self.finish_remote_quit_observed(ctx, &mut observed);
+        observed
+    }
+
+    fn finish_remote_quit_observed(&mut self, ctx: &egui::Context, observed: &mut crate::editor_windows::CloseObservation) {
         self.observe_remote_quit(ctx);
         let RemoteQuit::Waiting { receipt, deadline, origin, delivered, .. } = &mut self.remote_quit else { return };
         let mut reason = None;
@@ -3561,6 +3650,7 @@ impl EditorApp {
         self.begin_closing();
         self.close_sent = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        observed.issued = true;
     }
 
     fn render_preview(&mut self, ctx: &egui::Context) {
@@ -8195,6 +8285,15 @@ impl EditorApp {
 
     /// Carries out what a window of `editor_windows` asked for.
     fn apply_window_request(&mut self, ctx: &egui::Context, request: crate::editor_windows::Request) {
+        self.apply_window_request_observed(ctx, request, crate::editor_windows::CloseObservation::default());
+    }
+
+    fn apply_window_request_observed(&mut self, ctx: &egui::Context, request: crate::editor_windows::Request,
+        close: crate::editor_windows::CloseObservation) {
+        let request = match request {
+            crate::editor_windows::Request::Browser(request) => { self.apply_browser_request(ctx, request, close); return; }
+            other => other,
+        };
         self.remote_quit.cancel("native_window_operation");
         use crate::editor_windows::Request;
         match request {
@@ -8214,7 +8313,6 @@ impl EditorApp {
             Request::McpApply => self.apply_mcp(),
             Request::Core(request) => self.command(request),
             Request::Mcp(target, call) => {
-                if !self.windows.accepts_mcp_target(target) { return; }
                 self.sync_panel_drafts();
                 let response = editor_view!(self, ctx).mcp(&mut self.controller, &call, McpOrigin::Internal).into_message();
                 self.preview_dirty = true;
@@ -8241,7 +8339,120 @@ impl EditorApp {
             Request::Export(kind, path) => self.run_export(kind, &path),
             Request::OpenPsdDepth => self.psd_depth.open(),
             Request::Notice(message) => self.notice = message,
+            Request::Browser(_) => unreachable!(),
         }
+    }
+
+    fn browser_key_captures(&self) -> [Option<crate::editor_windows::BrowserTimeline>; 2] {
+        [KEY_ALL, UNKEY_ALL].map(|op| {
+            let (request, playhead) = self.all_keys_request(op)?;
+            let (_, from_preview) = timeline_playhead(self.controller.snapshot(), &self.animation_name, self.seek_frame);
+            Some(crate::editor_windows::BrowserTimeline {name:self.animation_name.clone(),fallback:(!from_preview).then_some(self.seek_frame),
+                playhead,from_preview,request})
+        })
+    }
+
+    fn apply_browser_request(&mut self, ctx: &egui::Context, request: crate::editor_windows::NativeBrowserRequest,
+        close: crate::editor_windows::CloseObservation) -> Option<BrowserActionResult> {
+        use crate::editor_windows::{CapturedBrowserAction, CapturedBrowserOperation};
+        if let Some(previous) = self.browser_pending.take() { self.windows.reject_browser(&previous, "Superseded Browser request"); }
+        self.browser_pending = Some(request);
+        self.sync_panel_drafts();
+        let request = self.browser_pending.take()?;
+        let document = browser_document(&self.controller);
+        let closing = close.issued || self.closing || self.close_sent || self.remote_quit.active()
+            || matches!(self.remote_quit,RemoteQuit::Closing(_)) || ctx.input(|input|input.viewport().close_requested());
+        let dialog = editor_view!(self, ctx).dialog_waits() || self.windows.other_quit_pending(&self.tools.store);
+        let valid_action = match &request.operation {
+            CapturedBrowserOperation::Action(action) => match action {
+                CapturedBrowserAction::New => !self.native_replace_has_draft(),
+                CapturedBrowserAction::Save(path) => self.native_save_refusal(path).is_none()
+                    && soul2d_core::editor_controller::file_op_gate(self.controller.draft_dirty(),false,&json!({"op":"save","path":path})).is_ok(),
+                CapturedBrowserAction::Node(target) => self.controller.node_clipboard_is_current(target),
+                CapturedBrowserAction::KeyAll {timeline,values} => self.browser_key_captures()[0].as_ref() == Some(timeline)
+                    && self.controller.key_values_are_current(values),
+                CapturedBrowserAction::UnkeyAll(target) => self.browser_key_captures()[1].as_ref() == Some(target),
+                CapturedBrowserAction::Undo(history) => self.controller.snapshot()["canUndo"] == true && &self.controller.snapshot()["history"] == history,
+                CapturedBrowserAction::Redo(history) => self.controller.snapshot()["canRedo"] == true && &self.controller.snapshot()["history"] == history,
+                _ => true,
+            },
+            _ => true,
+        };
+        if closing || dialog || !valid_action || !self.windows.browser_request_is_current(&request, &document) {
+            self.windows.reject_browser(&request, "The Command Browser request is stale or unavailable");
+            return None;
+        }
+        let consumed = self.windows.activate_browser(request, &document).ok()?;
+        Some(self.execute_browser(ctx,consumed))
+    }
+
+    fn execute_browser(&mut self, ctx: &egui::Context, consumed: crate::editor_windows::BrowserExecutionFrame) -> BrowserActionResult {
+        use crate::editor_windows::{BrowserAction, CapturedBrowserAction, CapturedBrowserOperation, Outcome};
+        let crate::editor_windows::BrowserExecutionFrame {captured:operation,context:mut frame}=consumed;
+        self.remote_quit.cancel("native_browser_operation");
+        let mut response = None;
+        let (result, outcome) = match operation {
+            CapturedBrowserOperation::List => {
+                let message = crate::editor_windows::list_request();
+                response = editor_view!(self,ctx,Some(&mut frame)).mcp(&mut self.controller,&message,McpOrigin::Internal).into_message();
+                let valid = response.as_ref().is_some_and(|reply|reply["jsonrpc"] == "2.0"
+                    && reply.get("id") == message.get("id") && reply.get("error").is_none()
+                    && crate::editor_windows::parse_tools(reply).is_ok());
+                (if valid {BrowserActionResult::Succeeded} else {BrowserActionResult::TargetResultUnknown},
+                    Outcome {ok:valid,text:if valid {"Tool catalogue loaded".into()} else {"The catalogue result is unknown".into()}})
+            }
+            CapturedBrowserOperation::Tool(message) => {
+                response = editor_view!(self,ctx,Some(&mut frame)).mcp(&mut self.controller,&message,McpOrigin::Internal).into_message();
+                #[cfg(test)]
+                if let Some(inject) = self.before_browser_result_for_test.take() {inject(&mut response);}
+                self.preview_dirty = true;
+                browser_tool_result(&message, response.as_ref())
+            }
+            CapturedBrowserOperation::Action(action) => {
+                let keeps_open = action.keeps_open();
+                let result = match action {
+                    CapturedBrowserAction::New => self.guard_replace_in(PendingAction::Request(json!({"op":"new"})),Some(&mut frame)),
+                    CapturedBrowserAction::Save(path) => {
+                        self.run_command(json!({"op":"save","path":path}),Some(&mut frame))
+                    }
+                    CapturedBrowserAction::Undo(_) => self.run_command(json!({"op":"undo"}),Some(&mut frame)),
+                    CapturedBrowserAction::Redo(_) => self.run_command(json!({"op":"redo"}),Some(&mut frame)),
+                    CapturedBrowserAction::Node(target) => {
+                        let reply = self.controller.apply_prepared_node_clipboard(target);
+                        if reply["succeeded"] == true {
+                            self.notice.clear();self.preview_dirty=true;BrowserActionResult::Succeeded
+                        } else {
+                            self.notice=reply["message"].as_str().unwrap_or("node action failed").into();BrowserActionResult::TargetFailed
+                        }
+                    }
+                    CapturedBrowserAction::KeyAll {timeline:target,..} | CapturedBrowserAction::UnkeyAll(target) => {
+                        self.timeline_apply_in(&target.name,&[target.request],target.playhead,Some(&mut frame))
+                    }
+                    CapturedBrowserAction::OpenPrompt => {
+                        self.windows.browser_action_window(BrowserAction::Open,self.controller.project_path());BrowserActionResult::PromptOpened
+                    }
+                    CapturedBrowserAction::SaveAsPrompt => {
+                        self.windows.browser_action_window(BrowserAction::SaveAs,self.controller.project_path());BrowserActionResult::PromptOpened
+                    }
+                    CapturedBrowserAction::Settings => {
+                        self.windows.browser_action_window(BrowserAction::Settings,self.controller.project_path());BrowserActionResult::Succeeded
+                    }
+                    CapturedBrowserAction::OpenBrowser => {
+                        self.windows.browser_action_window(BrowserAction::Browser,self.controller.project_path());BrowserActionResult::Succeeded
+                    }
+                };
+                if !keeps_open { self.windows.set_command_browser_open(false); }
+                let ok = matches!(result,BrowserActionResult::Succeeded | BrowserActionResult::PromptOpened);
+                (result,Outcome {ok,text:if result == BrowserActionResult::PromptOpened {"Dialog opened".into()}
+                    else if ok {"Command completed".into()} else {self.notice.clone()}})
+            }
+            CapturedBrowserOperation::Close => {
+                self.windows.set_command_browser_open(false);
+                (BrowserActionResult::Succeeded,Outcome {ok:true,text:"Command Browser closed".into()})
+            }
+        };
+        self.windows.complete_browser(frame,&browser_document(&self.controller),response,outcome);
+        result
     }
 
     fn open_flip_pairs(&mut self, ctx: &egui::Context, request: crate::editor_windows::FlipReadRequest, authority: FlipStorageAuthority<'_>)
@@ -8417,9 +8628,14 @@ impl eframe::App for EditorApp {
         self.agent.pump();
         self.observe_remote_quit(ctx);
         let mcp_status = self.mcp_status();
-        let all_keys = [KEY_ALL, UNKEY_ALL].map(|op| self.all_keys_request(op).is_some());
-        let window_requests = self.windows.show(ctx, crate::editor_windows::Host {
-            all_keys,
+        let controller = &self.controller;
+        let browser_node_capture = |action|controller.prepare_node_clipboard(action);
+        let browser_key_values = ||controller.capture_key_values();
+        let browser_keys = self.browser_key_captures();
+        let window_frame = self.windows.show(ctx, crate::editor_windows::Host {
+            all_keys:browser_keys.each_ref().map(Option::is_some),
+            browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values,
+            browser_keys:&browser_keys,
             snapshot: self.controller.snapshot(),
             selected_node: self.controller.selected_node(),
             project_path: self.controller.project_path(),
@@ -8431,8 +8647,9 @@ impl eframe::App for EditorApp {
             tr: &tr,
             mcp: &mcp_status,
         });
-        for request in window_requests {
-            self.apply_window_request(ctx, request);
+        let mut frame_close = window_frame.close;
+        for request in window_frame.requests {
+            self.apply_window_request_observed(ctx, request, frame_close);
         }
         let depth_snapshot = self.controller.snapshot().clone();
         for request in self.psd_depth.show(ctx, &depth_snapshot) {
@@ -8919,10 +9136,13 @@ impl eframe::App for EditorApp {
         self.can3_delete_dialog(ctx);
         self.draw_recovery_offer(ctx);
         self.guide_settings_window(ctx);
-        self.finish_close_requests(ctx, host_effect, confirmation_pending);
-        self.finish_remote_quit(ctx);
+        frame_close.merge(self.finish_close_requests(ctx, host_effect, confirmation_pending));
+        frame_close.merge(self.finish_remote_quit(ctx));
         self.finish_object_discard(ctx);
         self.finish_panel_discards(ctx);
+        if frame_close.issued {
+            if let Some(request) = self.browser_pending.take() { self.windows.reject_browser(&request,"Window close issued"); }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -11601,19 +11821,26 @@ impl EditorApp {
 
     /// Runs timeline edits and leaves the playhead on `target`.
     fn timeline_apply(&mut self, name: &str, requests: &[Value], target: f64) {
+        let _ = self.timeline_apply_in(name, requests, target, None);
+    }
+
+    fn timeline_apply_in(&mut self, name: &str, requests: &[Value], target: f64,
+        mut execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         self.controller.pause();
+        let mut result = BrowserActionResult::Succeeded;
         for request in requests {
-            self.command(request.clone());
+            result = self.command_in(request.clone(), execution.as_deref_mut());
         }
         // Edits drop the session preview; seek again so the preview and playhead stay on the frame. The seek's "ok"
         // would hide a refused last edit on the status line, so the refusal is put back.
         let status = self.controller.status();
         let refused = (!requests.is_empty() && status != "ok").then(|| status.to_owned());
         self.seek_frame = target;
-        self.command(timeline_seek_request(name, target));
+        let seek = self.command_in(timeline_seek_request(name, target), execution.as_deref_mut());
         if let Some(status) = refused {
             self.controller.set_status(status);
         }
+        if requests.is_empty() {seek} else {result}
     }
 }
 
@@ -13436,11 +13663,11 @@ impl EditorApp {
     }
 
     /// Open from the path field, asking first when a crash left autosave data for that project.
-    fn begin_open(&mut self, path: &str) {
+    fn begin_open(&mut self, path: &str, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         let prompt = self.tools.config_dir.as_deref().and_then(|dir| prompt_for_open(dir, path));
         match prompt {
-            Some(prompt) => self.tools.prompt = Some(prompt),
-            None => self.open_at(path),
+            Some(prompt) => { self.tools.prompt = Some(prompt); BrowserActionResult::PromptOpened }
+            None => self.open_at_in(path, execution),
         }
     }
 
@@ -13481,56 +13708,66 @@ impl EditorApp {
     /// drafts block it, unsaved changes raise the Save / Don't Save / Cancel dialog unless the
     /// `SaveProjectOnClose` setting says "Don't save".
     fn guard_replace(&mut self, action: PendingAction) {
+        let _ = self.guard_replace_in(action, None);
+    }
+
+    fn guard_replace_in(&mut self, action: PendingAction, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         if self.can3_delete.is_some() {
             self.notice = DIALOG_PENDING_MESSAGE.to_owned();
-            return;
+            return BrowserActionResult::TargetFailed;
         }
         if self.unsaved.is_some() {
-            return;
+            return BrowserActionResult::TargetFailed;
         }
-        if self.controller.draft_dirty() || self.motion3.has_draft() || self.forms.has_draft() || self.parameters.values.has_draft() || self.can3_creation_dirty()
-            || editor_view!(self, &egui::Context::default()).retained_document_edits(self.controller.snapshot()) {
+        if self.native_replace_has_draft() {
             self.notice = DRAFT_BLOCKS_MESSAGE.to_owned();
-            return;
+            return BrowserActionResult::TargetFailed;
         }
         let modified = self.controller.snapshot()["modified"].as_bool() == Some(true);
         match window_shell::gate(modified, window_shell::close_setting(&mut self.tools.store)) {
             Gate::Ask => {
                 let project = self.controller.project_path().and_then(Path::to_str).map(str::to_owned);
                 self.unsaved = Some(UnsavedState { action, dialog: crate::editor_shell::UnsavedDialog::new(project.as_deref()) });
+                BrowserActionResult::PromptOpened
             }
-            Gate::Proceed => self.carry_out(action, modified),
+            Gate::Proceed => self.carry_out_in(action, modified, execution),
         }
     }
 
     fn carry_out(&mut self, action: PendingAction, discard: bool) {
+        let _ = self.carry_out_in(action, discard, None);
+    }
+
+    fn carry_out_in(&mut self, action: PendingAction, discard: bool, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         if self.objects.has_draft() {
             self.notice = OBJECT_DRAFT_MESSAGE.to_owned();
-            return;
+            return BrowserActionResult::TargetFailed;
         }
         self.discarding = discard;
-        match action {
-            PendingAction::Request(request) => self.run_command(request),
-            PendingAction::Open(path) => self.begin_open(&path),
-            PendingAction::ImportLayers => self.import_layers(),
-            PendingAction::Close => self.begin_closing(),
-        }
+        let result = match action {
+            PendingAction::Request(request) => self.run_command(request, execution),
+            PendingAction::Open(path) => self.begin_open(&path, execution),
+            PendingAction::ImportLayers => self.import_layers(execution),
+            PendingAction::Close => { self.begin_closing(); BrowserActionResult::Succeeded }
+        };
         if self.tools.prompt.is_none() {
             self.discarding = false;
             self.controller.allow_replace_unsaved(false);
         }
+        result
     }
 
-    fn import_layers(&mut self) {
+    fn import_layers(&mut self, execution: Option<&mut crate::editor_windows::BrowserExecutionContext>) -> BrowserActionResult {
         self.controller.allow_replace_unsaved(self.discarding);
         match run_import(&mut self.controller, &self.tools.import) {
             Ok(message) => {
-                self.after_document_replaced();
+                self.after_document_replaced_in(execution);
                 self.notice.clear();
                 self.tools.info = message;
                 self.preview_dirty = true;
+                BrowserActionResult::Succeeded
             }
-            Err(message) => self.notice = message,
+            Err(message) => { self.notice = message; BrowserActionResult::TargetFailed }
         }
     }
 
@@ -13561,9 +13798,14 @@ impl EditorApp {
             return Err(RECOVERY_PATH_MESSAGE.to_owned());
         }
         let request = json!({"op": "save", "path": target});
+        let before_path = self.controller.project_path().map(Path::to_owned);
         let response = self.controller.core_request(&request);
         if response["succeeded"].as_bool() != Some(true) {
             return Err(response["message"].as_str().unwrap_or("save failed").to_owned());
+        }
+        if before_path.as_deref() != self.controller.project_path() {
+            let document = browser_document(&self.controller);
+            editor_view!(self, &egui::Context::default()).observe_browser_document(&document);
         }
         crate::editor_windows::note_saved(&request, self.controller.project_path(), &mut self.tools.store, self.tools.store_path.as_deref());
         self.file_path = target;
@@ -17205,7 +17447,7 @@ mod shell_flow_tests {
         harness.text("Point width", "4.25", |ctx| draw(&mut app, ctx));
         assert!(app.forms.has_draft());
         pending_quit.write_line(&mut Vec::new()).unwrap();
-        harness.frame(Vec::new(), |ctx| app.finish_remote_quit(ctx));
+        harness.frame(Vec::new(), |ctx| { app.finish_remote_quit(ctx); });
         assert!(!app.closing && harness.close_requests == 0, "input invalidates an already admitted Quit");
         let before = app.controller.snapshot().clone();
         let target = dir.join("blocked.cmo3");
@@ -17710,7 +17952,7 @@ mod shell_flow_tests {
         harness.text("Name","Input after Quit admission",|ctx| draw(&mut app,ctx));
         assert!(app.objects.has_draft()); let before = app.controller.snapshot().clone();
         admitted.write_line(&mut Vec::new()).unwrap();
-        harness.frame(Vec::new(),|ctx| app.finish_remote_quit(ctx));
+        harness.frame(Vec::new(),|ctx| { app.finish_remote_quit(ctx); });
         assert!(!app.closing && harness.close_requests == 0);
         app.command(json!({"op":"new"})); assert!(app.unsaved.is_none());
         app.guard_replace(PendingAction::ImportLayers); assert!(app.unsaved.is_none());
@@ -17961,7 +18203,7 @@ mod shell_flow_tests {
         object_range_text(&mut app,&mut harness,"Minimum","pending-invalid-range");
         let before = app.controller.snapshot().clone();
         admitted.write_line(&mut Vec::new()).unwrap();
-        harness.frame(Vec::new(),|ctx| app.finish_remote_quit(ctx));
+        harness.frame(Vec::new(),|ctx| { app.finish_remote_quit(ctx); });
         assert!(!app.closing && harness.close_requests==0);
         app.sync_panel_drafts(); assert!(app.controller.panel_drafts);
         let message = json!({"jsonrpc":"2.0","id":1,"method":"resources/read",
@@ -19882,7 +20124,7 @@ mod editor_state_tests {
         assert_eq!(state(&mut app)["quit"]["state"], "cancelled");
         quit.write_line(&mut Vec::new()).unwrap();
         drop(restart); finish_agent_new_session(&mut app);
-        CTX.with(|ctx| app.finish_remote_quit(ctx));
+        CTX.with(|ctx| { app.finish_remote_quit(ctx); });
         assert!(!app.closing && !app.agent.state().has_client);
         assert_eq!(state(&mut app)["codingAgentNewSession"]["state"], "reply_lost");
     }
@@ -21000,7 +21242,7 @@ mod editor_state_tests {
             app.remote_quit.cancel("test_reset"); drop(quit_reply);
             let reply = request_panel_discard(&mut app, &message);
             assert_eq!(request_panel_discard(&mut app, &quit).into_message().unwrap()["result"]["isError"], true);
-            harness.frame(Vec::new(), |ctx|app.finish_close_requests(ctx, HostDrainEffect::Eof, false));
+            harness.frame(Vec::new(), |ctx| { app.finish_close_requests(ctx, HostDrainEffect::Eof, false); });
             assert!(!app.closing && harness.close_requests == 0);
             reply.write_line(&mut Vec::new()).unwrap(); finish_panel_discards(&mut app);
             assert!(!app.closing && harness.close_requests == 0);
@@ -22130,7 +22372,7 @@ mod editor_state_tests {
                 assert_eq!(request_panel_discard(&mut app,second).into_message().unwrap()["result"]["isError"],true);
                 assert_eq!(app.panel_discards[other].attempt(),0,"refused overlap consumes no other attempt: {operation} {cancel_first}");
                 assert_eq!(app.panel_discards[lane].attempt(),1);
-                harness.frame(Vec::new(),|ctx|app.finish_close_requests(ctx,HostDrainEffect::Eof,false));
+                harness.frame(Vec::new(),|ctx| { app.finish_close_requests(ctx,HostDrainEffect::Eof,false); });
                 assert!(!app.closing && harness.close_requests == 0);
                 app.begin_closing();
                 assert_eq!(lifecycle_http_result(original,first["id"].as_str().unwrap())["isError"],true);
@@ -22188,7 +22430,7 @@ mod editor_state_tests {
             assert_eq!(app.panel_discards[5].state()["state"],"waiting_for_reply");
             assert_eq!(request_panel_discard(&mut app,&quit).into_message().unwrap()["result"]["isError"],true);
             assert!(!app.remote_quit.active());
-            harness.frame(Vec::new(),|ctx|app.finish_close_requests(ctx,HostDrainEffect::Eof,false));
+            harness.frame(Vec::new(),|ctx| { app.finish_close_requests(ctx,HostDrainEffect::Eof,false); });
             assert!(!app.closing && harness.close_requests == 0);
             reply.write_line(&mut Vec::new()).unwrap();
             harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
@@ -22931,7 +23173,7 @@ mod editor_state_tests {
         let reply = request_panel_discard(&mut app, &message);
         assert_eq!(request_panel_discard(&mut app, &quit).into_message().unwrap()["result"]["isError"], true);
         let mut frame = eframe::Frame::_new_kittest();
-        harness.frame(Vec::new(), |ctx|app.finish_close_requests(ctx, HostDrainEffect::Eof, false));
+        harness.frame(Vec::new(), |ctx| { app.finish_close_requests(ctx, HostDrainEffect::Eof, false); });
         assert!(!app.closing && harness.close_requests == 0);
         reply.write_line(&mut Vec::new()).unwrap();
         harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
@@ -29036,7 +29278,7 @@ mod editor_state_tests {
     }
 
     fn finish_quit(app: &mut EditorApp) -> usize {
-        let output = egui::Context::default().run(Default::default(), |ctx| app.finish_remote_quit(ctx));
+        let output = egui::Context::default().run(Default::default(), |ctx| { app.finish_remote_quit(ctx); });
         output.viewport_output.values().flat_map(|viewport| viewport.commands.iter())
             .filter(|command| matches!(command, egui::ViewportCommand::Close)).count()
     }
@@ -29200,7 +29442,7 @@ mod editor_state_tests {
                         return Err("native edit then Discard in one frame preserved stale consent".into());
                     }
                 },
-                "new_operation" => app.run_command(json!({"op":"history.limit.set","limit":100})),
+                "new_operation" => { app.run_command(json!({"op":"history.limit.set","limit":100}), None); },
                 _ => {},
             }
             if matches!(scenario, "deny" | "cancel" | "early_turn" | "transient_draft" | "transient_depth" | "native_draft_discard" | "new_operation") {
@@ -29605,13 +29847,17 @@ mod editor_state_tests {
 
         fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
             let mcp = app.mcp_status();
+            let controller = &app.controller;
+            let browser_node_capture = |action|controller.prepare_node_clipboard(action);
+            let browser_key_values = ||controller.capture_key_values();
+            let browser_keys = app.browser_key_captures();
             app.windows.show(ctx, Host {
-                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                all_keys:browser_keys.each_ref().map(Option::is_some), browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values, browser_keys:&browser_keys, snapshot:app.controller.snapshot(),
                 selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
                 store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
                 shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
                 tr:&tr, mcp:&mcp,
-            })
+            }).requests
         }
 
         let mut app = app("texture-viewer-native-replacement");
@@ -29811,14 +30057,18 @@ mod editor_state_tests {
 
         fn draw(app: &mut EditorApp, ctx: &egui::Context) {
             let mcp = app.mcp_status();
+            let controller = &app.controller;
+            let browser_node_capture = |action|controller.prepare_node_clipboard(action);
+            let browser_key_values = ||controller.capture_key_values();
+            let browser_keys = app.browser_key_captures();
             let requests = app.windows.show(ctx, crate::editor_windows::Host {
-                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                all_keys:browser_keys.each_ref().map(Option::is_some), browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values, browser_keys:&browser_keys, snapshot:app.controller.snapshot(),
                 selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
                 store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
                 shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
                 tr:&tr, mcp:&mcp,
             });
-            for request in requests { app.apply_window_request(ctx, request); }
+            for request in requests.requests { app.apply_window_request_observed(ctx, request, requests.close); }
         }
 
         let mut app = app("texture-viewer-native-controls");
@@ -29987,22 +30237,551 @@ mod editor_state_tests {
         }
     }
 
+    fn draw_browser_windows_frame(app: &mut EditorApp, ctx: &egui::Context) -> crate::editor_windows::WindowFrame {
+        let mcp = app.mcp_status();
+        let controller = &app.controller;
+        let browser_node_capture = |action|controller.prepare_node_clipboard(action);
+        let browser_key_values = ||controller.capture_key_values();
+        let browser_keys = app.browser_key_captures();
+        app.windows.show(ctx, crate::editor_windows::Host {
+            all_keys:browser_keys.each_ref().map(Option::is_some), browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values, browser_keys:&browser_keys, snapshot:app.controller.snapshot(),
+            selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
+            store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
+            shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
+            tr:&tr, mcp:&mcp,
+        })
+    }
+
+    fn draw_command_browser(app: &mut EditorApp, ctx: &egui::Context) -> Vec<crate::editor_windows::Request> {
+        draw_browser_windows_frame(app,ctx).requests
+    }
+
+    fn queue_native_browser_tool(app: &mut EditorApp, name: &str, arguments: Option<Value>)
+        -> (crate::editor_test_support::Harness,crate::editor_windows::NativeBrowserRequest) {
+        use crate::editor_test_support::{name_of,Harness};
+        use crate::editor_windows::{CapturedBrowserOperation,EntryKind,Request};
+        use egui::accesskit::Role;
+        app.tools.store.set("firstrun_complete",true).unwrap();app.tools.store.set("hasDoneQuickSetup",true).unwrap();
+        call(app,"editor_command_browser_set",json!({"open":true}));
+        let mut harness=Harness::new();let mut pending=Vec::new();
+        harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(app,ctx)));
+        for request in pending.drain(..) {app.apply_window_request(&harness.ctx,request);}
+        let list=rpc(app,"tools/list",json!({}));
+        let entry=crate::editor_windows::parse_tools(&json!({"result":list})).unwrap().into_iter().find(|entry|entry.id == name).unwrap();
+        let output=harness.text("Search",&entry.label,|ctx|pending.extend(draw_command_browser(app,ctx)));
+        let label=if entry.category.is_empty() {entry.label.clone()} else {format!("[{}] {}",entry.category,entry.label)};
+        let role=output.iter().find(|(_,node)|name_of(&output,node).as_deref() == Some(label.as_str())).unwrap().1.role();
+        let next_time=harness.ctx.input(|input|input.time)+1.0;
+        harness.next_input=Some(Box::new(move |input|input.time=Some(next_time)));
+        harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(app,ctx)));
+        harness.click(role,&label,|ctx|pending.extend(draw_command_browser(app,ctx)));
+        if let Some(arguments)=arguments {
+            let EntryKind::Tool(schema)=entry.kind else {panic!("expected a tool schema")};
+            let caption=format!("Arguments (JSON object); required: {}",crate::editor_windows::required_fields(&schema).join(", "));
+            harness.click(Role::MultilineTextInput,&caption,|ctx|pending.extend(draw_command_browser(app,ctx)));
+            let all=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+            harness.frame(vec![all(true),egui::Event::Text(arguments.to_string()),all(false)],|ctx|pending.extend(draw_command_browser(app,ctx)));
+        }
+        assert!(pending.is_empty(),"selection or argument entry executed {name}: {pending:?}");
+        let before=app.controller.snapshot().clone();
+        harness.click(Role::Button,"Run Command",|ctx|pending.extend(draw_command_browser(app,ctx)));
+        assert_eq!(pending.len(),1,"{name}: {pending:?}");
+        let Request::Browser(request)=pending.pop().unwrap() else {panic!("expected a semantic Browser request")};
+        assert!(matches!(&request.operation,CapturedBrowserOperation::Tool(message) if message["params"]["name"] == name));
+        assert_eq!(app.controller.snapshot(),&before,"proposal dispatched {name}");
+        (harness,request)
+    }
+
+    fn queue_native_browser_action(app: &mut EditorApp, id: &str)
+        -> (crate::editor_test_support::Harness, crate::editor_windows::NativeBrowserRequest) {
+        use crate::editor_test_support::{has, name_of, Harness};
+        use crate::editor_windows::{CapturedBrowserOperation, Request};
+        use egui::accesskit::Role;
+        app.tools.store.set("firstrun_complete",true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup",true).unwrap();
+        call(app,"editor_command_browser_set",json!({"open":true}));
+        let mut harness = Harness::new();
+        let mut pending = Vec::new();
+        harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(app,ctx)));
+        for request in pending.drain(..) {app.apply_window_request(&harness.ctx,request);}
+        let entry=crate::editor_windows::action_entries().into_iter().find(|entry|entry.id == id).unwrap();
+        let token=crate::editor_windows::english_token(id.rsplit('.').next().unwrap());
+        let output=harness.text("Search",&token,|ctx|pending.extend(draw_command_browser(app,ctx)));
+        let label=format!("[{}] {}",entry.category,entry.label);
+        let role=output.iter().find(|(_,node)|name_of(&output,node).as_deref() == Some(label.as_str())).unwrap().1.role();
+        let next_time=harness.ctx.input(|input|input.time)+1.0;
+        harness.next_input=Some(Box::new(move |input|input.time=Some(next_time)));
+        harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(app,ctx)));
+        harness.click(role,&label,|ctx|pending.extend(draw_command_browser(app,ctx)));
+        assert!(pending.is_empty(),"selection must not execute {id}: {pending:?}");
+        let before = app.controller.snapshot().clone();
+        let before_dialog = app.windows.other_quit_pending(&app.tools.store);
+        harness.click(Role::Button,"Run Command",|ctx|pending.extend(draw_command_browser(app,ctx)));
+        let output = harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(app,ctx)));
+        assert_eq!(pending.len(),1,"{id}: {pending:?}");
+        assert_eq!(app.controller.snapshot(),&before,"proposal mutated the document: {id}");
+        assert_eq!(app.windows.other_quit_pending(&app.tools.store),before_dialog,"proposal opened a prompt: {id}");
+        assert!(!has(&output,Role::Window,"Settings"),"proposal opened Settings");
+        let Request::Browser(request) = pending.pop().unwrap() else {panic!("expected a semantic Browser request")};
+        assert!(matches!(&request.operation,CapturedBrowserOperation::Action(_)),"{id}");
+        assert!(app.windows.command_browser_open(),"proposal closed Browser: {id}");
+        (harness,request)
+    }
+
+    #[test]
+    fn command_browser_all_fourteen_finite_actions_capture_then_activate_through_app() {
+        use crate::editor_test_support::{has, texts};
+        use egui::accesskit::Role;
+        let ids = ["FileCommand.NewFile","FileCommand.ShowOpenFileDialog","FileCommand.ShowSaveFileDialog",
+            "FileCommand.ShowSaveFileAsDialog","EditCommand.Undo","EditCommand.Redo","EditCommand.ShowSettingsWindow",
+            "EditCommand.ShowCommandBrowserWindow","NodeCommand.CutNode","NodeCommand.CopyNode","NodeCommand.PasteNode",
+            "AnimationCommand.KeyAll","AnimationCommand.UnkeyAll","PaletteCommand.ListCommand"];
+        let actual: std::collections::BTreeSet<_> = crate::editor_windows::action_entries().into_iter().map(|entry|entry.id).collect();
+        assert_eq!(actual,ids.iter().map(|id|id.to_string()).collect());
+        for id in ids {
+            let mut app = app(&format!("browser-finite-{id}"));
+            let saved = app.controller.project_path().unwrap().to_owned();
+            let wrong = saved.with_file_name("wrong-toolbar-save.inp");
+            app.file_path = wrong.display().to_string();
+            match id {
+                "FileCommand.ShowSaveFileDialog" | "EditCommand.Undo" | "EditCommand.Redo" => {
+                    app.command(json!({"op":"node.rename","id":2,"name":"Native history"}));
+                    if id == "EditCommand.Redo" {app.command(json!({"op":"undo"}));}
+                }
+                "NodeCommand.CutNode" | "NodeCommand.CopyNode" => {app.controller.select_nodes(&[2]).unwrap();}
+                "NodeCommand.PasteNode" => {
+                    app.controller.select_nodes(&[2]).unwrap();
+                    assert_eq!(app.controller.node_action(NodeAction::Copy)["succeeded"],true);
+                    app.controller.select_nodes(&[1]).unwrap();
+                }
+                "AnimationCommand.KeyAll" | "AnimationCommand.UnkeyAll" => {
+                    app.command(json!({"op":"animation.create","name":"Idle"}));
+                    app.animation_name="Idle".into();app.seek_frame=0.0;
+                    if id == "AnimationCommand.UnkeyAll" {app.command(json!({"op":KEY_ALL,"name":"Idle","frame":0}));}
+                }
+                _ => {}
+            }
+            let (mut harness,request) = queue_native_browser_action(&mut app,id);
+            let before = app.controller.snapshot().clone();
+            let settings = std::fs::read(app.tools.store_path.as_ref().unwrap()).ok();
+            let result = app.apply_browser_request(&harness.ctx,request,Default::default());
+            let prompt = matches!(id,"FileCommand.ShowOpenFileDialog" | "FileCommand.ShowSaveFileAsDialog");
+            assert_eq!(result,Some(if prompt {BrowserActionResult::PromptOpened} else {BrowserActionResult::Succeeded}),"{id}");
+            let keeps_open = matches!(id,"EditCommand.ShowCommandBrowserWindow" | "PaletteCommand.ListCommand");
+            assert_eq!(app.windows.command_browser_open(),keeps_open,"{id}");
+            assert!(app.browser_pending.is_none(),"consumed work retained by App: {id}");
+            match id {
+                "FileCommand.NewFile" => {
+                    assert!(app.controller.project_path().is_none());
+                    assert_ne!(app.controller.snapshot()["model"],before["model"]);
+                }
+                "FileCommand.ShowSaveFileDialog" => {
+                    assert_eq!(app.controller.project_path(),Some(saved.as_path()));
+                    assert!(!wrong.exists());assert_eq!(app.controller.snapshot()["modified"],false);
+                }
+                "FileCommand.ShowOpenFileDialog" | "FileCommand.ShowSaveFileAsDialog" => {
+                    assert_eq!(app.controller.snapshot(),&before);
+                    let mut pending=Vec::new();
+                    let output=harness.frame(Vec::new(),|ctx|pending.extend(draw_command_browser(&mut app,ctx)));
+                    assert!(pending.is_empty());
+                    assert!(has(&output,Role::Window,if id == "FileCommand.ShowOpenFileDialog" {"Open"} else {"Save As..."}));
+                }
+                "EditCommand.Undo" | "EditCommand.Redo" => {
+                    let name=if id == "EditCommand.Undo" {"Face"} else {"Native history"};
+                    assert_eq!(app.controller.snapshot()["model"]["nodes"]["children"][0]["name"],name);
+                    let step=if id == "EditCommand.Undo" {-1} else {1};
+                    assert_eq!(app.controller.snapshot()["history"]["position"].as_i64().unwrap(),before["history"]["position"].as_i64().unwrap()+step);
+                }
+                "EditCommand.ShowSettingsWindow" => {
+                    let output=harness.frame(Vec::new(),|ctx|{draw_command_browser(&mut app,ctx);});
+                    assert!(has(&output,Role::Window,"Settings"));
+                    assert_eq!(app.controller.snapshot(),&before);
+                    assert_eq!(std::fs::read(app.tools.store_path.as_ref().unwrap()).ok(),settings);
+                }
+                "EditCommand.ShowCommandBrowserWindow" | "PaletteCommand.ListCommand" => {
+                    assert_eq!(app.controller.snapshot(),&before);
+                    let output=harness.frame(Vec::new(),|ctx|{draw_command_browser(&mut app,ctx);});
+                    assert!(texts(&output).iter().any(|text|text == id));
+                }
+                "NodeCommand.CopyNode" => {
+                    assert_eq!(app.controller.snapshot()["clipboard"][0]["source"],2);
+                    assert_eq!(app.controller.snapshot()["revision"],before["revision"]);
+                }
+                "NodeCommand.CutNode" => {
+                    assert!(app.controller.selected_nodes().is_empty());
+                    assert!(app.controller.snapshot()["model"]["nodes"]["children"].as_array().unwrap().is_empty());
+                    assert_eq!(app.controller.snapshot()["clipboard"][0]["source"],2);
+                }
+                "NodeCommand.PasteNode" => {
+                    assert_eq!(app.controller.selected_nodes().len(),1);
+                    assert_ne!(app.controller.selected_nodes(),&[1]);assert_ne!(app.controller.selected_nodes(),&[2]);
+                    assert!(app.controller.snapshot()["clipboard"].as_array().unwrap().is_empty());
+                    assert_eq!(app.controller.snapshot()["model"]["nodes"]["children"].as_array().unwrap().len(),2);
+                }
+                "AnimationCommand.KeyAll" | "AnimationCommand.UnkeyAll" => {
+                    assert_ne!(app.controller.snapshot()["model"],before["model"]);
+                    assert_eq!(app.controller.snapshot()["history"]["position"].as_u64().unwrap(),before["history"]["position"].as_u64().unwrap()+1);
+                    assert_eq!(app.seek_frame,0.0);assert!(!app.controller.playing());
+                    assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+                    assert_eq!(app.controller.snapshot()["model"],before["model"],"one batch must undo in one step: {id}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn command_browser_finite_actions_reject_changed_semantic_inputs_before_activation() {
+        for case in ["copy_selection","cut_primary","paste_parent","paste_clipboard","key_clip","key_frame","key_values",
+            "key_source","unkey_frame","undo_history","redo_enablement","new_draft","save_draft"] {
+            let mut app=app(&format!("browser-stale-{case}"));
+            let mut other=0;
+            let id=match case {
+                "copy_selection" => {app.controller.select_nodes(&[2]).unwrap();"NodeCommand.CopyNode"}
+                "cut_primary" => {app.controller.select_nodes(&[1,2]).unwrap();"NodeCommand.CutNode"}
+                "paste_parent" | "paste_clipboard" => {
+                    let created=app.controller.core_request(&json!({"op":"node.create","className":"Node","parents":[1],"name":"Other"}));
+                    assert_eq!(created["succeeded"],true);
+                    other=created["result"]["created"][0]["uuid"].as_u64().unwrap();
+                    app.controller.select_nodes(&[2]).unwrap();
+                    assert_eq!(app.controller.node_action(NodeAction::Copy)["succeeded"],true);
+                    app.controller.select_nodes(&[1]).unwrap();"NodeCommand.PasteNode"
+                }
+                "key_clip" | "key_frame" | "key_values" | "key_source" | "unkey_frame" => {
+                    for name in ["Idle","Other"] {app.command(json!({"op":"animation.create","name":name}));}
+                    app.animation_name="Idle".into();app.seek_frame=0.0;
+                    if case == "unkey_frame" {app.command(json!({"op":KEY_ALL,"name":"Idle","frame":0}));}
+                    if case == "unkey_frame" {"AnimationCommand.UnkeyAll"} else {"AnimationCommand.KeyAll"}
+                }
+                "undo_history" | "redo_enablement" => {
+                    app.command(json!({"op":"node.rename","id":2,"name":"History"}));
+                    if case == "redo_enablement" {app.command(json!({"op":"undo"}));"EditCommand.Redo"} else {"EditCommand.Undo"}
+                }
+                "new_draft" => "FileCommand.NewFile",
+                "save_draft" => "FileCommand.ShowSaveFileDialog",
+                _ => unreachable!(),
+            };
+            let (harness,request)=queue_native_browser_action(&mut app,id);
+            let revision=app.controller.snapshot()["revision"].clone();
+            match case {
+                "copy_selection" => app.controller.select_nodes(&[1]).unwrap(),
+                "cut_primary" => app.controller.select_nodes(&[2,1]).unwrap(),
+                "paste_parent" => app.controller.select_nodes(&[2]).unwrap(),
+                "paste_clipboard" => {
+                    app.controller.select_nodes(&[other]).unwrap();
+                    assert_eq!(app.controller.node_action(NodeAction::Copy)["succeeded"],true);
+                    app.controller.select_nodes(&[1]).unwrap();
+                }
+                "key_clip" => app.animation_name="Other".into(),
+                "key_frame" | "unkey_frame" => app.seek_frame=1.0,
+                "key_values" => app.command(json!({"op":"value.set","id":10,"value":[0.75,0.0]})),
+                "key_source" => app.command(json!({"op":"animation.seek","name":"Idle","frame":0})),
+                "undo_history" => app.command(json!({"op":"history.limit.set","limit":300})),
+                "redo_enablement" => app.command(json!({"op":"history.clear"})),
+                "new_draft" | "save_draft" => {app.select_node_draft(2);app.controller.set_draft_name("Unsent".into());}
+                _ => unreachable!(),
+            }
+            if case != "redo_enablement" {assert_eq!(app.controller.snapshot()["revision"],revision,"nonrevision input: {case}");}
+            let before=app.controller.snapshot().clone();
+            let selection=app.controller.selected_nodes().to_vec();
+            let file=std::fs::read(app.controller.project_path().unwrap()).unwrap();
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),None,"{case}");
+            assert_eq!(app.controller.snapshot(),&before,"stale target ran: {case}");
+            assert_eq!(app.controller.selected_nodes(),selection,"stale target changed selection: {case}");
+            assert_eq!(std::fs::read(app.controller.project_path().unwrap()).unwrap(),file,"{case}");
+            assert!(app.windows.command_browser_open(),"stale target closed Browser: {case}");
+            if matches!(case,"new_draft"|"save_draft") {assert!(app.controller.draft_dirty());}
+        }
+    }
+
+    #[test]
+    fn command_browser_activated_refusal_closes_but_untitled_save_opens_human_prompt() {
+        let mut app=app("browser-root-cut-refusal");
+        app.controller.select_nodes(&[1]).unwrap();
+        let (harness,request)=queue_native_browser_action(&mut app,"NodeCommand.CutNode");
+        let before=app.controller.snapshot().clone();
+        assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(BrowserActionResult::TargetFailed));
+        assert_eq!(app.controller.snapshot(),&before);
+        assert_eq!(app.controller.selected_nodes(),&[1]);
+        assert!(!app.windows.command_browser_open());
+        app.command(json!({"op":"new"}));
+        assert!(app.controller.project_path().is_none());
+        let (harness,request)=queue_native_browser_action(&mut app,"FileCommand.ShowSaveFileDialog");
+        let before=app.controller.snapshot().clone();
+        assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(BrowserActionResult::PromptOpened));
+        assert_eq!(app.controller.snapshot(),&before);assert!(!app.windows.command_browser_open());
+        assert!(app.windows.other_quit_pending(&app.tools.store));
+    }
+
+    #[test]
+    fn command_browser_timeline_ignores_unused_fallback_and_preserves_native_new_dialog_policy() {
+        let mut app=app("browser-native-policy");
+        app.command(json!({"op":"animation.create","name":"Idle"}));
+        app.animation_name="Idle".into();
+        app.command(json!({"op":"animation.seek","name":"Idle","frame":0}));
+        let (harness,request)=queue_native_browser_action(&mut app,"AnimationCommand.KeyAll");
+        app.seek_frame=25.0;
+        assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(BrowserActionResult::Succeeded));
+        assert_eq!(app.seek_frame,0.0);
+        for dont_save in [false,true] {
+            app.tools.store.set("SaveProjectOnClose",(if dont_save {"dontSave"} else {"Ask"}).to_owned()).unwrap();
+            let (mut harness,request)=queue_native_browser_action(&mut app,"FileCommand.NewFile");
+            let before=app.controller.snapshot().clone();
+            let expected=if dont_save {BrowserActionResult::Succeeded} else {BrowserActionResult::PromptOpened};
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(expected));
+            if dont_save {assert!(app.controller.project_path().is_none());}
+            else {
+                assert_eq!(app.controller.snapshot(),&before);assert!(app.unsaved.is_some());
+                harness.click(egui::accesskit::Role::Button,"Cancel",|ctx|app.draw_unsaved(ctx));
+                assert!(app.unsaved.is_none());assert_eq!(app.controller.snapshot(),&before);
+            }
+        }
+    }
+
+    #[test]
+    fn command_browser_own_dispatch_survives_replacement_path_adoption_and_revision_only_edit() {
+        use crate::editor_test_support::texts;
+        for tool in ["new","FileCommand_OpenFile","import_inp","editor_recovery_restore","node_rename","FileCommand_SaveFile","editor_command_browser_set"] {
+            let mut app=if tool == "editor_recovery_restore" {app_with_two_snapshots("browser-own-recovery")}
+                else {app(&format!("browser-own-{tool}"))};
+            let path=app.controller.project_path().unwrap().to_owned();
+            let destination=path.with_file_name("own-adopted.inp");
+            let args=match tool {
+                "new" => json!({}),
+                "FileCommand_OpenFile" => json!({"file":path}),
+                "import_inp" => json!({"path":path}),
+                "editor_recovery_restore" => json!({"id":SNAPSHOT_NEW}),
+                "node_rename" => json!({"id":2,"name":"Own revision"}),
+                "FileCommand_SaveFile" => json!({"file":destination}),
+                _ => json!({"open":false}),
+            };
+            let (mut harness,request)=queue_native_browser_tool(&mut app,tool,Some(args));
+            app.browser_transitions_for_test.clear();
+            let before=app.controller.snapshot()["revision"].as_u64().unwrap();
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(BrowserActionResult::Succeeded),"{tool}");
+            let transition=matches!(tool,"new"|"FileCommand_OpenFile"|"import_inp"|"editor_recovery_restore"|"FileCommand_SaveFile");
+            assert_eq!(app.browser_transitions_for_test.len(),usize::from(transition),"{tool}");
+            if transition {assert_eq!(app.browser_transitions_for_test[0],browser_document(&app.controller));}
+            let revision_changed=!matches!(tool,"FileCommand_SaveFile"|"editor_command_browser_set");
+            assert_eq!(app.controller.snapshot()["revision"].as_u64().unwrap(),before+u64::from(revision_changed),"{tool}");
+            if tool == "FileCommand_SaveFile" {assert_eq!(app.controller.project_path(),Some(destination.as_path()));assert!(destination.exists());}
+            if tool == "node_rename" {assert_eq!(app.controller.snapshot()["model"]["nodes"]["children"][0]["name"],"Own revision");}
+            if tool == "editor_command_browser_set" {assert!(!app.windows.command_browser_open());}
+            else {
+                assert!(app.windows.command_browser_open(),"own completion lost its owner: {tool}");
+                let output=harness.frame(Vec::new(),|ctx|{draw_command_browser(&mut app,ctx);});
+                assert!(texts(&output).iter().any(|text|text == "Succeeded"),"own completion was erased: {tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn command_browser_observation_does_not_turn_unknown_or_failed_reply_into_success_or_retry() {
+        use crate::editor_test_support::texts;
+        for case in ["missing","wrong_id","missing_flag","bad_content","rpc_error","unsupported_content","target_failed"] {
+            let mut app=app(&format!("browser-own-result-{case}"));
+            let (mut harness,request)=queue_native_browser_tool(&mut app,"new",Some(json!({})));
+            app.browser_transitions_for_test.clear();
+            app.before_browser_result_for_test=Some(match case {
+                "missing" => |reply|*reply=None,
+                "wrong_id" => |reply|reply.as_mut().unwrap()["id"]=json!("another request"),
+                "missing_flag" => |reply|{reply.as_mut().unwrap()["result"].as_object_mut().unwrap().remove("isError");},
+                "bad_content" => |reply|reply.as_mut().unwrap()["result"]["content"]=json!(false),
+                "rpc_error" => |reply|*reply=Some(json!({"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"fault"}})),
+                "unsupported_content" => |reply|reply.as_mut().unwrap()["result"]["content"]=json!([{"type":"unknown"}]),
+                _ => |reply|{reply.as_mut().unwrap()["result"]["isError"]=json!(true);reply.as_mut().unwrap()["result"]["content"]=json!([{"type":"text","text":"Target refused"}]);},
+            });
+            let revision=app.controller.snapshot()["revision"].as_u64().unwrap();
+            let expected=if case == "target_failed" {BrowserActionResult::TargetFailed} else {BrowserActionResult::TargetResultUnknown};
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(expected),"{case}");
+            assert!(app.controller.project_path().is_none());
+            assert_eq!(app.controller.snapshot()["revision"].as_u64().unwrap(),revision+1);
+            assert_eq!(app.browser_transitions_for_test.len(),1,"observed target execution must occur once: {case}");
+            assert!(app.windows.command_browser_open());
+            let output=harness.frame(Vec::new(),|ctx|{draw_command_browser(&mut app,ctx);});
+            let shown=texts(&output);
+            assert!(shown.iter().any(|text|text == "Failed"));
+            assert!(!shown.iter().any(|text|text == "Succeeded"));
+            if case != "target_failed" {assert!(shown.iter().any(|text|text.contains("result is unknown")));}
+        }
+    }
+
+    #[test]
+    fn command_browser_save_aba_rotates_each_primitive_and_unchanged_or_failed_paths_keep_valid_work() {
+        let mut app=app("browser-save-aba");
+        app.command(json!({"op":"node.rename","id":2,"name":"History survives"}));
+        let original=app.controller.project_path().unwrap().to_owned();
+        let other=original.with_file_name("other.inp");
+        let backup=original.with_file_name("backup.inp");
+        let (harness,old)=queue_native_browser_tool(&mut app,"history_clear",None);
+        app.browser_transitions_for_test.clear();
+        let revision=app.controller.snapshot()["revision"].clone();
+        call(&mut app,"FileCommand_SaveFile",json!({"file":other}));
+        assert_eq!(app.browser_transitions_for_test.len(),1);
+        let adopted=app.controller.project_path().unwrap().to_owned();
+        assert_ne!(adopted,original);assert_eq!(app.browser_transitions_for_test[0].path,Some(adopted));
+        std::fs::rename(&original,original.with_file_name("initial-preserved.inp")).unwrap();
+        call(&mut app,"FileCommand_SaveFile",json!({"file":original}));
+        assert_eq!(app.browser_transitions_for_test.len(),2);
+        assert_eq!(app.browser_transitions_for_test[1].path,Some(original.clone()));
+        assert_eq!(app.controller.snapshot()["revision"],revision);
+        assert_eq!(app.apply_browser_request(&harness.ctx,old,Default::default()),None);
+        assert_eq!(app.controller.snapshot()["canUndo"],true);
+        let (harness,current)=queue_native_browser_tool(&mut app,"history_clear",None);
+        app.browser_transitions_for_test.clear();
+        call(&mut app,"FileCommand_SaveFile",json!({"file":original}));
+        app.command(json!({"op":"save","path":backup,"mark_saved":false}));
+        assert!(backup.exists());assert_eq!(app.controller.project_path(),Some(original.as_path()));
+        let missing=original.with_file_name("missing.inp");
+        refused(&mut app,"FileCommand_OpenFile",json!({"file":missing}));
+        app.command(json!({"op":"save","path":original.parent().unwrap()}));
+        assert!(app.browser_transitions_for_test.is_empty());
+        assert_eq!(app.controller.snapshot()["revision"],revision);
+        assert_eq!(app.apply_browser_request(&harness.ctx,current,Default::default()),Some(BrowserActionResult::Succeeded));
+        assert_eq!(app.controller.snapshot()["canUndo"],false);
+    }
+
+    #[test]
+    fn command_browser_human_save_before_new_observes_adoption_before_replacement() {
+        let mut app=app("browser-human-save-before-new");
+        app.command(json!({"op":"new"}));
+        let root=app.controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        app.command(json!({"op":"node.create","className":"Node","parents":[root],"name":"Saved child"}));
+        app.tools.store.set("SaveProjectOnClose","Ask".to_owned()).unwrap();
+        let (mut harness,request)=queue_native_browser_action(&mut app,"FileCommand.NewFile");
+        assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),Some(BrowserActionResult::PromptOpened));
+        assert!(app.browser_pending.is_none());assert!(app.unsaved.is_some());
+        let saved=temp_dir("browser-human-save").join("saved.inp");
+        app.browser_transitions_for_test.clear();
+        harness.text("Save path",saved.to_str().unwrap(),|ctx|app.draw_unsaved(ctx));
+        harness.click(egui::accesskit::Role::Button,"Save",|ctx|app.draw_unsaved(ctx));
+        assert!(app.unsaved.is_none());assert!(app.controller.project_path().is_none());assert!(saved.exists());
+        assert_eq!(app.browser_transitions_for_test.len(),2);
+        assert_eq!(app.browser_transitions_for_test[0].path,Some(std::fs::canonicalize(&saved).unwrap()));
+        assert_eq!(app.browser_transitions_for_test[1].path,None);
+        let mut reopened=soul2d_core::Session::new();
+        assert_eq!(reopened.handle_request(&json!({"op":"open","path":saved}))["succeeded"],true);
+        assert_eq!(reopened.snapshot()["model"]["nodes"]["children"][0]["name"],"Saved child");
+    }
+
+    #[test]
+    fn command_browser_every_close_producer_reports_and_blocks_later_unconsumed_work() {
+        use crate::editor_windows::CloseObservation;
+        use egui::accesskit::Role;
+        for producer in ["menu","native","eof","remote_quit"] {
+            let mut app=app(&format!("browser-close-{producer}"));
+            app.command(json!({"op":"node.rename","id":2,"name":"Saved history"}));
+            let path=app.controller.project_path().unwrap().to_owned();
+            app.command(json!({"op":"save","path":path}));
+            let (mut harness,request)=queue_native_browser_tool(&mut app,"history_clear",None);
+            let before=app.controller.snapshot().clone();
+            let mut close=CloseObservation::default();
+            match producer {
+                "menu" => {
+                    let mut pending=Vec::new();
+                    let mut draw=|ctx:&egui::Context| {
+                        let frame=draw_browser_windows_frame(&mut app,ctx);
+                        close.merge(frame.close);pending.extend(frame.requests);
+                    };
+                    harness.click(Role::Button,"File",&mut draw);
+                    harness.click(Role::Button,"Quit",&mut draw);
+                    assert!(pending.is_empty());
+                }
+                "native" => {app.begin_closing();harness.frame(Vec::new(),|ctx|close.merge(app.finish_close_requests(ctx,HostDrainEffect::None,false)));}
+                "eof" => {
+                    let (sender,receiver)=std::sync::mpsc::channel();app.host_rx=Some(receiver);
+                    sender.send(HostMessage::StdinClosed).unwrap();
+                    harness.frame(Vec::new(),|ctx|{let effect=app.drain_host(ctx);close.merge(app.finish_close_requests(ctx,effect,false));});
+                    assert!(app.stdin_closed);
+                }
+                _ => {
+                    let reply=request_quit(&mut app);reply.write_line(&mut Vec::new()).unwrap();
+                    harness.frame(Vec::new(),|ctx|close.merge(app.finish_remote_quit(ctx)));
+                    assert!(matches!(app.remote_quit,RemoteQuit::Closing(_)));
+                }
+            }
+            assert!(close.issued,"silent Close producer: {producer}");assert_eq!(harness.close_requests,1,"{producer}");
+            if matches!(producer,"menu"|"eof") {
+                assert!(!app.closing && !app.close_sent);
+                assert!(!harness.ctx.input(|input|input.viewport().close_requested()));
+            }
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,close),None,"{producer}");
+            assert_eq!(app.controller.snapshot(),&before,"Close allowed a later target effect: {producer}");
+            assert_eq!(app.controller.snapshot()["canUndo"],true);
+        }
+    }
+
+    #[test]
+    fn command_browser_native_layer_import_and_project_autosave_restore_retire_queued_work() {
+        for source in ["layers","project_autosave"] {
+            let mut app=app(&format!("browser-native-replace-{source}"));
+            let project=app.controller.project_path().unwrap().to_owned();
+            let mut backup_writer=None;
+            if source == "layers" {
+                let dir=temp_dir("browser-native-layer-source");
+                app.tools.import=ImportDraft {path:super::tools_tests::base_psd(&dir),..ImportDraft::default()};
+            } else {
+                let now=Now {mono_secs:0,unix_secs:1000};
+                let mut writer=Autosave::new(app.tools.config_dir.as_ref().unwrap(),now);
+                writer.set_project(Some(project.clone()),now);
+                writer.autosave_now(&autosave::Settings::new(true,1,3),now,
+                    |path|std::fs::write(path,model_bytes()).map_err(|error|error.to_string())).unwrap();
+                backup_writer=Some(writer);
+            }
+            let (harness,request)=queue_native_browser_tool(&mut app,"history_clear",None);
+            app.browser_transitions_for_test.clear();
+            if source == "layers" {assert_eq!(app.import_layers(None),BrowserActionResult::Succeeded);}
+            else {
+                app.request_open(project.to_str().unwrap());
+                assert_eq!(app.tools.prompt,Some(RestorePrompt {project:project.to_str().unwrap().to_owned(),backups:1}));
+                assert!(app.browser_transitions_for_test.is_empty(),"opening a restore prompt is not replacement");
+                app.resolve_prompt(PromptChoice::Restore);
+                assert!(app.tools.prompt.is_none());assert_eq!(app.controller.project_path(),Some(project.as_path()));
+            }
+            assert_eq!(app.browser_transitions_for_test.len(),1,"{source}");
+            let before=app.controller.snapshot().clone();
+            assert_eq!(app.apply_browser_request(&harness.ctx,request,Default::default()),None,"{source}");
+            assert_eq!(app.controller.snapshot(),&before);assert!(app.windows.command_browser_open());
+            drop(backup_writer);
+        }
+    }
+
+    #[test]
+    fn command_browser_queued_call_cannot_retarget_replacement_document_history() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        let mut app = app("browser-replacement-native-call");
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        call(&mut app, "editor_command_browser_set", json!({"open":true}));
+        let mut harness = Harness::new();
+        let mut pending = Vec::new();
+        harness.frame(Vec::new(), |ctx| pending.extend(draw_command_browser(&mut app, ctx)));
+        for request in pending.drain(..) { app.apply_window_request(&harness.ctx, request); }
+        harness.text("Search", "history_clear", |ctx| pending.extend(draw_command_browser(&mut app, ctx)));
+        assert!(pending.is_empty());
+        harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw_command_browser(&mut app, ctx)));
+        assert_eq!(pending.len(), 1);
+        let queued = pending.pop().unwrap();
+        call(&mut app, "new", json!({}));
+        let root = app.controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        let created = app.controller.core_request(&json!({"op":"node.create","className":"Node",
+            "parents":[root],"name":"Replacement history"}));
+        assert_eq!(created["succeeded"], true, "{created}");
+        assert_eq!(app.controller.snapshot()["canUndo"], true);
+        let before = document(&app);
+        app.apply_window_request(&harness.ctx, queued);
+        assert_eq!(app.controller.snapshot()["canUndo"], true, "old Browser work must not clear replacement history");
+        assert_eq!(document(&app), before);
+        assert!(app.windows.command_browser_open(), "stale work must not close its surviving Browser");
+    }
+
     #[test]
     fn command_browser_owner_stale_queued_native_call_cannot_clear_history() {
         use crate::editor_test_support::Harness;
-        use crate::editor_windows::{Host, Request};
+        use crate::editor_windows::Request;
         use egui::accesskit::Role;
-
-        fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
-            let mcp = app.mcp_status();
-            app.windows.show(ctx, Host {
-                all_keys:[false; 2], snapshot:app.controller.snapshot(),
-                selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
-                store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
-                shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
-                tr:&tr, mcp:&mcp,
-            })
-        }
+        let draw = draw_command_browser;
 
         let mut app = app("browser-stale-native-call");
         app.tools.store.set("firstrun_complete", true).unwrap();
@@ -30019,7 +30798,8 @@ mod editor_state_tests {
         harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw(&mut app, ctx)));
         assert_eq!(pending.len(), 1);
         let queued = pending.pop().unwrap();
-        assert!(matches!(&queued, Request::Mcp(_, request) if request["params"]["name"] == "history_clear"));
+        assert!(matches!(&queued, Request::Browser(request) if matches!(&request.operation,
+            crate::editor_windows::CapturedBrowserOperation::Tool(call) if call["params"]["name"] == "history_clear")));
         call(&mut app, "editor_command_browser_set", json!({"open":false}));
         call(&mut app, "editor_command_browser_set", json!({"open":true}));
         let before = document(&app);
@@ -30171,13 +30951,17 @@ mod editor_state_tests {
 
         fn draw(app: &mut EditorApp, ctx: &egui::Context) -> Vec<Request> {
             let mcp = app.mcp_status();
+            let controller = &app.controller;
+            let browser_node_capture = |action|controller.prepare_node_clipboard(action);
+            let browser_key_values = ||controller.capture_key_values();
+            let browser_keys = app.browser_key_captures();
             app.windows.show(ctx, Host {
-                all_keys:[false; 2], snapshot:app.controller.snapshot(),
+                all_keys:browser_keys.each_ref().map(Option::is_some), browser_node_capture:&browser_node_capture, browser_key_values:&browser_key_values, browser_keys:&browser_keys, snapshot:app.controller.snapshot(),
                 selected_node:app.controller.selected_node(), project_path:app.controller.project_path(),
                 store:&mut app.tools.store, store_path:app.tools.store_path.as_deref(),
                 shortcuts:&mut app.tools.shortcuts, locales:&app.tools.locales, lang:&app.tools.lang,
                 tr:&tr, mcp:&mcp,
-            })
+            }).requests
         }
 
         for format in ["inx", "live2d.cmo3", "live2d.can3"] {
@@ -30217,9 +31001,10 @@ mod editor_state_tests {
                     |ctx| pending.extend(draw(&mut app, ctx)));
                 harness.click(Role::Button, "Run Command", |ctx| pending.extend(draw(&mut app, ctx)));
                 assert_eq!(pending.len(), 1);
-                assert!(matches!(&pending[0], Request::Mcp(_, request)
-                    if request["params"]["name"] == "editor_command_browser_set"
-                        && request["params"]["arguments"] == json!({"open":open})));
+                assert!(matches!(&pending[0], Request::Browser(request) if matches!(&request.operation,
+                    crate::editor_windows::CapturedBrowserOperation::Tool(call)
+                    if call["params"]["name"] == "editor_command_browser_set"
+                        && call["params"]["arguments"] == json!({"open":open}))));
                 app.apply_window_request(&harness.ctx, pending.pop().unwrap());
                 assert_eq!(state(&mut app)["windows"]["commandBrowser"], open,
                     "browser-origin tool response must not resurrect or reset visibility: {format}");

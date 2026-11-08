@@ -4,11 +4,19 @@ use std::{cell::{Cell, RefCell}, ops::RangeInclusive, sync::atomic::{AtomicU64, 
 enum Content<T> { Value(T), Text(String) }
 enum Change { Text(String), Number(f64) }
 
+static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+
+fn reserve_input_view(counter: &AtomicU64) -> Option<egui::Id> {
+    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .ok().map(|id| egui::Id::new(("editor-number", id)))
+}
+
+pub(crate) fn try_new_input_view() -> Option<egui::Id> {
+    reserve_input_view(&NEXT_VIEW)
+}
+
 pub(crate) fn new_input_view() -> egui::Id {
-    static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_VIEW.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .expect("Forms numeric view identity exhausted");
-    egui::Id::new(("editor-number", id))
+    try_new_input_view().expect("Forms numeric view identity exhausted")
 }
 
 pub(crate) struct NumberInput<T> {
@@ -19,6 +27,22 @@ pub(crate) struct NumberInput<T> {
     range: RangeInclusive<f64>,
     max_decimals: usize,
     view_id: egui::Id,
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn checked_view_reservation_preserves_discriminator_and_never_reuses_exhausted_owner() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_input_view(&counter), Some(egui::Id::new(("editor-number", u64::MAX - 1))));
+        assert_eq!(reserve_input_view(&counter), None);
+        assert_eq!(reserve_input_view(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        let independent = AtomicU64::new(1);
+        assert_ne!(reserve_input_view(&independent), reserve_input_view(&independent));
+    }
 }
 
 fn finite(raw: &str) -> Option<f64> {

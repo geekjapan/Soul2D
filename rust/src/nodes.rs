@@ -59,7 +59,7 @@ const CONVERT_TYPES: &[&str] = &[
 
 const COMPOSITE_FIELDS: &[&str] = &["opacity", "blend_mode", "tint", "screenTint"];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClipboardEntry {
     pub source_id: u32,
     pub node: Value,

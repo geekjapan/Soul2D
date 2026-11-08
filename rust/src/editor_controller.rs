@@ -204,6 +204,32 @@ pub fn node_convert_classes(current_type: &str) -> &'static [&'static str] {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeClipboardAction { Copy, Cut, Paste }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedKeyValues(std::collections::BTreeMap<u32,[f64;2]>);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedNodeClipboard {
+    action: NodeClipboardAction,
+    root: Option<u64>,
+    selection: Vec<u64>,
+    request: Value,
+    clipboard: Option<Vec<crate::nodes::ClipboardEntry>>,
+}
+
+fn node_clipboard_request(action: NodeClipboardAction, selected: &[u64], root: Option<u64>, target: u64) -> Value {
+    match action {
+        NodeClipboardAction::Copy => json!({"op":"node.copy","nodes":selected}),
+        NodeClipboardAction::Cut => {
+            let nodes: Vec<_> = selected.iter().copied().filter(|id| selected.len() == 1 || Some(*id) != root).collect();
+            json!({"op":"node.cut","nodes":nodes})
+        }
+        NodeClipboardAction::Paste => json!({"op":"node.paste","parent":target}),
+    }
+}
+
 pub enum NodeAction<'a> {
     Create {
         class_name: &'a str,
@@ -759,6 +785,52 @@ impl EditorController {
         resolve_node_drop(&self.snapshot["model"], &self.selected_nodes_in_tree_order(), site)
     }
 
+    pub fn capture_key_values(&self) -> Result<PreparedKeyValues,String> {
+        self.session.key_values().map(PreparedKeyValues)
+    }
+
+    pub fn key_values_are_current(&self, target: &PreparedKeyValues) -> bool {
+        self.session.key_values().is_ok_and(|values|values == target.0)
+    }
+
+    fn node_clipboard_basis(&self, action: NodeClipboardAction) -> Result<(Option<u64>, Value), String> {
+        if self.snapshot["documentFormat"] != "inx" { return Err("node authoring requires an INX document".into()); }
+        if self.draft_dirty() && action != NodeClipboardAction::Copy { return Err(NODE_ACTION_BLOCKED_MESSAGE.into()); }
+        if self.selection.ids.is_empty() && action != NodeClipboardAction::Paste {
+            return Err(NODE_SELECT_REQUIRED_MESSAGE.into());
+        }
+        let root = self.snapshot["model"]["nodes"]["uuid"].as_u64();
+        let target = self.selected_node().or(root).ok_or("no target node is available")?;
+        Ok((root,node_clipboard_request(action,&self.selected_nodes_in_tree_order(),root,target)))
+    }
+
+    pub fn prepare_node_clipboard(&self, action: NodeClipboardAction) -> Result<PreparedNodeClipboard, String> {
+        let (root,request)=self.node_clipboard_basis(action)?;
+        Ok(PreparedNodeClipboard {
+            action, root, selection:self.selection.ids.clone(),
+            request,
+            clipboard:(action == NodeClipboardAction::Paste).then(||self.session.clipboard.clone()),
+        })
+    }
+
+    pub fn node_clipboard_is_current(&self, target: &PreparedNodeClipboard) -> bool {
+        self.selection.ids == target.selection
+            && self.node_clipboard_basis(target.action).is_ok_and(|(root,request)|root == target.root && request == target.request)
+            && target.clipboard.as_ref().is_none_or(|clipboard|&self.session.clipboard == clipboard)
+    }
+
+    pub fn apply_prepared_node_clipboard(&mut self, target: PreparedNodeClipboard) -> Value {
+        if !self.node_clipboard_is_current(&target) {
+            self.status = "node clipboard target is stale".into();
+            return failure(&self.status);
+        }
+        self.node_action(match target.action {
+            NodeClipboardAction::Copy => NodeAction::Copy,
+            NodeClipboardAction::Cut => NodeAction::Cut,
+            NodeClipboardAction::Paste => NodeAction::Paste,
+        })
+    }
+
     pub fn node_action(&mut self, action: NodeAction<'_>) -> Value {
         if self.snapshot["documentFormat"].as_str() != Some("inx") {
             return failure("node authoring requires an INX document");
@@ -814,9 +886,9 @@ impl EditorController {
                 }
                 request
             }
-            NodeAction::Copy => json!({"op": "node.copy", "nodes": selected}),
-            NodeAction::Cut => json!({"op": "node.cut", "nodes": without_root}),
-            NodeAction::Paste => json!({"op": "node.paste", "parent": target}),
+            NodeAction::Copy => node_clipboard_request(NodeClipboardAction::Copy, &selected, root, target),
+            NodeAction::Cut => node_clipboard_request(NodeClipboardAction::Cut, &selected, root, target),
+            NodeAction::Paste => node_clipboard_request(NodeClipboardAction::Paste, &selected, root, target),
             NodeAction::Delete => json!({"op": "node.delete", "nodes": without_root}),
             NodeAction::Reparent { parent } => {
                 json!({"op": "node.move", "nodes": without_root, "parent": parent})
@@ -1504,6 +1576,99 @@ mod tests {
         match controller.draft_view() {
             Some(DraftView::NodeName { id, original, value }) => (id, original.to_owned(), value.to_owned()),
             _ => panic!("expected the retained node draft"),
+        }
+    }
+
+    #[test]
+    fn prepared_clipboard_actions_reject_selection_and_clipboard_changes_without_revision_change() {
+        let mut controller = EditorController::new();
+        let root = controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        let mut children = Vec::new();
+        for name in ["First", "Second"] {
+            let created = controller.core_request(&json!({"op":"node.create","className":"Node","parents":[root],"name":name}));
+            assert_eq!(created["succeeded"], true, "{created}");
+            children.push(created["result"]["created"][0]["uuid"].as_u64().unwrap());
+        }
+        controller.select_nodes(&[children[0]]).unwrap();
+        let copy = controller.prepare_node_clipboard(NodeClipboardAction::Copy).unwrap();
+        let revision = controller.snapshot()["revision"].clone();
+        controller.select_nodes(&[children[1]]).unwrap();
+        assert!(!controller.node_clipboard_is_current(&copy));
+        assert_eq!(controller.apply_prepared_node_clipboard(copy)["succeeded"], false);
+        controller.select_nodes(&[children[0]]).unwrap();
+        assert_eq!(controller.node_action(NodeAction::Copy)["succeeded"], true);
+        controller.select_nodes(&[root]).unwrap();
+        let paste = controller.prepare_node_clipboard(NodeClipboardAction::Paste).unwrap();
+        controller.select_nodes(&[children[1]]).unwrap();
+        assert_eq!(controller.node_action(NodeAction::Copy)["succeeded"], true);
+        controller.select_nodes(&[root]).unwrap();
+        assert_eq!(controller.snapshot()["revision"], revision);
+        assert!(!controller.node_clipboard_is_current(&paste));
+        let before = controller.snapshot().clone();
+        assert_eq!(controller.apply_prepared_node_clipboard(paste)["succeeded"], false);
+        assert_eq!(controller.snapshot(), &before);
+    }
+
+    #[test]
+    fn prepared_paste_compares_full_clipboard_and_preserves_shared_selection_reconciliation() {
+        let mut controller = EditorController::new();
+        let root = controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        let created = controller.core_request(&json!({"op":"node.create","className":"Node","parents":[root],"name":"Source"}));
+        assert_eq!(created["succeeded"], true, "{created}");
+        let node = created["result"]["created"][0]["uuid"].as_u64().unwrap();
+        controller.select_nodes(&[node]).unwrap();
+        assert_eq!(controller.node_action(NodeAction::Copy)["succeeded"], true);
+        controller.select_nodes(&[root]).unwrap();
+        let stale = controller.prepare_node_clipboard(NodeClipboardAction::Paste).unwrap();
+        let summary = controller.snapshot()["clipboard"].clone();
+        controller.with_session(|session| session.clipboard[0].node["opacity"] = json!(0.25));
+        assert_eq!(controller.snapshot()["clipboard"], summary);
+        assert!(!controller.node_clipboard_is_current(&stale), "clipboard summaries are not the captured payload");
+        let paste = controller.prepare_node_clipboard(NodeClipboardAction::Paste).unwrap();
+        let response = controller.apply_prepared_node_clipboard(paste);
+        assert_eq!(response["succeeded"], true, "{response}");
+        let pasted = response["result"]["created"][0]["uuid"].as_u64().unwrap();
+        assert_eq!(controller.selected_nodes(), &[pasted]);
+        let cut = controller.prepare_node_clipboard(NodeClipboardAction::Cut).unwrap();
+        assert_eq!(controller.apply_prepared_node_clipboard(cut)["succeeded"], true);
+        assert!(controller.selected_nodes().is_empty());
+    }
+
+    #[test]
+    fn prepared_paste_rejects_hidden_world_and_absolute_z_changes_after_actual_copy() {
+        for field in ["translation","zsort"] {
+            let mut controller=EditorController::new();
+            let root=controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+            let mut create=|parent,name| {
+                let result=controller.core_request(&json!({"op":"node.create","className":"Node","parents":[parent],"name":name}));
+                assert_eq!(result["succeeded"],true,"{result}");
+                result["result"]["created"][0]["uuid"].as_u64().unwrap()
+            };
+            let parent=create(root,"Parent");let child=create(parent,"Child");
+            assert_eq!(controller.core_request(&json!({"op":"node.copy","nodes":[child]}))["succeeded"],true);
+            controller.select_nodes(&[root]).unwrap();
+            let before=controller.prepare_node_clipboard(NodeClipboardAction::Paste).unwrap();
+            let summary=controller.snapshot()["clipboard"].clone();
+            let mut change=json!({"op":"node.transform","id":parent});
+            change[field]=if field == "translation" {json!([7.0,0.0,0.0])} else {json!(7.0)};
+            assert_eq!(controller.core_request(&change)["succeeded"],true);
+            assert!(controller.node_clipboard_is_current(&before),"the model edit alone must not impersonate a Copy");
+            let revision=controller.snapshot()["revision"].clone();
+            assert_eq!(controller.core_request(&json!({"op":"node.copy","nodes":[child]}))["succeeded"],true);
+            let after=controller.prepare_node_clipboard(NodeClipboardAction::Paste).unwrap();
+            assert_eq!(controller.snapshot()["revision"],revision,"Copy must not change document revision");
+            assert_eq!(controller.snapshot()["clipboard"],summary);
+            assert_eq!(before.clipboard.as_ref().unwrap()[0].node,after.clipboard.as_ref().unwrap()[0].node);
+            assert_ne!(before.clipboard,after.clipboard,"hidden captured field: {field}");
+            assert!(!controller.node_clipboard_is_current(&before));
+            let model=controller.snapshot()["model"].clone();
+            assert_eq!(controller.apply_prepared_node_clipboard(before)["succeeded"],false);
+            assert_eq!(controller.snapshot()["model"],model);
+            let pasted=controller.apply_prepared_node_clipboard(after);
+            assert_eq!(pasted["succeeded"],true,"{field}: {pasted}");
+            let id=pasted["result"]["created"][0]["uuid"].as_u64().unwrap();
+            let node=controller.snapshot()["model"]["nodes"]["children"].as_array().unwrap().iter().find(|node|node["uuid"] == id).unwrap();
+            if field == "translation" {assert_eq!(node["transform"]["trans"][0],7.0);} else {assert_eq!(node["zsort"],7.0);}
         }
     }
 
