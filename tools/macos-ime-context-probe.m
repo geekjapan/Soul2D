@@ -12,6 +12,7 @@ static NSUInteger serial;
 static NSUInteger invocation;
 static NSUInteger nextInvocation;
 static NSMutableArray<NSDictionary *> *callbacks;
+static NSMutableArray<NSDictionary *> *ownerStates;
 static NSMutableArray<id> *clientsRetainedToProcessExit;
 static NSMutableDictionary<NSString *, NSString *> *committed;
 static NSMutableDictionary<NSString *, NSString *> *preedit;
@@ -42,7 +43,16 @@ static void require(BOOL condition, NSString *reason) {
     if (!condition) @throw [NSException exceptionWithName:@"ProbeIncomplete" reason:reason userInfo:nil];
 }
 
-@interface Client : NSObject <NSTextInputClient>
+static NSDictionary *observeOwnerState(NSView *view, NSString *boundary) {
+    NSDictionary *state = @{@"boundary":boundary, @"index":@(ownerStates.count),
+        @"first_responder":pointer(view.window.firstResponder),
+        @"context":pointer(NSTextInputContext.currentInputContext),
+        @"context_client":pointer(NSTextInputContext.currentInputContext.client)};
+    [ownerStates addObject:state];
+    return state;
+}
+
+@interface Client : NSView <NSTextInputClient>
 @property(nonatomic, readonly, copy) NSString *identity;
 @property(nonatomic, copy) NSString *marked;
 @property(nonatomic, weak) NSView *view;
@@ -51,8 +61,30 @@ static void require(BOOL condition, NSString *reason) {
 
 @implementation Client
 - (instancetype)initWithIdentity:(NSString *)identity view:(NSView *)view {
-    if ((self = [super init])) {_identity = [identity copy]; _marked = @""; _view = view;}
+    if ((self = [super initWithFrame:view.bounds])) {
+        _identity = [identity copy]; _marked = @""; _view = self;
+        self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [view addSubview:self];
+    }
     return self;
+}
+- (BOOL)acceptsFirstResponder {return YES;}
+- (void)keyDown:(NSEvent *)event {
+    NSString *previous = api;
+    NSTextInputContext *ownerContext = self.inputContext;
+    NSDictionary *entry = observeOwnerState(self, @"keyDown_enter");
+    emit(@{@"event":@"owner_key_down_enter", @"receiver":pointer(self), @"owner_identity":self.identity,
+        @"first_responder":entry[@"first_responder"], @"owner_context":pointer(ownerContext),
+        @"current_context":entry[@"context"], @"owner_state":entry});
+    api = @"interpretKeyEvents";
+    @try {
+        [self interpretKeyEvents:@[event]];
+    } @finally {
+        api = previous;
+        NSDictionary *exit = observeOwnerState(self, @"keyDown_return");
+        emit(@{@"event":@"owner_key_down_return", @"receiver":pointer(self),
+            @"first_responder":exit[@"first_responder"], @"current_context":exit[@"context"], @"owner_state":exit});
+    }
 }
 - (NSString *)plain:(id)value {
     if ([value isKindOfClass:NSAttributedString.class]) return [value string];
@@ -62,12 +94,13 @@ static void require(BOOL condition, NSString *reason) {
 - (void)record:(NSString *)kind text:(NSString *)text range:(NSRange)range {
     require(NSThread.isMainThread, @"text callback off main thread");
     NSString *origin = [mode isEqual:@"shared"] ? activeOwner : self.identity;
+    NSDictionary *state = observeOwnerState(self, @"native_callback");
     NSDictionary *event = @{@"kind":kind, @"text":[text copy], @"origin":origin,
         @"native_text_object":pointer(text), @"native_text_mutable":@([text isKindOfClass:NSMutableString.class]),
         @"receiver":pointer(self), @"receiver_identity":self.identity,
         @"origin_kind":[mode isEqual:@"shared"] ? @"MUTABLE_CALLBACK_SNAPSHOT" : @"IMMUTABLE_CLIENT",
-        @"context":pointer(NSTextInputContext.currentInputContext),
-        @"context_client":pointer(NSTextInputContext.currentInputContext.client),
+        @"context":state[@"context"], @"context_client":state[@"context_client"],
+        @"first_responder":state[@"first_responder"], @"owner_state":state,
         @"range":NSStringFromRange(range), @"api_at_callback":api, @"call_at_callback":@(invocation)};
     [callbacks addObject:event];
     emit(@{@"event":@"native_callback", @"callback":event, @"index":@(callbacks.count - 1)});
@@ -105,14 +138,6 @@ static void require(BOOL condition, NSString *reason) {
 - (NSInteger)windowLevel {return self.view.window.level;}
 @end
 
-@interface Canvas : NSView
-@property(nonatomic, strong) NSTextInputContext *selectedContext;
-@end
-@implementation Canvas
-- (BOOL)acceptsFirstResponder {return YES;}
-- (NSTextInputContext *)inputContext {return self.selectedContext;}
-@end
-
 @interface Session : NSObject
 @property(nonatomic, copy) NSString *owner;
 @property(nonatomic, strong) Client *client;
@@ -131,18 +156,19 @@ static void pump(void) {
     api = previous;
 }
 
-static Session *session(NSString *owner, Canvas *view, Session *shared) {
+static Session *session(NSString *owner, NSView *view, Session *shared) {
     Session *result = [Session new];
     result.owner = owner;
     result.client = shared ? shared.client : [[Client alloc] initWithIdentity:[mode isEqual:@"shared"] ? @"shared" : owner view:view];
     if (!shared) [clientsRetainedToProcessExit addObject:result.client];
-    result.context = shared ? shared.context : [[NSTextInputContext alloc] initWithClient:result.client];
-    require(result.context.client == result.client, @"context client mismatch");
+    result.context = shared ? shared.context : result.client.inputContext;
+    require(result.context != nil && result.context.client == result.client, @"view-owned context client mismatch");
+    require(result.client.window == view.window, @"owner view is not attached to owned window");
     emit(@{@"event":@"session_created", @"owner":owner, @"context":pointer(result.context), @"client":pointer(result.client)});
     return result;
 }
 
-static void selectOwner(Session *next, Session *old, Canvas *view) {
+static void selectOwner(Session *next, Session *old, NSView *view) {
     activeOwner = next.owner;
     committed[next.owner] = @"";
     preedit[next.owner] = @"";
@@ -157,7 +183,7 @@ static void selectOwner(Session *next, Session *old, Canvas *view) {
         old.client.marked = @"";
         emit(@{@"event":@"shared_local_marked_clear", @"context":pointer(old.context)});
     }
-    view.selectedContext = next.context;
+    require([view.window makeFirstResponder:next.client], @"cannot focus actual owner view");
     api = @"activate_new";
     [next.context activate];
     api = @"idle";
@@ -165,7 +191,7 @@ static void selectOwner(Session *next, Session *old, Canvas *view) {
         @"current_context":pointer(NSTextInputContext.currentInputContext),
         @"client":pointer(next.context.client), @"first_responder":pointer(view.window.firstResponder)});
     require(NSTextInputContext.currentInputContext == next.context, @"activation did not select expected context");
-    require(view.window.isKeyWindow && view.window.firstResponder == view, @"owned native window lacks focus");
+    require(view.window.isKeyWindow && view.window.firstResponder == next.client, @"owned native owner view lacks focus");
 }
 
 static NSString *projection(NSString *owner) {
@@ -208,6 +234,17 @@ static BOOL ownerTextSince(NSUInteger start, Session *owner) {
     return NO;
 }
 
+static BOOL ownerStatePreservedSince(NSUInteger start, Session *owner) {
+    if (start >= ownerStates.count) return NO;
+    for (NSUInteger i = start; i < ownerStates.count; i++) {
+        NSDictionary *state = ownerStates[i];
+        if (![state[@"first_responder"] isEqual:pointer(owner.client)]
+            || ![state[@"context"] isEqual:pointer(owner.context)]
+            || ![state[@"context_client"] isEqual:pointer(owner.client)]) return NO;
+    }
+    return YES;
+}
+
 static BOOL submitKey(Session *target, CGKeyCode code, BOOL down, CGEventFlags flags) {
     CGEventRef backing = CGEventCreateKeyboardEvent(keyboardSource, code, down);
     require(backing != NULL, @"owned Quartz key construction failed");
@@ -228,11 +265,12 @@ static BOOL submitKey(Session *target, CGKeyCode code, BOOL down, CGEventFlags f
             @"source_state_id":@(CGEventGetIntegerValueField(backing, kCGEventSourceStateID)),
             @"has_backing_event":@(event.CGEvent != NULL), @"posted":@NO});
         BOOL submitted = event.type == NSEventTypeKeyDown;
-        BOOL handled = submitted ? [target.context handleEvent:event] : NO;
-        emit(@{@"event":@"native_key_return", @"handled":@(handled), @"submitted_to_context":@(submitted),
+        if (submitted) [target.client keyDown:event];
+        emit(@{@"event":@"native_key_return", @"submitted_to_responder":@(submitted),
+            @"entrypoint":@"OWNER_VIEW_KEYDOWN_INTERPRET_KEY_EVENTS",
             @"current_context":pointer(NSTextInputContext.currentInputContext),
             @"current_client":pointer(NSTextInputContext.currentInputContext.client)});
-        return handled;
+        return submitted;
     } @finally {
         CFRelease(backing);
     }
@@ -241,19 +279,19 @@ static BOOL submitKey(Session *target, CGKeyCode code, BOOL down, CGEventFlags f
 static BOOL key(Session *target, NSString *characters, NSString *unmodified, unsigned short code, NSEventModifierFlags flags) {
     require(flags == 0 || flags == NSEventModifierFlagOption, @"unsupported stimulus modifier");
     invocation = ++nextInvocation;
-    api = @"handleEvent";
+    api = @"keyDown";
     emit(@{@"event":@"key_enter", @"requested_owner":target.owner, @"context":pointer(target.context),
         @"requested_characters":characters, @"requested_unmodified":unmodified, @"keycode":@(code), @"flags":@(flags)});
     BOOL option = flags == NSEventModifierFlagOption;
     CGEventFlags nativeFlags = option ? kCGEventFlagMaskAlternate : 0;
-    BOOL handled = NO;
-    if (option) handled |= submitKey(target, 58, YES, nativeFlags);
-    handled |= submitKey(target, code, YES, nativeFlags);
-    handled |= submitKey(target, code, NO, nativeFlags);
-    if (option) handled |= submitKey(target, 58, NO, 0);
+    BOOL dispatched = NO;
+    if (option) dispatched |= submitKey(target, 58, YES, nativeFlags);
+    dispatched |= submitKey(target, code, YES, nativeFlags);
+    dispatched |= submitKey(target, code, NO, nativeFlags);
+    if (option) dispatched |= submitKey(target, 58, NO, 0);
     invocation = 0;
     api = @"idle";
-    return handled;
+    return dispatched;
 }
 
 static void awaitCallback(NSUInteger start, NSString *kind, NSString *owner) {
@@ -287,7 +325,8 @@ int main(int argc, const char *argv[]) {
     }
     @autoreleasepool {
         mode = [NSString stringWithUTF8String:argv[1]];
-        callbacks = [NSMutableArray new]; committed = [NSMutableDictionary new]; preedit = [NSMutableDictionary new];
+        callbacks = [NSMutableArray new]; ownerStates = [NSMutableArray new];
+        committed = [NSMutableDictionary new]; preedit = [NSMutableDictionary new];
         clientsRetainedToProcessExit = [NSMutableArray new];
         __attribute__((objc_precise_lifetime)) NSMutableArray<Session *> *owners = [NSMutableArray new];
         NSWindow *window = nil;
@@ -302,15 +341,14 @@ int main(int argc, const char *argv[]) {
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
             window.releasedWhenClosed = NO;
             window.title = @"Soul2D native context prototype";
-            Canvas *view = [[Canvas alloc] initWithFrame:window.contentView.bounds];
+            NSView *view = [[NSView alloc] initWithFrame:window.contentView.bounds];
             window.contentView = view;
             [window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES];
-            require([window makeFirstResponder:view], @"cannot focus owned canvas");
             NSTimeInterval focusDeadline = NSProcessInfo.processInfo.systemUptime + 5.0;
             while (!window.isKeyWindow && NSProcessInfo.processInfo.systemUptime < focusDeadline) pump();
             require(window.isKeyWindow, @"native window did not become key");
             emit(@{@"event":@"environment", @"mode":mode, @"window":@(window.windowNumber),
-                @"scope":@"NATIVE_CLIENT_AND_APPLICATION_QUEUE_PROTOTYPE_NOT_PRODUCT_ACCEPTANCE"});
+                @"scope":@"NATIVE_OWNER_VIEW_AND_APPLICATION_QUEUE_PROTOTYPE_NOT_PRODUCT_ACCEPTANCE"});
             Session *a = session(@"A", view, nil); [owners addObject:a];
             Session *b = session(@"B", view, [mode isEqual:@"shared"] ? a : nil); [owners addObject:b];
             Session *s = session(@"sibling", view, [mode isEqual:@"shared"] ? a : nil); [owners addObject:s];
@@ -335,7 +373,7 @@ int main(int argc, const char *argv[]) {
             stage = @"sibling"; selectOwner(s, b, view); compose(s, @"i", 34, @"í", YES);
             require([projection(@"sibling") isEqual:@"í"] && [projection(@"B") isEqual:@"é"], @"sibling or B preservation failed");
             emit(@{@"event":@"queue_case_complete", @"retired_entries_rejected":@YES, @"fresh_B":@YES, @"sibling":@YES});
-            stage = @"retained_context_challenge";
+            stage = @"retained_view_challenge";
             Session *old = session(@"late-A", view, nil); [owners addObject:old];
             Session *current = session(@"late-B", view, [mode isEqual:@"shared"] ? old : nil); [owners addObject:current];
             selectOwner(old, s, view);
@@ -353,6 +391,8 @@ int main(int argc, const char *argv[]) {
                     reason:@"native retirement changed new owner before any resubmission" userInfo:nil];
             }
             NSUInteger challengeStart = callbacks.count;
+            NSUInteger beforeChallengeStates = ownerStates.count;
+            emit(@{@"event":@"retained_view_challenge_entry", @"owner_state":observeOwnerState(current.client, @"challenge_entry")});
             key(old, @"o", @"o", 31, 0); pump(); consume();
             NSTimeInterval challengeDeadline = NSProcessInfo.processInfo.systemUptime + 2.0;
             NSMutableArray<NSDictionary *> *meaningful = [NSMutableArray new];
@@ -367,25 +407,44 @@ int main(int argc, const char *argv[]) {
                 if (meaningful.count || NSProcessInfo.processInfo.systemUptime >= challengeDeadline) break;
                 pump(); consume();
             }
+            BOOL statePreserved = ownerStatePreservedSince(beforeChallengeStates, current)
+                && window.firstResponder == current.client && NSTextInputContext.currentInputContext == current.context;
             emit(@{@"event":@"retained_context_observation", @"same_context_as_current":@(old.context == current.context),
                 @"callbacks":@(callbacks.count - challengeStart), @"new_owner_value":projection(current.owner),
                 @"nonempty_text_callbacks":@(meaningful.count),
-                @"scope":@"EXPLICIT_RETAINED_CONTEXT_INVOCATION_NOT_QUEUED_OS_REPLY"});
-            require(meaningful.count != 0, @"INCONCLUSIVE no nonempty callback from retained-context invocation");
+                @"first_responder":pointer(window.firstResponder), @"current_context":pointer(NSTextInputContext.currentInputContext),
+                @"expected_current_client":pointer(current.client), @"expected_current_context":pointer(current.context),
+                @"owner_state_samples":@(ownerStates.count - beforeChallengeStates), @"current_state_preserved":@(statePreserved),
+                @"scope":@"EXPLICIT_RETAINED_VIEW_KEYDOWN_NOT_QUEUED_OS_REPLY"});
+            if ([mode isEqual:@"distinct"] && (!statePreserved || ![projection(current.owner) isEqual:@""])) {
+                @throw [NSException exceptionWithName:@"CandidateRefuted"
+                    reason:@"retained view changed current owner text or observed focus/context, even if later restored or silent" userInfo:nil];
+            }
+            require(meaningful.count != 0, @"INCONCLUSIVE no nonempty callback from retained-view invocation");
             if ([mode isEqual:@"distinct"]) {
-                BOOL preserved = [projection(current.owner) isEqual:@""];
+                BOOL preserved = YES;
                 for (NSDictionary *event in meaningful) {
                     preserved = preserved && [event[@"receiver"] isEqual:pointer(old.client)]
-                        && [event[@"origin"] isEqual:old.owner] && [event[@"origin_kind"] isEqual:@"IMMUTABLE_CLIENT"];
+                        && [event[@"origin"] isEqual:old.owner] && [event[@"origin_kind"] isEqual:@"IMMUTABLE_CLIENT"]
+                        && [event[@"context"] isEqual:pointer(current.context)]
+                        && [event[@"context_client"] isEqual:pointer(current.client)]
+                        && [event[@"first_responder"] isEqual:pointer(current.client)];
                 }
                 if (!preserved) @throw [NSException exceptionWithName:@"CandidateRefuted"
-                    reason:@"retained context did not preserve old immutable receiver and empty current owner" userInfo:nil];
+                    reason:@"retained owner-view dispatch did not preserve old receiver and empty focused current owner" userInfo:nil];
+                stage = @"fresh_B_after_retained_view";
+                compose(current, @"e", 14, @"é", YES);
+                require([projection(current.owner) isEqual:@"é"], @"immediate B after retained-view challenge differs");
+                stage = @"sibling_after_retained_view";
+                selectOwner(s, current, view); compose(s, @"i", 34, @"í", YES);
+                require([projection(s.owner) isEqual:@"í"] && [projection(current.owner) isEqual:@"é"],
+                    @"sibling after retained-view challenge or B preservation failed");
             }
             stage = @"complete";
-            emit(@{@"event":@"outcome", @"result":[mode isEqual:@"distinct"] ? @"BOUNDED_NATIVE_CLIENT_QUEUE_FEASIBLE" : @"SHARED_BASELINE_OBSERVED",
+            emit(@{@"event":@"outcome", @"result":[mode isEqual:@"distinct"] ? @"BOUNDED_OWNER_VIEW_QUEUE_FEASIBLE" : @"SHARED_BASELINE_OBSERVED",
                 @"retained_context_nonempty_callbacks":@(meaningful.count),
                 @"delayed_OS_reply_isolation":@"NOT_PROVED", @"physical_IME":@"NOT_RUN", @"pinned_winit_integration":@"NOT_RUN",
-                @"entrypoint":@"PUBLIC_CONTEXT_HANDLE_EVENT_REPLACEMENT_SEAM_NOT_INTERPRET_KEY_EVENTS_EQUIVALENCE"});
+                @"entrypoint":@"OWNER_VIEW_KEYDOWN_INTERPRET_KEY_EVENTS_NOT_PINNED_WINIT_INTEGRATION"});
             finished = YES; status = 0;
         } @catch (NSException *error) {
             emit(@{@"event":@"incomplete", @"name":error.name, @"reason":error.reason ?: @"unknown"});
