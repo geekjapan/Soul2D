@@ -20924,7 +20924,7 @@ mod editor_state_tests {
             let action = if forms {"reload_form"} else {"reload_point"};
             let message = panel_discard_message(&app, forms, action);
             let original = draft_http(&app, &token, &message); let duplicate = draft_http(&app, &token, &message);
-            serve_agent_requests(&mut app);
+            serve_panel_review(&mut app, if forms {0} else {1});
             let lane = if forms {0} else {1};
             assert_eq!(app.panel_discards[lane].state()["state"], "awaiting_human");
             assert_eq!(lifecycle_http_result(duplicate, "panel-discard")["isError"], true);
@@ -20934,7 +20934,7 @@ mod editor_state_tests {
             assert_eq!(lifecycle_http_result(original, "panel-discard")["isError"], false);
             finish_panel_discards(&mut app);
             assert!(!app.panel_discards[lane].pending());
-            let fresh = draft_http(&app, &token, &panel_discard_message(&app, forms, action)); serve_agent_requests(&mut app);
+            let fresh = draft_http(&app, &token, &panel_discard_message(&app, forms, action)); serve_panel_review(&mut app, lane);
             assert_eq!(app.panel_discards[lane].state()["state"], "awaiting_human");
             assert_eq!(app.panel_discards[lane].attempt(), 2);
             app.begin_closing(); assert_eq!(lifecycle_http_result(fresh, "panel-discard")["isError"], true);
@@ -21034,7 +21034,7 @@ mod editor_state_tests {
                 let (mut app, _) = panel_discard_app(&format!("panel-discard-authority-{forms}-{case}"), forms, true);
                 let (mut peer, token) = draft_peer(&mut app);
                 let message = panel_discard_message(&app, forms, if forms {"reload_form"} else {"reload_point"});
-                let original = draft_http(&app, &token, &message); serve_agent_requests(&mut app);
+                let original = draft_http(&app, &token, &message); serve_panel_review(&mut app, if forms {0} else {1});
                 let path = app.tools.store_path.clone();
                 Harness::new().click(Role::Button, "Allow once", |ctx|app.agent.host_approval_window(ctx, path.as_deref()));
                 serve_agent_requests(&mut app);
@@ -22368,7 +22368,7 @@ mod editor_state_tests {
             let message=flip_operation_message(&mut app,operation,extra);
             let original=draft_http(&app,&token,&message);
             let duplicate=draft_http(&app,&token,&message);
-            serve_agent_requests(&mut app);
+            serve_panel_review(&mut app,5);
             assert_eq!(app.panel_discards[5].state()["state"],"awaiting_human","private semantics must not bypass review: {case}");
             assert_eq!(app.windows.flip_view_identity(),before);
             assert_eq!(app.controller.snapshot(),&snapshot);
@@ -22391,7 +22391,7 @@ mod editor_state_tests {
                     assert!(response["structuredContent"]["flipPairingContent"]["base64"].is_string());
                     assert_eq!(app.windows.flip_view_identity(),before);
                     let next=draft_http(&app,&token,&message);
-                    serve_agent_requests(&mut app);
+                    serve_panel_review(&mut app,5);
                     assert_eq!(app.panel_discards[5].state()["state"],"awaiting_human","every page needs original approval again");
                     app.begin_closing();
                     assert_eq!(lifecycle_http_result(next,message["id"].as_str().unwrap())["isError"],true);
@@ -23023,7 +23023,7 @@ mod editor_state_tests {
             let message = flip_cancel_message(&app);
             let original = draft_http(&app, &token, &message);
             let duplicate = draft_http(&app, &token, &message);
-            serve_agent_requests(&mut app);
+            serve_panel_review(&mut app,4);
             assert_eq!(app.panel_discards[4].state()["state"], "awaiting_human");
             assert!(app.windows.flip_input_state().open);
             assert_eq!(lifecycle_http_result(duplicate, "flip-cancel")["isError"], true);
@@ -23081,7 +23081,7 @@ mod editor_state_tests {
             if matches!(case, "expired" | "prompt_replaced" | "run_replaced") {
                 assert_eq!(flip_cancel_message(&app), message);
                 let fresh = draft_http(&app, &token, &message);
-                serve_agent_requests(&mut app);
+                serve_panel_review(&mut app,4);
                 assert_eq!(app.panel_discards[4].state()["state"], "awaiting_human");
                 assert_eq!(app.panel_discards[4].attempt(), 2);
                 app.begin_closing();
