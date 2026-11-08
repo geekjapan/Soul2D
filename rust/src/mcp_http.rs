@@ -318,14 +318,26 @@ fn dispatch_message(handler: &mut dyn FnMut(&Value) -> Option<Value>, message: &
 }
 
 fn write_all_before(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    #[cfg(test)]
+    let trace_start = Instant::now();
     let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "MCP response write timed out");
     let outcome = (|| {
-        stream.set_nonblocking(true)?;
+        let mode = stream.set_nonblocking(true);
+        #[cfg(test)]
+        eprintln!("HTTP_DEADLINE_PHASE nonblocking elapsed={:?} result={mode:?}", trace_start.elapsed());
+        mode?;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(timed_out()); }
             if bytes.is_empty() { break; }
-            match stream.write(bytes) {
+            #[cfg(test)]
+            let write_start = Instant::now();
+            let written = stream.write(bytes);
+            #[cfg(test)]
+            if write_start.elapsed() >= Duration::from_millis(100) {
+                eprintln!("HTTP_DEADLINE_PHASE slow_send requested={} duration={:?} result={written:?}", bytes.len(), write_start.elapsed());
+            }
+            match written {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "MCP response write stopped")),
                 Ok(written) => bytes = &bytes[written..],
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -341,7 +353,11 @@ fn write_all_before(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant)
         if Instant::now() >= deadline { return Err(timed_out()); }
         Ok(())
     })();
+    #[cfg(test)]
+    eprintln!("HTTP_DEADLINE_PHASE loop_done elapsed={:?} result={outcome:?}", trace_start.elapsed());
     let restored = stream.set_nonblocking(false);
+    #[cfg(test)]
+    eprintln!("HTTP_DEADLINE_PHASE restored elapsed={:?} result={restored:?}", trace_start.elapsed());
     outcome.and(restored)?;
     if Instant::now() >= deadline { return Err(timed_out()); }
     Ok(())
@@ -360,11 +376,17 @@ fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)],
     // Blocking socket timeouts can restart on progress; enforce the absolute send deadline in user space.
     let write_deadline = Instant::now() + budget;
     write_all_before(stream, out.as_bytes(), write_deadline)?;
+    #[cfg(test)]
+    let trace_drain = Instant::now();
     // Half-close, then swallow whatever the client still sends so closing does not reset the reply.
     stream.shutdown(Shutdown::Write)?;
+    #[cfg(test)]
+    eprintln!("HTTP_DEADLINE_PHASE shutdown elapsed={:?}", trace_drain.elapsed());
     let deadline = (Instant::now() + DRAIN_BUDGET.min(budget)).min(write_deadline);
     let mut sink = Vec::new();
     while sink.len() < DRAIN_MAX_BYTES && fill(stream, deadline, &mut sink).is_some() {}
+    #[cfg(test)]
+    eprintln!("HTTP_DEADLINE_PHASE drain_done elapsed={:?}", trace_drain.elapsed());
     Ok(())
 }
 

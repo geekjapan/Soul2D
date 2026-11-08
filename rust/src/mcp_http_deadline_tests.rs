@@ -38,7 +38,7 @@ fn small_buffer(stream: &TcpStream, send: bool) -> i32 {
         fn wsa_get_last_error() -> i32;
     }
     let option = if send { 0x1001 } else { 0x1002 };
-    let requested = 4096i32;
+    let requested = if send { 0i32 } else { 4096i32 };
     let mut length = std::mem::size_of_val(&requested) as i32;
     let result = unsafe {
         setsockopt(stream.as_raw_socket() as usize, 0xffff, option, (&requested as *const i32).cast(), length)
@@ -71,19 +71,18 @@ fn burst_reader(mut client: TcpStream) -> (Sender<()>, JoinHandle<BurstRead>) {
             if paced && !matches!(control.recv_timeout(Duration::from_millis(200)), Err(RecvTimeoutError::Timeout)) {
                 paced = false;
             }
-            let mut remaining = buffer.len();
-            while remaining > 0 && Instant::now() < deadline {
-                match client.read(&mut buffer[..remaining]) {
-                    Ok(0) => return result,
-                    Ok(count) => { result.bytes.extend_from_slice(&buffer[..count]); remaining -= count; }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                        if !matches!(control.try_recv(), Err(TryRecvError::Empty)) { paced = false; }
-                    }
-                    Err(_) => return result,
+            match client.read(&mut buffer) {
+                Ok(0) => return result,
+                Ok(count) => {
+                    result.bytes.extend_from_slice(&buffer[..count]);
+                    if paced { result.progress.push(Instant::now()); }
                 }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    if !matches!(control.try_recv(), Err(TryRecvError::Empty)) { paced = false; }
+                }
+                Err(_) => return result,
             }
-            if remaining == 0 && paced { result.progress.push(Instant::now()); }
         }
         result
     });
@@ -94,7 +93,7 @@ fn burst_reader(mut client: TcpStream) -> (Sender<()>, JoinHandle<BurstRead>) {
 fn assert_partial(result: &io::Result<()>, elapsed: Duration, received: &BurstRead, expected: &[u8],
                   deadline: Instant, buffers: (i32, i32)) {
     let progress = received.progress.iter().filter(|time| **time < deadline).count();
-    eprintln!("writer={result:?} elapsed={elapsed:?} bytes={}/{} bursts_before_deadline={progress} buffers={buffers:?}",
+    eprintln!("writer={result:?} elapsed={elapsed:?} bytes={}/{} paced_reads_before_deadline={progress} buffers={buffers:?}",
         received.bytes.len(), expected.len());
     assert_eq!(result.as_ref().err().map(io::Error::kind), Some(io::ErrorKind::TimedOut));
     assert!(elapsed < Duration::from_secs(4), "elapsed={elapsed:?}");
