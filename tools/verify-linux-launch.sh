@@ -87,6 +87,104 @@ query_wayland_capabilities() {
     return "$status"
 }
 
+stop_native_group() {
+    [ -n "${native_pid:-}" ] || return 0
+    kill -TERM -- "-$native_pid" 2>/dev/null || true
+    for _ in $(seq 300); do
+        kill -0 -- "-$native_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -KILL -- "-$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+    if kill -0 -- "-$native_pid" 2>/dev/null; then
+        echo "FAIL: owned native IME process group survived cleanup" >&2
+        return 1
+    fi
+    native_pid=
+    echo "native-ime process group cleanup: PASS"
+}
+
+run_native_ime() {
+    local runtime="$probe_dir/native-runtime" status=0
+    mkdir -m 700 "$runtime"
+    setsid python3 - "$runtime" "$out" "$probe_dir/native-ime-probe" <<'PY' &
+import os, pathlib, signal, subprocess, sys, time
+runtime, out, executable = map(pathlib.Path, sys.argv[1:])
+out = out.resolve()
+env = os.environ.copy()
+for key in ("DISPLAY", "WAYLAND_SOCKET", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
+    env.pop(key, None)
+env.update(XDG_RUNTIME_DIR=str(runtime), WLR_BACKENDS="headless", WLR_RENDERER="pixman")
+config = runtime / "sway.conf"
+config.write_text("xwayland disable\nseat seat0 fallback true\ninput * xkb_layout us\noutput * mode 640x480\n")
+class Cancelled(Exception):
+    pass
+def cancel(number, _frame):
+    raise Cancelled(number)
+for number in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, cancel)
+actors = []
+status = 1
+try:
+    with (out / "native-ime-environment.log").open("w") as log:
+        subprocess.run(["sway", "--version"], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=5)
+        subprocess.run(["dpkg-query", "-W", "sway"], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=5)
+    with (out / "native-ime-sway.log").open("w") as log:
+        sway = subprocess.Popen(["sway", "--config", str(config), "--debug"], env=env,
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        actors.append(sway)
+    deadline = time.monotonic() + 10
+    while True:
+        if sway.poll() is not None:
+            raise RuntimeError(f"owned Sway exited during startup: {sway.returncode}")
+        paths = [p for p in runtime.glob("wayland-*") if p.is_socket()]
+        if len(paths) > 1:
+            raise RuntimeError("ambiguous private Wayland sockets")
+        if paths:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned Sway startup incomplete")
+        time.sleep(0.05)
+    env.update(WAYLAND_DISPLAY=paths[0].name, WAYLAND_DEBUG="client")
+    with (out / "native-ime-probe.log").open("w") as log, (out / "native-ime-protocol.log").open("w") as trace:
+        probe = subprocess.Popen([str(executable), str(runtime)], env=env, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=trace)
+        actors.append(probe)
+        status = probe.wait(timeout=45)
+        if sway.poll() is not None:
+            raise RuntimeError("owned Sway exited before probe acceptance")
+except (TimeoutError, subprocess.TimeoutExpired):
+    status = 124
+    print("native-ime: bounded experiment incomplete; no safe-rejection conclusion", flush=True)
+except Cancelled as error:
+    status = 128 + error.args[0]
+finally:
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, signal.SIG_IGN)
+    for actor in reversed(actors):
+        if actor.poll() is None:
+            actor.terminate()
+    for actor in reversed(actors):
+        try:
+            actor.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            actor.kill()
+            actor.wait(timeout=2)
+    print("native-ime owned direct children reaped=true", flush=True)
+sys.exit(status)
+PY
+    native_pid=$!
+    wait "$native_pid" || status=$?
+    stop_native_group || status=1
+    cat "$out/native-ime-environment.log" "$out/native-ime-probe.log" 2>/dev/null || true
+    if [ "$status" -ne 0 ]; then
+        tail -n 60 "$out/native-ime-sway.log" "$out/native-ime-protocol.log" >&2 || true
+    fi
+    echo "native-ime: exit=$status scope=LOCKED_NATIVE_EFRAME_DIAGNOSTIC_NOT_PRODUCT_ACCEPTANCE" \
+        | tee "$out/native-ime.status"
+    return "$status"
+}
+
 shoot_wayland() {
     # Not on PATH in every package; weston only lets it capture because of --debug.
     local shooter
@@ -101,7 +199,9 @@ x11-inner) run_ime_probe x11; launch x11 shoot_x11 ;;
 all)
     probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/soul2d-ime-probe.XXXXXX")
     weston_pid=
+    native_pid=
     cleanup() {
+        stop_native_group || true
         if [ -n "$weston_pid" ]; then
             kill "$weston_pid" 2>/dev/null || true
             wait "$weston_pid" 2>/dev/null || true
@@ -151,6 +251,18 @@ all)
     rustc --edition=2021 --crate-name soul2d_wayland_ime_capabilities "$root/tools/wayland-ime-capabilities.rs" \
         --extern "wayland_client=${wayland_libraries[0]}" -L "dependency=$root/out/rust/debug/deps" \
         -o "$SOUL2D_WAYLAND_CAPABILITIES"
+    native_args=()
+    for crate in eframe wayland_client wayland_protocols_misc; do
+        libraries=("$root"/out/rust/debug/deps/lib"$crate"-*.rlib)
+        if [ "${#libraries[@]}" -ne 1 ] || [ ! -f "${libraries[0]}" ]; then
+            echo "FAIL: expected exactly one compiled $crate rlib for native IME" >&2
+            exit 1
+        fi
+        printf 'native-rlib.%s.file=%s\n' "$crate" "${libraries[0]##*/}"
+        native_args+=(--extern "$crate=${libraries[0]}")
+    done
+    rustc --edition=2021 --crate-name soul2d_native_ime_probe "$root/tools/native-ime-probe.rs" \
+        "${native_args[@]}" -L "dependency=$root/out/rust/debug/deps" -o "$probe_dir/native-ime-probe"
     rm -f "$out/fixture.inx"
     build_fixture
     xvfb-run -a -s "-screen 0 1280x800x24" "$0" "$out" x11-inner
@@ -167,6 +279,7 @@ all)
     env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c \
         "$(declare -f run_ime_probe); out=\$1; run_ime_probe wayland" _ "$out"
     env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c "$(declare -f painted launch shoot_wayland); out='$out' editor='$editor' launch wayland shoot_wayland"
+    run_native_ime
     echo "PASS: the editor opened and drew the model on X11 and Wayland; evidence in $out"
     ;;
 esac
