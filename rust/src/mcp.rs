@@ -8,6 +8,7 @@ pub(crate) fn handle_mcp(
     session: &mut Session,
     request: &Value,
     mut guard: impl FnMut(&mut Session, &Value) -> Result<Option<crate::export_ops::PreparedExport>, String>,
+    mut on_tool_executed: impl FnMut(&Value, bool),
 ) -> Option<Value> {
     if !valid_envelope(request) {
         return Some(rpc_error(Value::Null, -32600, "invalid JSON-RPC request"));
@@ -38,7 +39,7 @@ pub(crate) fn handle_mcp(
         "notifications/initialized" | "notifications/cancelled" => return None,
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),
-        "tools/call" => call_tool(session, &params, &mut guard),
+        "tools/call" => call_tool(session, &params, &mut guard, &mut on_tool_executed),
         "resources/list" => Ok(json!({ "resources": resources(session) })),
         "resources/templates/list" => Ok(json!({ "resourceTemplates": resource_templates() })),
         // The native render model is built on demand, which the shared `&Session` reader cannot do.
@@ -587,6 +588,7 @@ fn call_tool(
     session: &mut Session,
     params: &Value,
     guard: &mut impl FnMut(&mut Session, &Value) -> Result<Option<crate::export_ops::PreparedExport>, String>,
+    on_tool_executed: &mut impl FnMut(&Value, bool),
 ) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
@@ -600,7 +602,7 @@ fn call_tool(
         return Ok(tool_reply(crate::mcp_aliases::scope_response(&tools())));
     }
     if name == "ViewCommand_CaptureLiveScreenshot" {
-        return capture_live_screenshot(session, &arguments, guard);
+        return capture_live_screenshot(session, &arguments, guard, on_tool_executed);
     }
     if let Err(message) = check_declared_arguments(name, &arguments) {
         return Ok(tool_error(&message));
@@ -618,6 +620,7 @@ fn call_tool(
         .get("succeeded")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    on_tool_executed(&request, succeeded);
     if !succeeded {
         let message = response
             .get("message")
@@ -713,6 +716,7 @@ fn capture_live_screenshot(
     session: &mut Session,
     arguments: &Value,
     guard: &mut impl FnMut(&mut Session, &Value) -> Result<Option<crate::export_ops::PreparedExport>, String>,
+    on_tool_executed: &mut impl FnMut(&Value, bool),
 ) -> Result<Value, (i64, String)> {
     let outcome = (|| -> Result<Value, String> {
         if arguments.get("overlayObjects").and_then(Value::as_array).is_some_and(|list| !list.is_empty()) {
@@ -760,6 +764,7 @@ fn capture_live_screenshot(
         };
         let _ = guard(session, &request)?;
         let response = session.handle_request(&request);
+        on_tool_executed(&request, response["succeeded"] == true);
         if response["succeeded"] != true {
             return Err(response["message"].as_str().unwrap_or("tool failed").to_owned());
         }
@@ -6525,6 +6530,65 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_completion_observes_guarded_execution_before_reply_suppression() {
+        let call = |name: &str, arguments: Value| json!({
+            "jsonrpc":"2.0", "method":"tools/call", "params":{"name":name, "arguments":arguments},
+        });
+        for id in [None, Some(Value::Null), Some(json!(11)), Some(json!("completion-request"))] {
+            for (name, arguments, operation) in [
+                ("node_create", json!({"className":"Node", "name":"Created"}), "node.create"),
+                ("ViewCommand_CaptureLiveScreenshot", json!({"width":1, "height":1, "bounds":[-1.0,-1.0,1.0,1.0]}), "render"),
+            ] {
+                let mut session = Session::new();
+                let mut request = call(name, arguments);
+                if let Some(id) = &id { request["id"] = id.clone(); }
+                let guarded = std::cell::Cell::new(false);
+                let mut completed = Vec::new();
+                let response = handle_mcp(&mut session, &request, |_, core| {
+                    assert_eq!(core["op"], operation);
+                    assert!(!guarded.replace(true));
+                    Ok(None)
+                }, |core, succeeded| {
+                    assert!(guarded.get());
+                    completed.push((core["op"].clone(), succeeded));
+                });
+                assert_eq!(completed, [(json!(operation), true)]);
+                if let Some(id) = &id {
+                    let response = response.unwrap();
+                    assert_eq!(&response["id"], id);
+                    assert_eq!(response["result"]["isError"], false);
+                } else {
+                    assert!(response.is_none());
+                }
+                if operation == "node.create" {
+                    assert_eq!(session.snapshot()["model"]["nodes"]["children"][0]["name"], "Created");
+                }
+            }
+        }
+        let mut session = Session::new();
+        let missing = std::env::temp_dir().join(format!("soul2d-mcp-completion-missing-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        assert!(!missing.exists());
+        for (request, denied, expected) in [
+            (call("open", json!({"path":missing})), false, vec![(json!("open"), false)]),
+            (call("new", json!({})), true, vec![]),
+            (call("new", json!({"model":null})), false, vec![(json!("new"), false)]),
+            (call("new", json!({"_forbidden":true})), false, vec![]),
+            (call(crate::mcp_aliases::SCOPE_TOOL, json!({})), false, vec![]),
+            (json!({"jsonrpc":"2.0", "method":"ping"}), false, vec![]),
+        ] {
+            let before = session.snapshot();
+            let mut completed = Vec::new();
+            let response = handle_mcp(&mut session, &request, |_, _| {
+                if denied { Err("Guard denied execution".into()) } else { Ok(None) }
+            }, |core, succeeded| completed.push((core["op"].clone(), succeeded)));
+            assert!(response.is_none());
+            assert_eq!(completed, expected);
+            assert_eq!(session.snapshot(), before);
+        }
+    }
 
     #[test]
     fn native_animation_scene_delete_tool_routes_to_session() {

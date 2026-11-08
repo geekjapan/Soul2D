@@ -377,7 +377,7 @@ impl Session {
         request: &Value,
         mut guard: impl FnMut(&Value) -> Result<(), String>,
     ) -> Option<Value> {
-        mcp::handle_mcp(self, request, |_, call| { guard(call)?; Ok(None) })
+        mcp::handle_mcp(self, request, |_, call| { guard(call)?; Ok(None) }, |_, _| {})
     }
 
     pub fn snapshot(&self) -> Value {

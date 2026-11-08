@@ -1190,7 +1190,6 @@ impl EditorController {
     ) -> Option<Value> {
         let dirty = self.draft_dirty() || self.panel_drafts;
         let modified = self.modified();
-        let before_revision = self.revision();
         let mut replaced = false;
         let mut command = None;
         let refusal = self.replacement_refusal.clone();
@@ -1215,11 +1214,12 @@ impl EditorController {
                 if let Some(refusal) = &refusal {
                     return Err(refusal.clone());
                 }
-                replaced = true;
             }
             file_op_gate(dirty, modified, core)?;
             command = Some(core.clone());
             Ok(prepared)
+        }, |core, succeeded| {
+            replaced |= succeeded && replaces_document(core);
         });
         if let Some(command) = command {
             // Notifications have no result; state changes still invalidate play intent.
@@ -1229,9 +1229,7 @@ impl EditorController {
             self.reconcile_playback(&command, succeeded || response.is_none());
         }
         self.refresh();
-        // Notifications answer None, so success is proven by the revision
-        // advancing; a failed replacement leaves it unchanged and keeps the draft.
-        if replaced && self.revision() != before_revision {
+        if replaced {
             self.draft = None;
             self.selection.clear();
             self.document_replaced = true;
@@ -1465,4 +1463,158 @@ fn find_node(value: &Value, id: u64) -> Option<&Value> {
         .as_array()?
         .iter()
         .find_map(|child| find_node(child, id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replacement_controller(revision: u64) -> EditorController {
+        let mut controller = EditorController::new();
+        let mut model = crate::empty_model();
+        model["nodes"]["name"] = json!("Old root");
+        assert_eq!(controller.core_request(&json!({"op":"new", "model":model}))["succeeded"], true);
+        controller.with_session(|session| session.revision = revision);
+        let root = controller.snapshot()["model"]["nodes"]["uuid"].as_u64().unwrap();
+        controller.select_nodes(&[root]).unwrap();
+        controller.select_node(root).unwrap();
+        assert!(!controller.draft_dirty());
+        controller
+    }
+
+    fn replacement_call(id: Option<Value>, name: &str, arguments: Value) -> Value {
+        let mut call = json!({"jsonrpc":"2.0", "method":"tools/call", "params":{"name":name, "arguments":arguments}});
+        if let Some(id) = id {
+            call["id"] = id;
+        }
+        call
+    }
+
+    fn assert_success_reply(id: &Option<Value>, response: &Option<Value>) {
+        if let Some(id) = id {
+            let response = response.as_ref().unwrap();
+            assert_eq!(&response["id"], id);
+            assert_eq!(response["result"]["isError"], false);
+        } else {
+            assert!(response.is_none());
+        }
+    }
+
+    fn node_draft(controller: &EditorController) -> (u64, String, String) {
+        match controller.draft_view() {
+            Some(DraftView::NodeName { id, original, value }) => (id, original.to_owned(), value.to_owned()),
+            _ => panic!("expected the retained node draft"),
+        }
+    }
+
+    #[test]
+    fn mcp_document_replacement_at_saturated_revision_clears_old_targets() {
+        for id in [None, Some(Value::Null), Some(json!(7)), Some(json!("new-request"))] {
+            let mut controller = replacement_controller(u64::MAX);
+            let response = controller.mcp_request(&replacement_call(id.clone(), "new", json!({})));
+            assert_success_reply(&id, &response);
+            assert_eq!(controller.snapshot()["revision"], u64::MAX);
+            assert_eq!(controller.snapshot()["model"]["nodes"]["name"], "Root");
+            assert!(controller.draft_view().is_none(), "successful replacement retained an old draft for {id:?}");
+            assert!(controller.selected_nodes().is_empty());
+            assert!(controller.take_document_replaced());
+            assert!(!controller.take_document_replaced());
+        }
+    }
+
+    #[test]
+    fn mcp_same_path_reopen_at_saturated_revision_still_replaces_document() {
+        let directory = crate::test_scratch::scratch(std::env::temp_dir().join(format!(
+            "soul2d-mcp-replacement-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, field) in [("open", "path"), ("FileCommand_OpenFile", "file")] {
+            for (case, id) in [None, Some(Value::Null), Some(json!(8)), Some(json!("open-request"))].into_iter().enumerate() {
+                let path = directory.join(format!("{name}-{case}.inx"));
+                let mut controller = replacement_controller(u64::MAX);
+                assert_eq!(controller.core_request(&json!({"op":"save", "path":path}))["succeeded"], true);
+                let before = controller.snapshot().clone();
+                let before_path = controller.project_path().unwrap().to_owned();
+                let mut arguments = json!({});
+                arguments[field] = json!(path);
+                let response = controller.mcp_request(&replacement_call(id.clone(), name, arguments));
+                assert_success_reply(&id, &response);
+                assert_eq!(controller.snapshot(), &before);
+                assert_eq!(controller.project_path(), Some(before_path.as_path()));
+                assert!(controller.draft_view().is_none(), "same-state reopen retained an old draft for {id:?}");
+                assert!(controller.selected_nodes().is_empty());
+                assert!(controller.take_document_replaced());
+                assert!(!controller.take_document_replaced());
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_failed_or_refused_replacements_keep_document_targets_and_pending_notice() {
+        let missing = std::env::temp_dir().join(format!(
+            "soul2d-mcp-missing-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        assert!(!missing.exists());
+        for id in [None, Some(Value::Null), Some(json!(9)), Some(json!("refused-request"))] {
+            for reason in ["invalid-model", "missing-file", "guard", "draft", "panel", "replacement", "unsaved"] {
+                let mut controller = replacement_controller(u64::MAX);
+                let mut request = replacement_call(id.clone(), "new", json!({}));
+                match reason {
+                    "invalid-model" => request["params"]["arguments"] = json!({"model":null}),
+                    "missing-file" => request = replacement_call(id.clone(), "open", json!({"path":missing})),
+                    "draft" => controller.set_draft_name("Unsaved draft".into()),
+                    "panel" => controller.panel_drafts = true,
+                    "replacement" => controller.replacement_refusal = Some("Pending dialog".into()),
+                    "unsaved" => {
+                        assert_eq!(controller.core_request(&json!({"op":"node.create", "className":"Node", "name":"Changed"}))["succeeded"], true);
+                    }
+                    _ => {}
+                }
+                let before = controller.snapshot().clone();
+                let selected = controller.selected_nodes().to_vec();
+                let draft = node_draft(&controller);
+                let response = controller.mcp_request_guarded(&request, &mut |_| {
+                    if reason == "guard" { Err("Denied by guard".into()) } else { Ok(()) }
+                });
+                if id.is_some() {
+                    let response = response.unwrap();
+                    assert_eq!(response["id"], id.as_ref().unwrap().clone());
+                    assert_eq!(response["result"]["isError"], true, "{reason}");
+                } else {
+                    assert!(response.is_none(), "{reason}");
+                }
+                assert_eq!(controller.snapshot(), &before, "{reason}");
+                assert_eq!(controller.selected_nodes(), &selected, "{reason}");
+                assert_eq!(node_draft(&controller), draft, "{reason}");
+                assert!(!controller.take_document_replaced(), "{reason}");
+            }
+        }
+        let mut controller = replacement_controller(0);
+        let response = controller.mcp_request(&replacement_call(None, "new", json!({})));
+        assert!(response.is_none());
+        let response = controller.mcp_request(&replacement_call(None, "open", json!({"path":missing})));
+        assert!(response.is_none());
+        let response = controller.mcp_request(&replacement_call(None, "history_summary", json!({})));
+        assert!(response.is_none());
+        assert!(controller.take_document_replaced());
+        assert!(!controller.take_document_replaced());
+    }
+
+    #[test]
+    fn mcp_successful_non_replacement_does_not_retire_document_targets() {
+        for id in [None, Some(Value::Null), Some(json!(10)), Some(json!("read-request"))] {
+            let mut controller = replacement_controller(u64::MAX);
+            let before = controller.snapshot().clone();
+            let selected = controller.selected_nodes().to_vec();
+            let draft = node_draft(&controller);
+            let response = controller.mcp_request(&replacement_call(id.clone(), "history_summary", json!({})));
+            assert_success_reply(&id, &response);
+            assert_eq!(controller.snapshot(), &before);
+            assert_eq!(controller.selected_nodes(), &selected);
+            assert_eq!(node_draft(&controller), draft);
+            assert!(!controller.take_document_replaced());
+        }
+    }
 }
