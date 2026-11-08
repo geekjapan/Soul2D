@@ -62,7 +62,8 @@ static void require(BOOL condition, NSString *reason) {
 - (void)record:(NSString *)kind text:(NSString *)text range:(NSRange)range {
     require(NSThread.isMainThread, @"text callback off main thread");
     NSString *origin = [mode isEqual:@"shared"] ? activeOwner : self.identity;
-    NSDictionary *event = @{@"kind":kind, @"text":text, @"origin":origin,
+    NSDictionary *event = @{@"kind":kind, @"text":[text copy], @"origin":origin,
+        @"native_text_object":pointer(text), @"native_text_mutable":@([text isKindOfClass:NSMutableString.class]),
         @"receiver":pointer(self), @"receiver_identity":self.identity,
         @"origin_kind":[mode isEqual:@"shared"] ? @"MUTABLE_CALLBACK_SNAPSHOT" : @"IMMUTABLE_CLIENT",
         @"context":pointer(NSTextInputContext.currentInputContext),
@@ -226,8 +227,9 @@ static BOOL submitKey(Session *target, CGKeyCode code, BOOL down, CGEventFlags f
             @"unicode_payload":[NSString stringWithCharacters:text length:count],
             @"source_state_id":@(CGEventGetIntegerValueField(backing, kCGEventSourceStateID)),
             @"has_backing_event":@(event.CGEvent != NULL), @"posted":@NO});
-        BOOL handled = [target.context handleEvent:event];
-        emit(@{@"event":@"native_key_return", @"handled":@(handled),
+        BOOL submitted = event.type == NSEventTypeKeyDown;
+        BOOL handled = submitted ? [target.context handleEvent:event] : NO;
+        emit(@{@"event":@"native_key_return", @"handled":@(handled), @"submitted_to_context":@(submitted),
             @"current_context":pointer(NSTextInputContext.currentInputContext),
             @"current_client":pointer(NSTextInputContext.currentInputContext.client)});
         return handled;
