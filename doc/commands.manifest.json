@@ -12070,6 +12070,414 @@
       ]
     },
     {
+      "description": "Action: admit one native Flip Pairing filter, pattern, pick, Add, assignment, Remove or Pair command at the exact document revision and view identity. Rows are zero-based raw displayed rows; slots are 1 or 2. Text is literal whole-field UTF-8, including empty or identical values, with no trimming or new text limit. Native captured-catalogue semantics apply; Pair can normalize rows and update its message even on a handled error. Targeted text replacement preserves undo and retires only that field's IME/focus. Poll flipPairingOperation after exact successful local reply delivery and final checks. Every owned ACP occurrence needs original human Allow once, including disabled or invalid private targets. No stored-data edit or input contents in the result. No automatic retry. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Flip Pairing > Add as new row",
+        "Flip Pairing > Filter nodes",
+        "Flip Pairing > Filter nodes / selection / Add / patterns / Pair / assignment / Remove",
+        "Flip Pairing > Pair",
+        "Flip Pairing > Part 1 pattern",
+        "Flip Pairing > Part 2 pattern",
+        "Flip Pairing > Remove row",
+        "Flip Pairing > available node selection",
+        "Flip Pairing > row Part 1 assignment",
+        "Flip Pairing > row Part 2 assignment"
+      ],
+      "headless_ok": false,
+      "id": "editor_flip_pairing_edit",
+      "inputSchema": {
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "filter"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "left_pattern"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "right_pattern"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "pick"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "uuid": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "uuid"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "add"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "assign"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "row": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "slot": {
+                "enum": [
+                  1,
+                  2
+                ],
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "row",
+              "slot"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "remove"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "row": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action",
+              "row"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "pair"
+              },
+              "expectedRevision": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expectedViewIdentity": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "expectedRevision",
+              "expectedViewIdentity",
+              "action"
+            ],
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "action": {
+            "enum": [
+              "filter",
+              "left_pattern",
+              "right_pattern",
+              "pick",
+              "add",
+              "assign",
+              "remove",
+              "pair"
+            ],
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedViewIdentity": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "row": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "slot": {
+            "enum": [
+              1,
+              2
+            ],
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "uuid": {
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "expectedViewIdentity",
+          "action"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
+      "description": "Action: admit native Flip Pairing opening or reopening at the exact document revision and flipPairingView.identity. Reopening replaces retained rows, filter, selection, patterns and message when its matching read completes. Poll flipPairingOperation by attempt; admitted is not opened. Execution follows exact successful local reply delivery and final current-input, document, invocation and Close/Quit checks. Every owned ACP call needs original human Allow once, sharing the existing 256-occurrence prompt limit. Failed or stale delivery never executes or revives. No automatic retry, source-file write or dialog answers. Headless, internal calls and notifications refuse.",
+      "effect": "editor-state",
+      "guiEntry": [
+        "Tools > Flip Pairing"
+      ],
+      "headless_ok": false,
+      "id": "editor_flip_pairing_open",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedViewIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "expectedViewIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
+      "description": "Read: one explicit byte page of the current retained Flip Pairing inputs, captured catalogue, native raw rows/display labels and control facts, at the exact document revision and view identity. offset is a byte offset; maxBytes is 1..16384. Concatenate decoded base64-json-utf8 pages before UTF-8/JSON parsing. Each owned ACP page requires its original human Allow once. Returns flipPairingContent directly; snapshot_ready means produced locally, not received by the peer. It never opens a window or returns history, config or unrelated contents. Changed views refuse; no cached snapshots or automatic retry. Headless, internal calls and notifications refuse.",
+      "effect": "-",
+      "guiEntry": [
+        "Flip Pairing > filter, pick, raw rows and control facts",
+        "Flip Pairing > pair list display"
+      ],
+      "headless_ok": false,
+      "id": "editor_flip_pairing_read",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedViewIdentity": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxBytes": {
+            "maximum": 16384,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "expectedViewIdentity",
+          "offset",
+          "maxBytes"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
+      "description": "Action: admit native Save of the captured Flip Pairing inputs into Session FlipConfig at the exact document revision and view identity. Normalizes a cloned proposal; an empty proposal removes the stored key, including after a malformed read. Changed bytes make one undo entry; identical bytes do not. Source files are not saved. Exact local reply delivery, current document/input and original owned ACP Allow once precede execution. Other drafts remain protected. Poll flipPairingOperation: confirmed success releases only its exact owner; save_refused keeps inputs; save_unknown does not prove write failure; saved_owner_retained distinguishes a known write from owner disposal. Never retry automatically. No dialog answers. Headless, internal calls and notifications refuse.",
+      "effect": "document-edit",
+      "guiEntry": [
+        "Flip Pairing > Save"
+      ],
+      "headless_ok": false,
+      "id": "editor_flip_pairing_save",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedViewIdentity": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "expectedViewIdentity"
+        ],
+        "type": "object"
+      },
+      "mcpExposed": true,
+      "scope": [
+        "global"
+      ]
+    },
+    {
       "description": "Action: show or hide the canvas grid of the editor viewport and set its spacing in world units (1 to 1000000) and its colour as unmultiplied [r, g, b, a]. The lines run through the world origin and are not drawn when they would be closer than 4 points. Editor only. Not a document edit.",
       "effect": "editor-state",
       "headless_ok": false,
@@ -13608,9 +14016,6 @@
     {
       "description": "Read one named payload of the INX extension section as base64.",
       "effect": "-",
-      "guiEntry": [
-        "Tools > Flip Pairing"
-      ],
       "headless_ok": true,
       "id": "extdata_get",
       "inputSchema": {
@@ -13633,10 +14038,6 @@
     {
       "description": "Store (base64 string) or remove (base64 null) one named payload of the INX extension section as one undo step.",
       "effect": "document-edit",
-      "guiEntry": [
-        "Flip Pairing > Save",
-        "Tools > Flip Pairing"
-      ],
       "headless_ok": true,
       "id": "extdata_set",
       "inputSchema": {

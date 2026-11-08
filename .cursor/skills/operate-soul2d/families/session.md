@@ -2,6 +2,8 @@
 
 Status: run live against the headless host (`new`, `open`, `save`, `FileCommand_SaveFile`, `snapshot`, `puppet_meta_set`, `extdata_set` / `extdata_get`, `tool_regenerate_node_ids`, `CommandScopeCommand_GetCurrentCommandScope`). `tool_repair`, `tool_generate_fake_layer_names` and `FileCommand_OpenFile` are written from the manifest only.
 
+Retained Flip Session Save is editor-only; its focused egui/App, Client HTTP, persistent stdio host and owned-fake ACP checks are separate from headless, physical GUI, vendor and real-provider acceptance.
+
 The session owns one document at a time (INP/INX, or a native Live2D CMO3/CAN3 where the tool says so). `new`, `open` and the `import_*` tools replace it; everything else edits it.
 
 ## Sequence
@@ -20,7 +22,8 @@ The session owns one document at a time (INP/INX, or a native Live2D CMO3/CAN3 w
 | `save` / `FileCommand_SaveFile` | `{path, mark_saved?}` / `{file}`. The D forms use `file`, not `path`. |
 | `snapshot` | `{}` read only. |
 | `puppet_meta_set` | `{property, value}` one undo step: `name`, `artist`, `rigger`, `contact`, `licenseURL`, `copyright`, `reference`, `preservePixels`, `pixelsPerMeter`, `gravity`. |
-| `extdata_set` / `extdata_get` | `{key, base64}` (`null` removes) / `{key}` named payload of the INX extension section; `set` answers `{bytes, changed, present, key}`. The flip-pair list is key `com.inochi2d.creator.FlipConfig`, base64 of a JSON array of `{uuid1, uuid2}` node UUIDs (Tools > Flip Pairing reads and stores it through these two tools). |
+| `extdata_set` / `extdata_get` | `{key, base64}` (`null` removes) / `{key}` named payload of the INX extension section; `set` answers `{bytes, changed, present, key}`. The stored flip-pair list is key `com.inochi2d.creator.FlipConfig`, base64 JSON array of `{uuid1, uuid2}`. These do not open, read or edit the separate retained Flip owner; its typed native coordinator uses the same Session storage operations. |
+| `editor_flip_pairing_save` | `{expectedRevision,expectedViewIdentity}` from editor state admits native Save of the captured retained Flip owner. Normalizes a cloned proposal; empty removes FlipConfig; changed bytes make one undo entry, identical bytes make none. Source files are not saved. Every ACP occurrence needs original human Allow once, including empty Save. Exact local reply and final document/view/invocation checks precede the fixed Session write. Other drafts/dialogs remain protected. `saved` releases only its exact confirmed owner; `save_refused`/`save_unknown` keep inputs, and `saved_owner_retained` distinguishes a known write. No automatic retry or dialog answer. |
 | `tool_regenerate_node_ids` / `ToolCommand_RegenerateNodeIDs` | `{}` new UUID for every node, references rewritten; answers `{regenerated}`. Invalidates every UUID you hold; re-list. |
 | `tool_repair` / `ToolCommand_AttemptRepairPuppet` | `{}` full repair; also regenerates node UUIDs. |
 | `tool_generate_fake_layer_names` / `ToolCommand_GenerateFakeLayerName` | `{}` set every Part's layer path to `/name`. |

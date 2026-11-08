@@ -104,6 +104,7 @@ const OBJECT_NAMES_CSV_URI: &str = "resource://soul2d/object/names-csv";
 /// lists them with `headless_ok: false`.
 pub(crate) const EDITOR_TOOLS: &[&str] = &[
     "editor_flip_pairing_cancel",
+    "editor_flip_pairing_open", "editor_flip_pairing_read", "editor_flip_pairing_edit", "editor_flip_pairing_save",
     "editor_live2d_objects_discard",
     "editor_live2d_forms_discard", "editor_motion3_discard",
     "editor_quit", "editor_coding_agent_cancel", "editor_coding_agent_stop", "editor_coding_agent_set", "editor_coding_agent_start", "editor_coding_agent_new_session", "editor_coding_agent_prompt_set", "editor_coding_agent_send",
@@ -218,6 +219,18 @@ fn editor_tool_request(name: &str, arguments: &Value) -> Result<Value, String> {
         Ok(ids)
     };
     Ok(match name {
+        "editor_flip_pairing_open" | "editor_flip_pairing_read" | "editor_flip_pairing_edit" | "editor_flip_pairing_save" => {
+            let (operation, op) = match name {
+                "editor_flip_pairing_open" => ("open", "editor.flip_pairing.open"),
+                "editor_flip_pairing_read" => ("read", "editor.flip_pairing.read"),
+                "editor_flip_pairing_edit" => ("edit", "editor.flip_pairing.edit"),
+                _ => ("save", "editor.flip_pairing.save"),
+            };
+            crate::editor_controller::FlipOperationRequest::parse(operation, arguments)?;
+            let mut call = arguments.clone();
+            call["op"] = json!(op);
+            call
+        },
         "editor_flip_pairing_cancel" => {
             let identity = arguments["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
                 .ok_or("expectedInputIdentity must be a nonempty string")?;
@@ -5455,6 +5468,36 @@ flip-pair partners. The clipboard is used up.",
              Original whitespace is preserved. First briefing uses current document context at execution. No launch, enable, \
              permission grant or document edit. Failed/lost/expired reply delivery never sends. Headless hosts refuse.",
             closed_schema(&[("expectedDraftIdentity", json!({"type":"string"}))], &["expectedDraftIdentity"])),
+        tool("editor_flip_pairing_open", "Action: admit native Flip Pairing opening or reopening at the exact document revision \
+             and flipPairingView.identity. Reopening replaces retained rows, filter, selection, patterns and message when its \
+             matching read completes. Poll flipPairingOperation by attempt; admitted is not opened. Execution follows exact \
+             successful local reply delivery and final current-input, document, invocation and Close/Quit checks. Every owned \
+             ACP call needs original human Allow once, sharing the existing 256-occurrence prompt limit. Failed or stale \
+             delivery never executes or revives. No automatic retry, source-file write or dialog answers. Headless, internal \
+             calls and notifications refuse.", flip_operation_schema("open")),
+        tool("editor_flip_pairing_read", "Read: one explicit byte page of the current retained Flip Pairing inputs, captured \
+             catalogue, native raw rows/display labels and control facts, at the exact document revision and view identity. \
+             offset is a byte offset; maxBytes is 1..16384. Concatenate decoded base64-json-utf8 pages before UTF-8/JSON parsing. \
+             Each owned ACP page requires its original human Allow once. Returns flipPairingContent directly; snapshot_ready \
+             means produced locally, not received by the peer. It never opens a window or returns history, config or unrelated \
+             contents. Changed views refuse; no cached snapshots or automatic retry. Headless, internal calls and notifications refuse.",
+            flip_operation_schema("read")),
+        tool("editor_flip_pairing_edit", "Action: admit one native Flip Pairing filter, pattern, pick, Add, assignment, Remove \
+             or Pair command at the exact document revision and view identity. Rows are zero-based raw displayed rows; slots \
+             are 1 or 2. Text is literal whole-field UTF-8, including empty or identical values, with no trimming or new text \
+             limit. Native captured-catalogue semantics apply; Pair can normalize rows and update its message even on a \
+             handled error. Targeted text replacement preserves undo and retires only that field's IME/focus. Poll \
+             flipPairingOperation after exact successful local reply delivery and final checks. Every owned ACP occurrence \
+             needs original human Allow once, including disabled or invalid private targets. No stored-data edit or input \
+             contents in the result. No automatic retry. Headless, internal calls and notifications refuse.", flip_operation_schema("edit")),
+        tool("editor_flip_pairing_save", "Action: admit native Save of the captured Flip Pairing inputs into Session FlipConfig \
+             at the exact document revision and view identity. Normalizes a cloned proposal; an empty proposal removes the \
+             stored key, including after a malformed read. Changed bytes make one undo entry; identical bytes do not. Source \
+             files are not saved. Exact local reply delivery, current document/input and original owned ACP Allow once precede \
+             execution. Other drafts remain protected. Poll flipPairingOperation: confirmed success releases only its exact \
+             owner; save_refused keeps inputs; save_unknown does not prove write failure; saved_owner_retained distinguishes a \
+             known write from owner disposal. Never retry automatically. No dialog answers. Headless, internal calls and \
+             notifications refuse.", flip_operation_schema("save")),
         tool("editor_flip_pairing_cancel", "Action: admit native Cancel for the captured retained Flip Pairing window, including \
              clean inputs and explanatory owners. Read flipPairingInputs.cancel.identity as expectedInputIdentity. This loses its \
              pair draft, filter, selection, patterns and message. Admission is not completion: poll flipPairingCancel by attempt. \
@@ -5915,6 +5958,42 @@ fn psd_depth_properties() -> Vec<(&'static str, Value)> {
         ("layers", json!({ "type": "array", "items": layer })),
         ("disabledGrids", json!({ "type": "array", "items": integer_schema() })),
     ]
+}
+
+fn flip_operation_schema(operation: &str) -> Value {
+    let mut properties = vec![
+        ("expectedRevision", json!({"type":"integer", "minimum":0, "maximum":u64::MAX})),
+        ("expectedViewIdentity", json!({"type":"string", "minLength":1})),
+    ];
+    let mut required = vec!["expectedRevision", "expectedViewIdentity"];
+    let index = ||json!({"type":"integer", "minimum":0, "maximum":usize::MAX as u64});
+    if operation == "read" {
+        properties.extend([("offset", index()), ("maxBytes", json!({"type":"integer", "minimum":1,
+            "maximum":crate::editor_controller::FLIP_CONTENT_MAX_BYTES}))]);
+        required.extend(["offset", "maxBytes"]);
+    } else if operation == "edit" {
+        properties.extend([
+            ("action", json!({"type":"string", "enum":["filter","left_pattern","right_pattern","pick","add","assign","remove","pair"]})),
+            ("text", string_schema()), ("uuid", json!({"type":"integer", "minimum":0, "maximum":u32::MAX})),
+            ("row", index()), ("slot", json!({"type":"integer", "enum":[1,2]})),
+        ]);
+        required.push("action");
+    }
+    let mut schema = closed_schema(&properties, &required);
+    if operation == "edit" {
+        schema["oneOf"] = Value::Array(["filter","left_pattern","right_pattern","pick","add","assign","remove","pair"]
+            .into_iter().map(|action| {
+                let extra: &[&str] = match action {"filter"|"left_pattern"|"right_pattern"=>&["text"],
+                    "pick"=>&["uuid"], "assign"=>&["row","slot"], "remove"=>&["row"], _=>&[]};
+                let mut branch = properties[..2].to_vec();
+                branch.push(("action", json!({"const":action})));
+                branch.extend(extra.iter().map(|name|properties.iter().find(|(key,_)|key == name).unwrap().clone()));
+                let mut required = vec!["expectedRevision", "expectedViewIdentity", "action"];
+                required.extend_from_slice(extra);
+                closed_schema(&branch, &required)
+            }).collect());
+    }
+    schema
 }
 
 fn string_schema() -> Value {
@@ -6637,6 +6716,100 @@ mod tests {
             assert!(editor_request(&request(arguments)).unwrap().is_err());
         }
         assert_eq!(crate::manifest::effect_of("editor_live2d_objects_discard"),Some("editor-state"));
+    }
+
+    #[test]
+    fn flip_operation_translation_preserves_literal_text_full_integer_ranges_and_explicit_effects() {
+        let basis = json!({"expectedRevision":u64::MAX,"expectedViewIdentity":"  opaque 日本語  "});
+        let mut cases = vec![("open", json!({})), ("save", json!({})),
+            ("read", json!({"offset":0,"maxBytes":1})),
+            ("read", json!({"offset":usize::MAX as u64,"maxBytes":16384}))];
+        for action in ["filter","left_pattern","right_pattern"] {
+            cases.push(("edit",json!({"action":action,"text":"  é\r\n\0\t日本語👾  "})));
+            cases.push(("edit",json!({"action":action,"text":""})));
+        }
+        for uuid in [0,u32::MAX] {cases.push(("edit",json!({"action":"pick","uuid":uuid})));}
+        for action in ["add","pair"] {cases.push(("edit",json!({"action":action})));}
+        for slot in [1,2] {cases.push(("edit",json!({"action":"assign","row":usize::MAX as u64,"slot":slot})));}
+        cases.push(("edit",json!({"action":"remove","row":0})));
+        let mut session = Session::new();
+        let before = session.snapshot();
+        for (operation, extra) in cases {
+            let name = format!("editor_flip_pairing_{operation}");
+            let op = format!("editor.flip_pairing.{operation}");
+            let mut arguments = basis.clone();
+            arguments.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let request = json!({"jsonrpc":"2.0","id":"flip-op","method":"tools/call",
+                "params":{"name":name,"arguments":arguments}});
+            let mut expected = arguments.clone();
+            expected["op"] = json!(op);
+            assert_eq!(editor_request(&request).unwrap().unwrap(), expected, "{operation}: {extra}");
+            assert_eq!(crate::editor_controller::FlipOperationRequest::parse(operation,&arguments).unwrap().expected_revision, u64::MAX);
+            assert!(EDITOR_TOOLS.contains(&name.as_str()));
+            assert_eq!(crate::manifest::effect_of(&name), Some(match operation {"read"=>"-","save"=>"document-edit",_=>"editor-state"}));
+            let reply = session.handle_mcp(&request).unwrap();
+            assert_eq!(reply["result"]["isError"], true);
+            assert!(reply["result"]["content"][0]["text"].as_str().unwrap().contains("needs the editor"));
+            assert_eq!(session.snapshot(), before);
+        }
+        let edit = tools().into_iter().find(|tool|tool["name"] == "editor_flip_pairing_edit").unwrap();
+        assert_eq!(edit["inputSchema"]["additionalProperties"], false);
+        assert_eq!(edit["inputSchema"]["oneOf"].as_array().unwrap().len(), 8);
+        for branch in edit["inputSchema"]["oneOf"].as_array().unwrap() {
+            assert_eq!(branch["additionalProperties"], false);
+            let action = branch["properties"]["action"]["const"].as_str().unwrap();
+            if action == "add" || action == "pair" {
+                assert_eq!(branch["properties"].as_object().unwrap().len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operation_translation_rejects_wrong_types_cross_action_fields_and_unbounded_or_implicit_shapes() {
+        let basis = json!({"expectedRevision":0,"expectedViewIdentity":"opaque"});
+        let request = |operation:&str, arguments:Value|json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":format!("editor_flip_pairing_{operation}"),"arguments":arguments}});
+        let check = |operation:&str, arguments:Value| {
+            assert!(editor_request(&request(operation,arguments.clone())).unwrap().is_err(), "{operation}: {arguments}");
+            assert!(crate::editor_controller::FlipOperationRequest::parse(operation,&arguments).is_err());
+        };
+        for (operation, extra) in [("open",json!({})),("save",json!({})),("read",json!({"offset":0,"maxBytes":1})),
+            ("edit",json!({"action":"add"}))] {
+            let mut valid = basis.clone(); valid.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            for key in ["expectedRevision","expectedViewIdentity"] {
+                let mut missing = valid.clone(); missing.as_object_mut().unwrap().remove(key); check(operation,missing);
+            }
+            for revision in [Value::Null,json!(true),json!(-1),json!(0.0),json!("0"),json!(18446744073709551616.0)] {
+                let mut bad = valid.clone(); bad["expectedRevision"]=revision; check(operation,bad);
+            }
+            for identity in [Value::Null,json!(false),json!(0),json!(""),json!([]),json!({})] {
+                let mut bad = valid.clone(); bad["expectedViewIdentity"]=identity; check(operation,bad);
+            }
+            for extra in [json!({"force":true}),json!({"path":"other.inx"}),json!({"_op":"extdata.set"}),json!({"key":"other"})] {
+                let mut bad = valid.clone(); bad.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); check(operation,bad);
+            }
+        }
+        let mut bad_edits = vec![json!({}),json!({"action":null}),json!({"action":"bulk"}),json!({"action":"pair","text":"hidden"}),
+            json!({"action":"add","uuid":1}),json!({"action":"pick","uuid":1,"row":0}),
+            json!({"action":"remove","row":0,"slot":1}),json!({"action":"filter","text":"x","uuid":1}),
+            json!({"action":"assign","row":0,"slot":1,"text":"x"}),json!({"action":"pick","uuid":4294967296u64})];
+        for bad in [Value::Null,json!(false),json!(0),json!([]),json!({})] {
+            bad_edits.push(json!({"action":"left_pattern","text":bad}));
+        }
+        for bad in [Value::Null,json!(true),json!(-1),json!(0.0),json!("0"),json!(18446744073709551616.0)] {
+            bad_edits.push(json!({"action":"remove","row":bad}));
+            bad_edits.push(json!({"action":"pick","uuid":bad}));
+            let mut read = basis.clone(); read["offset"]=bad; read["maxBytes"]=json!(1); check("read",read);
+        }
+        for slot in [Value::Null,json!(false),json!(0),json!(3),json!(1.0),json!("1")] {
+            bad_edits.push(json!({"action":"assign","row":0,"slot":slot}));
+        }
+        for extra in bad_edits {
+            let mut bad = basis.clone(); bad.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); check("edit",bad);
+        }
+        for max_bytes in [Value::Null,json!(0),json!(16385),json!(-1),json!(1.0),json!("1")] {
+            let mut bad = basis.clone(); bad["offset"]=json!(0); bad["maxBytes"]=max_bytes; check("read",bad);
+        }
     }
 
     #[test]

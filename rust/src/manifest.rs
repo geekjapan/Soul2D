@@ -68,7 +68,10 @@ const IMPORT: &[&str] = &[
 /// D `ngManifestEffectSlug` value for the tools whose effect is known by name.
 pub fn effect_of(tool: &str) -> Option<&'static str> {
     if matches!(tool, "editor_coding_agent_prompt_set" | "editor_live2d_objects_discard"
-        | "editor_live2d_forms_discard" | "editor_motion3_discard" | "editor_flip_pairing_cancel") { return Some("editor-state"); }
+        | "editor_live2d_forms_discard" | "editor_motion3_discard" | "editor_flip_pairing_cancel"
+        | "editor_flip_pairing_open" | "editor_flip_pairing_edit") { return Some("editor-state"); }
+    if tool == "editor_flip_pairing_read" { return Some("-"); }
+    if tool == "editor_flip_pairing_save" { return Some("document-edit"); }
     if matches!(tool, "editor_quit" | "editor_coding_agent_stop" | "editor_coding_agent_set" | "editor_coding_agent_start" | "editor_coding_agent_new_session" | "editor_coding_agent_send") { return Some("application-lifecycle"); }
     [("-", READ_ONLY), ("project-reset", PROJECT_RESET), ("file-write", FILE_WRITE), ("import", IMPORT),
         ("clipboard-write", CLIPBOARD_WRITE)]

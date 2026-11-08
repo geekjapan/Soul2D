@@ -780,6 +780,9 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         ("editor_live2d_forms_discard", json!({"action":"reload_form","expectedInputIdentity":"not-an-editor"})),
         ("editor_motion3_discard", json!({"action":"reload_point","expectedInputIdentity":"not-an-editor"})),
         ("editor_flip_pairing_cancel", json!({"expectedInputIdentity":"not-an-editor"})),
+        ("editor_flip_pairing_open", json!({"expectedRevision":0,"expectedViewIdentity":"not-an-editor"})),
+        ("editor_flip_pairing_edit", json!({"expectedRevision":0,"expectedViewIdentity":"not-an-editor","action":"pair"})),
+        ("editor_flip_pairing_save", json!({"expectedRevision":0,"expectedViewIdentity":"not-an-editor"})),
         ("editor_coding_agent_send", json!({"expectedDraftIdentity":"not-an-editor"})),
         ("editor_selection_set", json!({"nodes": [2]})),
         ("editor_armed_set", json!({"parameter": 10})),
@@ -831,12 +834,12 @@ fn editor_tools_are_listed_and_refused_without_a_window() {
         assert_eq!(refused["isError"], true, "{name}: {refused}");
         assert_eq!(refused["content"][0]["text"], format!("{name} needs the editor: this host has no window"));
     }
-    // The two readers answer the same way; their descriptions say "Read:", not "Action:".
-    for name in ["editor_recovery_list", "editor_settings_get"] {
+    for (name,arguments) in [("editor_recovery_list",json!({})),("editor_settings_get",json!({})),
+        ("editor_flip_pairing_read",json!({"expectedRevision":0,"expectedViewIdentity":"not-an-editor","offset":0,"maxBytes":1}))] {
         let tool = listed["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is listed"));
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
         assert!(tool["description"].as_str().unwrap().starts_with("Read: "), "{name}");
-        let refused = call(&mut session, name, json!({}));
+        let refused = call(&mut session, name, arguments);
         assert_eq!(refused["isError"], true, "{name}: {refused}");
         assert_eq!(refused["content"][0]["text"], format!("{name} needs the editor: this host has no window"));
     }

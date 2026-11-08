@@ -13,6 +13,7 @@
 use eframe::egui::{self, TextBuffer};
 use serde_json::{json, Map, Value};
 use soul2d_core::acp::{Block, Client, Incoming, LaunchSpec, McpHttp, Plan, PermissionRequest, PromptAttemptStamp, PromptId, PromptOutcome, RoleKind};
+use soul2d_core::editor_controller::FlipOperation;
 use soul2d_core::mcp_http::{handle_connection_deferred, HttpDispatch, PendingReply, RpcReply};
 use soul2d_core::settings::Settings;
 use std::io::Write;
@@ -453,7 +454,8 @@ impl AcpInvocation {
 
 impl HostApproval {
     pub(crate) fn covers(call: &Value) -> bool {
-        if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) { return true; }
+        if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel"
+            | "editor.flip_pairing.open" | "editor.flip_pairing.read" | "editor.flip_pairing.edit" | "editor.flip_pairing.save")) { return true; }
         matches!(call["op"].as_str(), Some("editor.quit" | "editor.coding_agent.stop" | "editor.coding_agent.set" | "editor.coding_agent.new_session" | "editor.coding_agent.prompt.set" | "editor.live2d.objects.discard" | "editor.panel.set" | "editor.settings.set" | "editor.shortcut.set" |
             "editor.workspace.save" | "editor.workspace.apply" | "editor.workspace.delete" | "editor.layout.reset" | "save" |
             "export.inp" | "export.image" | "export.frames" | "export.video.start" | "export.collect" | "export.gltf" | "depth.draw.export_png" | "export.gif" | "view.screenshot" | "object.export_csv" | "model.template.export" | "motion3.export" | "texture.export"))
@@ -605,7 +607,10 @@ impl HostApproval {
         if matches!(target, ApprovalTarget::Settings(None)) { return Ok(()) }
         let tool = call["op"].as_str().unwrap_or_default().replace('.', "_");
         let effect = soul2d_core::manifest::effect_of(&tool).filter(|effect| matches!(*effect, "file-write" | "project-reset" | "import" | "application-lifecycle")
-            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_) | ApprovalTarget::PanelDiscard(_))))
+            || (*effect == "editor-state" && matches!(target, ApprovalTarget::CodingAgentDraft(_) | ApprovalTarget::ObjectDiscard(_) | ApprovalTarget::PanelDiscard(_)))
+            || matches!(&target, ApprovalTarget::PanelDiscard(target) if matches!(&target.input,
+                PanelDiscardInput::FlipOperation(input) if matches!((&input.operation,*effect),
+                    (FlipOperation::Read {..},"-") | (FlipOperation::Save,"document-edit")))))
             .ok_or("The operation effect is missing from the command manifest")?;
         if let Some(request) = &self.request {
             if matches!(request.decision, ApprovalDecision::AllowedOnce) {
@@ -723,13 +728,39 @@ impl HostApproval {
                             soul2d_core::editor_controller::Motion3InputAction::ReloadMotion => "Reload the selected motion, including its retained point and bindings inputs.",
                         },
                         PanelDiscardInput::Flip(_) => "Cancel the captured Flip Pairing window, losing its pair draft, node filter and selection, patterns and message, including clean inputs. An independent pending read remains and may later create another window.",
+                        PanelDiscardInput::FlipOperation(input) => match &input.operation {
+                            soul2d_core::editor_controller::FlipOperation::Open =>
+                                "Open or reopen Flip Pairing. A matching stored-data read replaces the entire retained owner, including rows, filter, pick, patterns and message. A failed or malformed read can open an empty explanatory owner.",
+                            soul2d_core::editor_controller::FlipOperation::Read {..} =>
+                                "Read one explicit page containing the current filter, pick, patterns, message, captured node catalogue, raw rows with native display labels and control facts. No original baseline, undo history, config, credentials or unrelated inputs.",
+                            soul2d_core::editor_controller::FlipOperation::Edit(_) =>
+                                "Execute the caller-proposed native Flip command. Text is literal whole-field UTF-8, including empty or identical replacements. Native Pair can normalize rows and update its message even on a handled error.",
+                            soul2d_core::editor_controller::FlipOperation::Save =>
+                                "Normalize a cloned proposal and store FlipConfig in this Session. If the proposal is empty, Save removes the stored key, including after a malformed read. Changed bytes add one undo entry; identical bytes do not. This does not save the source file.",
+                        },
                     });
-                    ui.label(if matches!(&target.input, PanelDiscardInput::Flip(_)) {
-                        "Allow this original request once. Execution follows local reply delivery and final input, document and invocation checks. Only this captured owner is cancelled. No automatic retry."
+                    if matches!(&target.input, PanelDiscardInput::FlipOperation(_)) {
+                        ui.label("Caller-proposed arguments only (JSON string escapes preserve literal text):");
+                        let mut proposed = request.call.clone();
+                        for key in ["op", "expectedRevision", "expectedViewIdentity"] {
+                            proposed.as_object_mut().expect("validated Flip call").remove(key);
+                        }
+                        let quoted = serde_json::to_string(&proposed).unwrap_or_default();
+                        let mut shown = quoted.as_str();
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace)
+                                .desired_width(400.0).interactive(false));
+                        });
+                        ui.label("Allow this original call once, even for empty, identical, disabled or invalid private targets. Each Read page needs its own approval and returns its snapshot on this continuation; snapshot_ready means produced locally, not received by the peer.");
+                        ui.label("Mutations follow exact successful local reply delivery and final view, document, invocation and Close/Quit checks. Save releases only the confirmed current owner; refusal or unknown outcome keeps inputs. No automatic retry, dialog answers, other-panel discard or permission changes.");
                     } else {
-                        "Allow this original request once, including clean inputs. Execution follows local reply delivery and final input, document and invocation checks. Native failure can leave partial effects, reported in editor state. No automatic retry."
-                    });
-                    ui.label("This does not apply edits, save, change undo, answer dialogs or discard other panels' inputs. Retained input contents are not disclosed.");
+                        ui.label(if matches!(&target.input, PanelDiscardInput::Flip(_)) {
+                            "Allow this original request once. Execution follows local reply delivery and final input, document and invocation checks. Only this captured owner is cancelled. No automatic retry."
+                        } else {
+                            "Allow this original request once, including clean inputs. Execution follows local reply delivery and final input, document and invocation checks. Native failure can leave partial effects, reported in editor state. No automatic retry."
+                        });
+                        ui.label("This does not apply edits, save, change undo, answer dialogs or discard other panels' inputs. Retained input contents are not disclosed.");
+                    }
                 },
                 ApprovalTarget::Settings(Some(path)) => { ui.label(format!("Settings file: {}", path.display())); },
                 ApprovalTarget::Output(path) => {
@@ -1090,22 +1121,25 @@ pub(crate) enum PanelDiscardInput {
     Forms(crate::editor_live2d_forms::FormsDiscardTarget),
     Motion3(crate::editor_motion3::Motion3DiscardTarget),
     Flip(crate::editor_windows::FlipCancelTarget),
+    FlipOperation(crate::editor_windows::FlipOperationTarget),
 }
 
 impl PanelDiscardInput {
     pub(crate) fn action(&self) -> &'static str {
-        match self { Self::Forms(input) => input.action().name(), Self::Motion3(input) => input.action().name(), Self::Flip(_) => "cancel" }
+        match self { Self::Forms(input) => input.action().name(), Self::Motion3(input) => input.action().name(),
+            Self::Flip(_) => "cancel", Self::FlipOperation(input) => input.operation.name() }
     }
     fn review_label(&self) -> &str {
         match self { Self::Forms(input) => input.review_label(), Self::Motion3(input) => input.review_label(),
-            Self::Flip(_) => "the captured retained Flip Pairing window" }
+            Self::Flip(_) => "the captured retained Flip Pairing window", Self::FlipOperation(_) => "the captured Flip Pairing view" }
     }
     pub(crate) fn result_key(&self) -> &'static str {
-        match self { Self::Forms(_) => "live2dFormDiscard", Self::Motion3(_) => "motion3Discard", Self::Flip(_) => "flipPairingCancel" }
+        match self { Self::Forms(_) => "live2dFormDiscard", Self::Motion3(_) => "motion3Discard",
+            Self::Flip(_) => "flipPairingCancel", Self::FlipOperation(_) => "flipPairingOperation" }
     }
     pub(crate) fn lane_name(&self) -> &'static str {
         match self {
-            Self::Forms(_) => "forms", Self::Flip(_) => "flip",
+            Self::Forms(_) => "forms", Self::Flip(_) | Self::FlipOperation(_) => "flip",
             Self::Motion3(input) => match input.action() {
                 soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
                 | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => "point",
@@ -1119,6 +1153,7 @@ impl PanelDiscardInput {
         match self {
             Self::Forms(_) => 0,
             Self::Flip(_) => 4,
+            Self::FlipOperation(_) => 5,
             Self::Motion3(input) => match input.action() {
                 soul2d_core::editor_controller::Motion3InputAction::DiscardPoint
                 | soul2d_core::editor_controller::Motion3InputAction::ReloadPoint => 1,
@@ -3446,8 +3481,16 @@ mod tests {
             .unwrap()["identity"].as_str().unwrap();
         let motion_input = PanelDiscardInput::Motion3(motion.capture_discard_target(Motion3InputAction::ReloadPoint,
             motion_identity, motion_controller.snapshot()).unwrap());
-        let variants = [(input.clone(), document.clone()), (flip, document.clone()), (motion_input, ObjectDiscardDocument {
+        let mut variants = vec![(input.clone(), document.clone()), (flip, document.clone()), (motion_input, ObjectDiscardDocument {
             revision:motion_controller.snapshot()["revision"].as_u64().unwrap(), path:None})];
+        for operation in [FlipOperation::Open,FlipOperation::Read {offset:0,max_bytes:1},
+            FlipOperation::Edit(soul2d_core::editor_controller::FlipEdit::Pair),FlipOperation::Save] {
+            let expected=windows.flip_view_identity().unwrap();
+            let capture=windows.capture_flip_operation(&expected,operation).unwrap();
+            let value=PanelDiscardInput::FlipOperation(capture);
+            assert_eq!((value.lane(),value.lane_name(),value.result_key()),(5,"flip","flipPairingOperation"));
+            variants.push((value,document.clone()));
+        }
         let (mut panel, _agent, _) = active_panel_endpoint();
         panel.sync_approval();
         let run = panel.run.as_mut().unwrap();
@@ -3480,9 +3523,11 @@ mod tests {
         approval.invocation = Some(AcpInvocation { run:run.id, prompt, permissions:permissions + 1, call:1 });
         let changed_permissions = PanelDiscardTarget::new(variants[1].0.clone(), variants[1].1.clone(), Some(approval)).unwrap();
         assert!(approval.reserve_input_discard(&changed_permissions, false).unwrap_err().contains("occurrence_consumed"));
-        approval.invocation.as_mut().unwrap().call = 257;
-        let overflow = PanelDiscardTarget::new(variants[2].0.clone(), variants[2].1.clone(), Some(approval)).unwrap();
-        assert!(approval.reserve_input_discard(&overflow, false).unwrap_err().contains("occurrence_capacity"));
+        for (index,(input,document)) in variants.iter().enumerate() {
+            approval.invocation.as_mut().unwrap().call = 257 + index as u64;
+            let overflow = PanelDiscardTarget::new(input.clone(),document.clone(),Some(approval)).unwrap();
+            assert!(approval.reserve_input_discard(&overflow,false).unwrap_err().contains("occurrence_capacity"));
+        }
         assert_eq!(approval.input_occurrences.len(), 256);
         assert_eq!(approval.input_occurrences[0].call, 1);
         approval.input_context = None;

@@ -29,6 +29,11 @@ impl Default for InputEpochs {
 }
 
 impl InputEpochs {
+    pub(crate) fn try_next(&mut self) -> Option<InputEpoch> {
+        self.generation = self.generation.checked_add(1)?;
+        (self.generation != u64::MAX).then_some(InputEpoch(self.generation))
+    }
+
     pub(crate) fn next(&mut self) -> InputEpoch {
         self.generation = self.generation.saturating_add(1);
         InputEpoch(self.generation)
@@ -57,6 +62,19 @@ impl InputEpochs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_reservations_stop_before_exhaustion_and_never_reuse_a_ticket() {
+        let mut epochs = InputEpochs::default();
+        epochs.generation = u64::MAX - 2;
+        assert_eq!(epochs.try_next(), Some(InputEpoch(u64::MAX - 1)));
+        assert_eq!(epochs.try_next(), None);
+        assert_eq!(epochs.try_next(), None);
+        assert!(epochs.identity("request", &[]).is_none());
+        let mut epochs = InputEpochs::default();
+        epochs.fail_instance_for_test();
+        assert!(epochs.try_next().is_some());
+    }
 
     #[test]
     fn scoped_identity_changes_only_with_its_owners_and_action() {

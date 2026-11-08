@@ -161,6 +161,28 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "Flip Pairing > Cancel / Close window",
         "Flip Pairing > Close window",
     ]),
+    ("editor_flip_pairing_edit", &[
+        "Flip Pairing > Add as new row",
+        "Flip Pairing > Filter nodes",
+        "Flip Pairing > Filter nodes / selection / Add / patterns / Pair / assignment / Remove",
+        "Flip Pairing > Pair",
+        "Flip Pairing > Part 1 pattern",
+        "Flip Pairing > Part 2 pattern",
+        "Flip Pairing > Remove row",
+        "Flip Pairing > available node selection",
+        "Flip Pairing > row Part 1 assignment",
+        "Flip Pairing > row Part 2 assignment",
+    ]),
+    ("editor_flip_pairing_open", &[
+        "Tools > Flip Pairing",
+    ]),
+    ("editor_flip_pairing_read", &[
+        "Flip Pairing > filter, pick, raw rows and control facts",
+        "Flip Pairing > pair list display",
+    ]),
+    ("editor_flip_pairing_save", &[
+        "Flip Pairing > Save",
+    ]),
     ("editor_guides_set", &[
         "Guide Settings > Close window",
         "Viewport context menu > Guide line > Guide Settings",
@@ -297,13 +319,6 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
     ("export_video_start", &[
         "File > Import > Export > Export Video...",
         "Tools panel",
-    ]),
-    ("extdata_get", &[
-        "Tools > Flip Pairing",
-    ]),
-    ("extdata_set", &[
-        "Flip Pairing > Save",
-        "Tools > Flip Pairing",
     ]),
     ("history_clear", &[
         "History",

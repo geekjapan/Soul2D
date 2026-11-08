@@ -388,6 +388,14 @@ enum PanelDiscardOutcome {
     Forms(crate::editor_live2d_forms::FormsDiscardOutcome),
     Motion3(crate::editor_motion3::Motion3DiscardOutcome),
     FlipCancelled,
+    FlipApplied,
+    FlipOpened,
+    FlipSnapshotReady,
+    FlipSaved,
+    FlipSaveRefused,
+    FlipSaveUnknown,
+    FlipSavedOwnerRetained,
+    FlipRefusal(crate::editor_windows::FlipRefusal),
     Input(crate::editor_input_epoch::InputRefusal),
     StaleDocument,
     ConsentInvalid,
@@ -398,12 +406,27 @@ enum PanelDiscardOutcome {
     ReplyExpired,
 }
 
+enum FlipStorageAuthority<'a> { Native, Admitted(&'a crate::editor_agent::PanelDiscardTarget) }
+
+impl FlipStorageAuthority<'_> {
+    fn live(&self, agent: &crate::editor_agent::AgentPanel) -> bool {
+        match self {Self::Native=>true, Self::Admitted(target)=>agent.panel_discard_status(target,true)}
+    }
+
+    fn document(&self) -> Option<&crate::editor_agent::ObjectDiscardDocument> {
+        match self {Self::Native=>None, Self::Admitted(target)=>Some(&target.document)}
+    }
+}
+
 impl PanelDiscardOutcome {
     fn value(&self) -> Value {
         let state = match self {
             Self::Forms(outcome) => return outcome.value(),
             Self::Motion3(outcome) => return outcome.value(),
             Self::FlipCancelled => "cancelled",
+            Self::FlipApplied => "applied", Self::FlipOpened => "opened", Self::FlipSnapshotReady => "snapshot_ready",
+            Self::FlipSaved => "saved", Self::FlipSaveRefused => "save_refused", Self::FlipSaveUnknown => "save_unknown",
+            Self::FlipSavedOwnerRetained => "saved_owner_retained", Self::FlipRefusal(refusal) => refusal.state(),
             Self::Input(refusal) => refusal.state(),
             Self::StaleDocument => "stale_document", Self::ConsentInvalid => "consent_invalid",
             Self::EditorClosing => "editor_closing", Self::ReplyNotProduced => "reply_not_produced",
@@ -913,7 +936,7 @@ impl RemoteQuit {
 /// All of it is view state: nothing here reaches the document, its history or its revision.
 struct EditorView<'a> {
     object_discard: &'a mut RemoteObjectDiscard,
-    panel_discards: &'a mut [RemotePanelDiscard; 5],
+    panel_discards: &'a mut [RemotePanelDiscard; 6],
     remote_quit: &'a mut RemoteQuit,
     agent_cancel: &'a mut RemoteAgentCancel,
     agent_cancel_target: Option<crate::editor_agent::CancelTarget>,
@@ -1118,19 +1141,28 @@ impl EditorView<'_> {
                 || self.ctx.input(|input|input.viewport().close_requested()) { return Err(CLOSING_MESSAGE.into()); }
             if self.remote_quit.active() { return Err("Input discard refused: Quit is pending".into()); }
             let args = &message["params"]["arguments"];
-            let expected = args["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
-                .ok_or("expectedInputIdentity must be a nonempty string")?;
+            let expected = ||args["expectedInputIdentity"].as_str().filter(|text|!text.is_empty())
+                .ok_or("expectedInputIdentity must be a nonempty string");
             let input = match message["params"]["name"].as_str() {
                 Some("editor_live2d_forms_discard") => PanelDiscardInput::Forms(self.forms.capture_discard_target(
                     FormsInputAction::parse(args["action"].as_str().ok_or("action must be a string")?)
-                        .ok_or("Unknown Forms input action")?, expected, controller.snapshot())
+                        .ok_or("Unknown Forms input action")?, expected()?, controller.snapshot())
                     .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
                 Some("editor_motion3_discard") => PanelDiscardInput::Motion3(self.motion3.capture_discard_target(
                     Motion3InputAction::parse(args["action"].as_str().ok_or("action must be a string")?)
-                        .ok_or("Unknown Motion3 input action")?, expected, controller.snapshot())
+                        .ok_or("Unknown Motion3 input action")?, expected()?, controller.snapshot())
                     .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
-                Some("editor_flip_pairing_cancel") => PanelDiscardInput::Flip(self.windows.capture_flip_cancel_target(expected)
+                Some("editor_flip_pairing_cancel") => PanelDiscardInput::Flip(self.windows.capture_flip_cancel_target(expected()?)
                     .map_err(|refusal|format!("Input discard refused: {}", refusal.state()))?),
+                Some(name @ ("editor_flip_pairing_open" | "editor_flip_pairing_read" | "editor_flip_pairing_edit" | "editor_flip_pairing_save")) => {
+                    let request = soul2d_core::editor_controller::FlipOperationRequest::parse(
+                        name.strip_prefix("editor_flip_pairing_").unwrap(), args)?;
+                    if controller.snapshot()["revision"].as_u64() != Some(request.expected_revision) {
+                        return Err("Flip operation refused: stale_document".into());
+                    }
+                    PanelDiscardInput::FlipOperation(self.windows.capture_flip_operation(&request.expected_view_identity, request.operation)
+                        .map_err(|refusal|format!("Flip operation refused: {}", refusal.state()))?)
+                },
                 _ => return Err("Not a panel input discard request".into()),
             };
             let document = crate::editor_agent::ObjectDiscardDocument {
@@ -1141,7 +1173,8 @@ impl EditorView<'_> {
             let target = crate::editor_agent::PanelDiscardTarget::new(input, document, approval)?;
             let lane = target.input.lane();
             if (lane == 3 && self.panel_discards[1..3].iter().any(RemotePanelDiscard::pending))
-                || ((lane == 1 || lane == 2) && self.panel_discards[3].pending()) {
+                || ((lane == 1 || lane == 2) && self.panel_discards[3].pending())
+                || (lane == 4 && self.panel_discards[5].pending()) || (lane == 5 && self.panel_discards[4].pending()) {
                 return Err("Input discard already pending in an overlapping scope; read editor state".into());
             }
             match &self.panel_discards[lane] {
@@ -1269,7 +1302,8 @@ impl EditorView<'_> {
             || (message["method"] == "tools/call" && message["params"]["name"].as_str()
                 .is_some_and(|name| soul2d_core::manifest::effect_of(name) == Some("-")));
         let is_panel_discard = matches!(message["params"]["name"].as_str(),
-            Some("editor_live2d_forms_discard" | "editor_motion3_discard" | "editor_flip_pairing_cancel"));
+            Some("editor_live2d_forms_discard" | "editor_motion3_discard" | "editor_flip_pairing_cancel"
+                | "editor_flip_pairing_open" | "editor_flip_pairing_read" | "editor_flip_pairing_edit" | "editor_flip_pairing_save"));
         if !is_quit && !read_only && !is_panel_discard { self.remote_quit.cancel("new_operation"); }
         if self.remote_quit.active() {
             let changed = match &*self.remote_quit {
@@ -1319,7 +1353,8 @@ impl EditorView<'_> {
         let response = controller.mcp_request_with_prepared(message, matches!(&origin, McpOrigin::Agent(_)), &mut |call, prepared| {
             attachment_request |= matches!(call["op"].as_str(), Some("live2d.model.attach" | "live2d.animation.attach"));
             if let McpOrigin::Agent(approval) = &mut origin {
-                if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) {
+                if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel"
+                    | "editor.flip_pairing.open" | "editor.flip_pairing.read" | "editor.flip_pairing.edit" | "editor.flip_pairing.save")) {
                     let target = panel_discard_target.clone()?;
                     approval.reserve_input_discard(&target, panel_discard_continuing)?;
                     return approval.guard(call, Ok(crate::editor_agent::ApprovalTarget::PanelDiscard(target)), None);
@@ -1517,7 +1552,8 @@ impl EditorView<'_> {
                 send_receipt = Some((sender, admitted.clone()));
                 return Ok(admitted);
             }
-            if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel")) {
+            if matches!(call["op"].as_str(), Some("editor.live2d.forms.discard" | "editor.motion3.discard" | "editor.flip_pairing.cancel"
+                | "editor.flip_pairing.open" | "editor.flip_pairing.read" | "editor.flip_pairing.edit" | "editor.flip_pairing.save")) {
                 let target = panel_discard_target.clone()?;
                 let lane = target.input.lane();
                 let attempt = if target.invocation().is_some() {
@@ -1526,10 +1562,31 @@ impl EditorView<'_> {
                         _ => return Err("The original input discard review is no longer valid".into()),
                     }
                 } else { self.panel_discards[lane].attempt().checked_add(1).ok_or("Input discard attempt identity exhausted")? };
-                let (sender, receipt) = sync_channel(1);
                 let action = target.input.action();
                 let key = target.input.result_key();
                 let lane_name = target.input.lane_name();
+                if let crate::editor_agent::PanelDiscardInput::FlipOperation(input) = &target.input {
+                    if let soul2d_core::editor_controller::FlipOperation::Read {offset, max_bytes} = input.operation {
+                        if *self.closing || self.ctx.input(|input|input.viewport().close_requested()) {
+                            return Err(CLOSING_MESSAGE.into());
+                        }
+                        if controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
+                            || controller.project_path() != target.document.path.as_deref() {
+                            return Err("Flip read refused: stale_document".into());
+                        }
+                        let page = self.windows.flip_content_page(&input.view, offset, max_bytes);
+                        self.panel_discards[lane] = RemotePanelDiscard::Finished {attempt, action,
+                            outcome:match &page {Ok(_)=>PanelDiscardOutcome::FlipSnapshotReady,
+                                Err(refusal)=>PanelDiscardOutcome::FlipRefusal(*refusal)}};
+                        return page.map(|page|json!({"flipPairingContent":{
+                            "asOf":{"revision":target.document.revision,"viewIdentity":input.view.identity()},
+                            "encoding":"base64-json-utf8","offset":offset,"nextOffset":page.next_offset,"done":page.done,
+                            "base64":base64::engine::general_purpose::STANDARD.encode(page.bytes)},
+                            "flipPairingOperation":self.panel_discards[lane].state()}))
+                            .map_err(|refusal|format!("Flip read refused: {}", refusal.state()));
+                    }
+                }
+                let (sender, receipt) = sync_channel(1);
                 self.panel_discards[lane] = RemotePanelDiscard::Waiting { attempt, target, receipt,
                     deadline:Instant::now() + OBJECT_DISCARD_REPLY_TIMEOUT };
                 let admitted = json!({key:{"state":"admitted", "action":action, "lane":lane_name, "attempt":attempt,
@@ -1891,10 +1948,14 @@ impl EditorView<'_> {
     }
 
     fn retained_document_edits(&self, snapshot: &Value) -> bool {
+        self.other_retained_document_edits(snapshot) || self.windows.has_document_draft()
+    }
+
+    fn other_retained_document_edits(&self, snapshot: &Value) -> bool {
         self.animation_draft.has_draft() || self.timeline_value_draft.is_some()
             || self.timeline_tension_draft.is_some() || self.timeline_weight_draft.is_some() || self.form_time_draft.is_some()
             || self.sequence_panel.has_draft() || self.parameters.has_draft()
-            || self.objects.has_draft() || self.physics_groups.has_draft() || self.windows.has_document_draft()
+            || self.objects.has_draft() || self.physics_groups.has_draft()
             || self.tools.merge.planned.is_some() || !self.tools.merge.rows.is_empty()
             || self.viewport.editing() || self.parameters.values.editing_trs()
             || self.marker_at.as_ref().is_some_and(|(name, frame)| {
@@ -1908,6 +1969,21 @@ impl EditorView<'_> {
         self.refuse_under_a_dialog().err()
             .or_else(|| self.windows.quit_pending(&self.tools.store).then(|| DIALOG_PENDING_MESSAGE.to_owned()))
             .or_else(|| self.retained_document_edits(snapshot).then(|| DRAFT_BLOCKS_MESSAGE.to_owned()))
+    }
+
+    fn flip_save_refusal(&self, controller: &EditorController) -> Option<String> {
+        let snapshot = controller.snapshot();
+        if *self.closing || matches!(&*self.remote_quit, RemoteQuit::Closing(_))
+            || self.ctx.input(|input|input.viewport().close_requested()) {
+            Some(CLOSING_MESSAGE.to_owned())
+        } else if self.dialog_waits() || self.windows.other_quit_pending(&self.tools.store) {
+            Some(DIALOG_PENDING_MESSAGE.to_owned())
+        } else if controller.draft_dirty() || controller.panel_drafts || self.other_retained_document_edits(snapshot)
+            || self.mesh_tools.editing() || self.depth_tools.editing() || self.tool_edits()
+            || (snapshot["partSplit"]["open"] == true && snapshot["partSplit"]["applied"] != true)
+            || self.psd_depth_open || snapshot["deformPending"] == true {
+            Some(DRAFT_BLOCKS_MESSAGE.to_owned())
+        } else { None }
     }
 
     /// Runs one `editor.*` request (arguments already checked for shape by `mcp.rs`) and answers with the
@@ -2573,6 +2649,8 @@ impl EditorView<'_> {
         state["flipPairingInputs"] = json!({"open":flip.open, "dirty":flip.dirty, "pendingRead":flip.pending_read,
             "cancel":{"nativeAvailable":flip.open, "discardable":flip.identity.is_some(), "identity":flip.identity}});
         state["flipPairingCancel"] = self.panel_discards[4].state();
+        state["flipPairingView"] = json!({"identity":self.windows.flip_view_identity()});
+        state["flipPairingOperation"] = self.panel_discards[5].state();
         state
     }
 }
@@ -2603,7 +2681,7 @@ pub struct EditorApp {
     agent_start: RemoteAgentLaunch,
     agent_new_session: RemoteAgentLaunch,
     object_discard: RemoteObjectDiscard,
-    panel_discards: [RemotePanelDiscard; 5],
+    panel_discards: [RemotePanelDiscard; 6],
     agent_draft: RemoteAgentDraft,
     agent_send: RemoteAgentSend,
     #[cfg(test)]
@@ -3218,6 +3296,7 @@ impl EditorApp {
                 crate::editor_agent::PanelDiscardInput::Forms(input) => self.forms.check_discard_target(input, self.controller.snapshot()),
                 crate::editor_agent::PanelDiscardInput::Motion3(input) => self.motion3.check_discard_target(input, self.controller.snapshot()),
                 crate::editor_agent::PanelDiscardInput::Flip(input) => self.windows.check_flip_cancel_target(input),
+                crate::editor_agent::PanelDiscardInput::FlipOperation(input) => self.windows.check_flip_view(&input.view),
             };
             let mut failure = if self.controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
                 || self.controller.project_path() != target.document.path.as_deref() { Some(PanelDiscardOutcome::StaleDocument) }
@@ -3251,12 +3330,59 @@ impl EditorApp {
                         .map(PanelDiscardOutcome::Motion3),
                     crate::editor_agent::PanelDiscardInput::Flip(input) => self.windows.cancel_flip_if_current(input)
                         .map(|()|PanelDiscardOutcome::FlipCancelled),
+                    crate::editor_agent::PanelDiscardInput::FlipOperation(input) => Ok(self.execute_flip_operation(ctx, &target, input)),
                 };
                 self.sync_panel_drafts();
                 result.unwrap_or_else(PanelDiscardOutcome::Input)
             };
             self.agent.invalidate_panel_discard(&target, false);
             self.panel_discards[lane] = RemotePanelDiscard::Finished { attempt, action:target.input.action(), outcome };
+        }
+    }
+
+    fn execute_flip_operation(&mut self, ctx: &egui::Context, target: &crate::editor_agent::PanelDiscardTarget,
+        input: &crate::editor_windows::FlipOperationTarget) -> PanelDiscardOutcome {
+        use soul2d_core::editor_controller::FlipOperation;
+        use crate::editor_windows::{FlipOpenOrigin, FlipOpenResult, FlipRefusal, FlipSaveResult};
+        if self.closing || matches!(self.remote_quit,RemoteQuit::Closing(_))
+            || ctx.input(|input|input.viewport().close_requested()) {return PanelDiscardOutcome::EditorClosing;}
+        if self.controller.snapshot()["revision"].as_u64() != Some(target.document.revision)
+            || self.controller.project_path() != target.document.path.as_deref() {return PanelDiscardOutcome::StaleDocument;}
+        if let Err(refusal) = self.windows.check_flip_view(&input.view) {return PanelDiscardOutcome::Input(refusal);}
+        if !self.agent.panel_discard_status(target,true) {return PanelDiscardOutcome::ConsentInvalid;}
+        if !matches!(input.operation,FlipOperation::Save) && editor_view!(self,ctx).dialog_waits() {
+            return PanelDiscardOutcome::FlipRefusal(FlipRefusal::Disabled);
+        }
+        match &input.operation {
+            FlipOperation::Open => {
+                let request = self.windows.begin_flip_open(self.controller.snapshot(), self.controller.project_path(), FlipOpenOrigin::RemoteExact);
+                let result = match request {
+                    Ok(Some(request)) => self.open_flip_pairs(ctx, request, FlipStorageAuthority::Admitted(target)),
+                    Ok(None) => FlipOpenResult::Opened,
+                    Err(refusal) => FlipOpenResult::Input(refusal),
+                };
+                match result {
+                    FlipOpenResult::Opened => PanelDiscardOutcome::FlipOpened,
+                    FlipOpenResult::StaleDocument => PanelDiscardOutcome::StaleDocument,
+                    FlipOpenResult::Input(refusal) => PanelDiscardOutcome::Input(refusal),
+                    FlipOpenResult::EditorClosing => PanelDiscardOutcome::EditorClosing,
+                    FlipOpenResult::ConsentInvalid => PanelDiscardOutcome::ConsentInvalid,
+                }
+            },
+            FlipOperation::Edit(edit) => self.windows.edit_flip_if_current(ctx,&input.view,edit.clone())
+                .map(|()|PanelDiscardOutcome::FlipApplied).unwrap_or_else(PanelDiscardOutcome::FlipRefusal),
+            FlipOperation::Save => {
+                match self.windows.begin_flip_save(self.controller.snapshot(),self.controller.project_path()) {
+                    Ok(request) => match self.save_flip_pairs(ctx,request,FlipStorageAuthority::Admitted(target)) {
+                        FlipSaveResult::Saved => PanelDiscardOutcome::FlipSaved,
+                        FlipSaveResult::Refused => PanelDiscardOutcome::FlipSaveRefused,
+                        FlipSaveResult::Unknown => PanelDiscardOutcome::FlipSaveUnknown,
+                        FlipSaveResult::SavedOwnerRetained => PanelDiscardOutcome::FlipSavedOwnerRetained,
+                    },
+                    Err(refusal) => PanelDiscardOutcome::Input(refusal),
+                }
+            },
+            FlipOperation::Read {..} => PanelDiscardOutcome::FlipRefusal(FlipRefusal::InvalidTarget),
         }
     }
 
@@ -8093,6 +8219,8 @@ impl EditorApp {
                 self.preview_dirty = true;
                 self.windows.deliver(target, response);
             }
+            Request::FlipRead(request) => { self.open_flip_pairs(ctx, request, FlipStorageAuthority::Native); }
+            Request::FlipSave(request) => { self.save_flip_pairs(ctx, request, FlipStorageAuthority::Native); }
             Request::SetLanguage(code) => {
                 if let Err(error) = self.tools.set_language(&code) {
                     self.notice = error;
@@ -8113,6 +8241,97 @@ impl EditorApp {
             Request::OpenPsdDepth => self.psd_depth.open(),
             Request::Notice(message) => self.notice = message,
         }
+    }
+
+    fn open_flip_pairs(&mut self, ctx: &egui::Context, request: crate::editor_windows::FlipReadRequest, authority: FlipStorageAuthority<'_>)
+        -> crate::editor_windows::FlipOpenResult {
+        use crate::editor_agent::ObjectDiscardDocument;
+        use crate::editor_windows::{FlipOpenResult, FlipReadAnswer, FLIP_CONFIG_KEY};
+        if self.closing || matches!(self.remote_quit, RemoteQuit::Closing(_))
+            || ctx.input(|input|input.viewport().close_requested()) {
+            self.windows.abort_flip_read(request);
+            return FlipOpenResult::EditorClosing;
+        }
+        let before = ObjectDiscardDocument {revision:self.controller.snapshot()["revision"].as_u64().expect("host snapshot revision"),
+            path:self.controller.project_path().map(Path::to_owned)};
+        if !authority.live(&self.agent) {
+            self.windows.abort_flip_read(request);
+            return FlipOpenResult::ConsentInvalid;
+        }
+        if authority.document().is_some_and(|document|document != &before) {
+            self.windows.abort_flip_read(request);
+            return FlipOpenResult::StaleDocument;
+        }
+        if let Err(result) = self.windows.check_flip_read(&request, &before) {
+            self.windows.abort_flip_read(request);
+            return result;
+        }
+        let response = self.controller.core_request(&json!({"op":"extdata.get", "key":FLIP_CONFIG_KEY}));
+        let result = &response["result"];
+        let answer = if response["succeeded"] != true {
+            FlipReadAnswer::Failed(response["message"].as_str().unwrap_or("The endpoint sent no usable response").to_owned())
+        } else if result["key"] != FLIP_CONFIG_KEY || !result["present"].is_boolean() {
+            FlipReadAnswer::Failed("The endpoint sent an unexpected Flip data result".into())
+        } else if result["present"] == false { FlipReadAnswer::Stored(None) }
+        else {
+            match result["base64"].as_str().ok_or_else(||"the stored data is missing".to_owned())
+                .and_then(|text|base64::engine::general_purpose::STANDARD.decode(text)
+                    .map_err(|error|format!("not valid base64: {error}"))) {
+                Ok(bytes) => FlipReadAnswer::Stored(Some(bytes)),
+                Err(error) => FlipReadAnswer::Unreadable(error),
+            }
+        };
+        let after = ObjectDiscardDocument {revision:self.controller.snapshot()["revision"].as_u64().expect("host snapshot revision"),
+            path:self.controller.project_path().map(Path::to_owned)};
+        if !authority.live(&self.agent) {
+            self.windows.abort_flip_read(request);
+            return FlipOpenResult::ConsentInvalid;
+        }
+        self.windows.finish_flip_read(request, &after, answer)
+    }
+
+    fn save_flip_pairs(&mut self, ctx: &egui::Context, request: crate::editor_windows::FlipSaveRequest, authority: FlipStorageAuthority<'_>)
+        -> crate::editor_windows::FlipSaveResult {
+        use crate::editor_agent::ObjectDiscardDocument;
+        use crate::editor_windows::{FlipWriteAnswer, FLIP_CONFIG_KEY};
+        self.sync_panel_drafts();
+        let before = ObjectDiscardDocument {revision:self.controller.snapshot()["revision"].as_u64().expect("host snapshot revision"),
+            path:self.controller.project_path().map(Path::to_owned)};
+        let refusal = if !authority.live(&self.agent) {
+            Some("The original Flip Save invocation is no longer live".to_owned())
+        } else if request.document() != &before || authority.document().is_some_and(|document|document != &before) {
+            Some("The document changed before Flip pairs could be saved".to_owned())
+        } else if !self.windows.check_flip_save(&request) {
+            Some("The Flip inputs changed before they could be saved".to_owned())
+        } else { editor_view!(self, ctx).flip_save_refusal(&self.controller) };
+        let answer = if let Some(message) = refusal { FlipWriteAnswer::Refused(message) } else {
+            let payload = request.payload();
+            let response = self.controller.core_request(&json!({"op":"extdata.set", "key":FLIP_CONFIG_KEY,
+                "base64":payload.map(|bytes|base64::engine::general_purpose::STANDARD.encode(bytes))}));
+            let unchanged = self.controller.snapshot()["revision"].as_u64() == Some(before.revision)
+                && self.controller.project_path() == before.path.as_deref();
+            let answer = flip_save_answer(&response,payload,unchanged);
+            if matches!(answer,FlipWriteAnswer::Saved {..}) {self.preview_dirty=true;}
+            answer
+        };
+        let after = ObjectDiscardDocument {revision:self.controller.snapshot()["revision"].as_u64().expect("host snapshot revision"),
+            path:self.controller.project_path().map(Path::to_owned)};
+        let disposal_allowed = authority.live(&self.agent) && editor_view!(self, ctx).flip_save_refusal(&self.controller).is_none();
+        let receipt = request.completed(before, after.clone(), answer);
+        self.windows.finish_flip_save(receipt, &after, disposal_allowed)
+    }
+}
+
+fn flip_save_answer(response: &Value, payload: Option<&[u8]>, document_unchanged: bool) -> crate::editor_windows::FlipWriteAnswer {
+    use crate::editor_windows::{FlipWriteAnswer, FLIP_CONFIG_KEY};
+    let result=&response["result"];
+    match response["succeeded"].as_bool() {
+        Some(true) if result["key"]==FLIP_CONFIG_KEY && result["present"]==payload.is_some()
+            && result["bytes"].as_u64()==Some(payload.map_or(0,|bytes|bytes.len()) as u64)
+            && result["changed"].as_bool().is_some()=>FlipWriteAnswer::Saved {changed:result["changed"].as_bool().unwrap()},
+        Some(false) if document_unchanged=>FlipWriteAnswer::Refused(
+            response["message"].as_str().unwrap_or("The document refused the write").to_owned()),
+        _=>FlipWriteAnswer::Unknown,
     }
 }
 
@@ -21218,6 +21437,1240 @@ mod editor_state_tests {
         (app, harness)
     }
 
+    #[test]
+    fn flip_open_absent_capture_cannot_replace_a_competing_native_owner_or_revive_after_open_close_aba() {
+        use crate::editor_test_support::center;
+        use egui::accesskit::Role;
+        let (mut app,mut harness)=flip_cancel_app("flip-open-absent-native-aba",false);
+        let mut frame=eframe::Frame::_new_kittest();
+        harness.click_in_window("Flip Pairing",Role::Button,"Cancel",|ctx|app.update(ctx,&mut frame));
+        assert!(!app.windows.flip_input_state().open);
+        let absent=app.windows.flip_view_identity();
+        let output=harness.click(Role::Button,"Tools",|ctx|app.update(ctx,&mut frame));
+        let at=center(&output,Role::Button,"Flip Pairing");
+        let message=flip_operation_message(&mut app,"open",json!({}));
+        let snapshot=app.controller.snapshot().clone();
+        let source=app.controller.project_path().unwrap().to_owned();
+        let bytes=std::fs::read(&source).unwrap();
+        request_panel_discard(&mut app,&message).write_line(&mut Vec::new()).unwrap();
+        harness.frame(vec![egui::Event::PointerMoved(at),egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,
+            pressed:true,modifiers:egui::Modifiers::NONE},egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,
+            pressed:false,modifiers:egui::Modifiers::NONE}],|ctx|app.update(ctx,&mut frame));
+        assert_eq!(app.panel_discards[5].state()["state"],"stale_input");
+        assert!(app.windows.flip_input_state().open);
+        assert_ne!(app.windows.flip_view_identity(),absent);
+        harness.click_in_window("Flip Pairing",Role::Button,"Cancel",|ctx|app.update(ctx,&mut frame));
+        assert!(!app.windows.flip_input_state().open);
+        assert_ne!(app.windows.flip_view_identity(),absent,"returning to absence does not restore old authority");
+        harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+        assert_eq!(app.panel_discards[5].state()["state"],"stale_input");
+        assert!(!app.windows.flip_input_state().open);
+        assert_eq!(app.controller.snapshot(),&snapshot);
+        assert_eq!(std::fs::read(source).unwrap(),bytes);
+    }
+
+    #[test]
+    fn flip_operations_post_delivery_input_document_owner_and_blocked_close_changes_never_retarget_or_revive() {
+        use crate::editor_test_support::{center,center_in_window,find};
+        use egui::accesskit::Role;
+        for operation in ["open","edit","save"] {
+            for case in ["equivalent","aba","ime","revision","path","same_path","native_cancel","native_reopen","raw_close"] {
+                let (mut app,mut harness)=flip_cancel_app(&format!("flip-op-basis-{operation}-{case}"),case != "same_path");
+                let mut frame=eframe::Frame::_new_kittest();
+                harness.text("Part 1","seed",|ctx|app.update(ctx,&mut frame));
+                let at=if case == "native_reopen" {
+                    let output=harness.click(Role::Button,"Tools",|ctx|app.update(ctx,&mut frame));
+                    Some(center(&output,Role::Button,"Flip Pairing"))
+                } else if case == "native_cancel" {
+                    harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                    let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                    Some(center_in_window(&output,"Flip Pairing",Role::Button,"Cancel"))
+                } else {None};
+                let extra=if operation == "edit" {json!({"action":"right_pattern","text":"must not replace newer work"})} else {json!({})};
+                let message=flip_operation_message(&mut app,operation,extra);
+                let source=app.controller.project_path().unwrap().to_owned();
+                let source_bytes=std::fs::read(&source).unwrap();
+                request_panel_discard(&mut app,&message).write_line(&mut Vec::new()).unwrap();
+                let select=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+                let events=match case {
+                    "equivalent"=>vec![select(true),egui::Event::Text("seed".into()),select(false)],
+                    "aba"=>vec![select(true),egui::Event::Text("changed".into()),select(false),select(true),egui::Event::Text("seed".into()),select(false)],
+                    "ime"=>vec![egui::Event::Ime(egui::ImeEvent::Enabled),egui::Event::Ime(egui::ImeEvent::Preedit("x".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),egui::Event::Ime(egui::ImeEvent::Disabled)],
+                    "native_cancel"|"native_reopen"=>{
+                        let at=at.unwrap();vec![egui::Event::PointerMoved(at),egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,
+                            pressed:true,modifiers:egui::Modifiers::NONE},egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,
+                            pressed:false,modifiers:egui::Modifiers::NONE}]
+                    },
+                    "revision"=>{call(&mut app,"node_rename",json!({"id":2,"name":"Changed after admission"}));Vec::new()},
+                    "path"=>{call(&mut app,"save",json!({"path":source.with_file_name("changed-basis.inx")}));Vec::new()},
+                    "same_path"=>{call(&mut app,"open",json!({"path":source}));Vec::new()},
+                    _=>{
+                        harness.next_input=Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                            .events.push(egui::ViewportEvent::Close)));Vec::new()
+                    },
+                };
+                let changed=app.controller.snapshot().clone();
+                let output=harness.frame(events,|ctx|app.update(ctx,&mut frame));
+                let expected=if case == "raw_close" {"editor_closing"} else if matches!(case,"revision"|"path"|"same_path") {"stale_document"} else {"stale_input"};
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"{operation} {case}");
+                if matches!(case,"equivalent"|"aba"|"ime") {
+                    assert_eq!(find(&output,Role::TextInput,"Part 1").unwrap().value(),Some("seed"));
+                    assert_eq!(find(&output,Role::TextInput,"Part 2").unwrap().value(),Some(""));
+                }
+                if case == "raw_close" {assert!(!app.closing && harness.close_requests == 0 && app.windows.has_document_draft());}
+                if case == "native_cancel" || case == "same_path" {assert!(!app.windows.flip_input_state().open);}
+                if case == "native_reopen" {assert!(app.windows.flip_input_state().open && !app.windows.flip_input_state().pending_read);}
+                assert_eq!(app.controller.snapshot(),&changed,"the stale request must not commit: {operation} {case}");
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"terminal state stays terminal: {operation} {case}");
+                assert_eq!(app.controller.snapshot(),&changed);
+                assert_eq!(std::fs::read(source).unwrap(),source_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operations_unidentified_internal_and_pending_quit_refusals_consume_no_attempt_or_input() {
+        let (mut app,_harness)=flip_cancel_app("flip-operations-refused-intake",false);
+        let snapshot=app.controller.snapshot().clone();
+        let before=app.windows.flip_view_identity();
+        let mut messages=Vec::new();
+        for (operation,extra) in [("open",json!({})),("read",json!({"offset":0,"maxBytes":1})),
+            ("edit",json!({"action":"left_pattern","text":"proposed"})),("save",json!({}))] {
+            let message=flip_operation_message(&mut app,operation,extra);
+            for id in [None,Some(Value::Null),Some(json!(false)),Some(json!(1.0)),Some(json!(1.5)),Some(json!([])),Some(json!({}))] {
+                let mut bad=message.clone(); bad.as_object_mut().unwrap().remove("id");
+                if let Some(id)=id {bad["id"]=id;}
+                if let Some(response)=request_panel_discard(&mut app,&bad).into_message() {
+                    assert!(response.get("error").is_some() || response["result"]["isError"] == true,"{response}");
+                    assert!(response["result"]["structuredContent"]["flipPairingContent"].is_null());
+                }
+                assert_eq!(app.panel_discards[5].attempt(),0);
+                assert_eq!(app.windows.flip_view_identity(),before);
+            }
+            let response=CTX.with(|ctx|editor_view!(app,ctx).mcp(&mut app.controller,&message,McpOrigin::Internal))
+                .into_message().unwrap();
+            assert_eq!(response["result"]["isError"],true);
+            assert_eq!(app.panel_discards[5].attempt(),0);
+            messages.push(message);
+        }
+        let quit=json!({"jsonrpc":"2.0","id":"quit","method":"tools/call","params":{"name":"editor_quit","arguments":{}}});
+        let pending=request_panel_discard(&mut app,&quit);
+        assert!(app.remote_quit.active());
+        for message in messages {
+            let response=request_panel_discard(&mut app,&message).into_message().unwrap();
+            assert_eq!(response["result"]["isError"],true);
+            assert!(app.remote_quit.active(),"refused Flip calls preserve pending Quit");
+            assert_eq!(app.panel_discards[5].attempt(),0);
+            assert_eq!(app.windows.flip_view_identity(),before);
+        }
+        assert_eq!(app.controller.snapshot(),&snapshot);
+        drop(pending);
+    }
+
+    #[test]
+    fn flip_operations_failed_partial_unflushed_lost_and_expired_admissions_never_execute_or_revive() {
+        struct Writer {remaining:usize,flush_fails:bool}
+        impl std::io::Write for Writer {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+                let count=bytes.len().min(self.remaining); self.remaining-=count;
+                if count == 0 {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(count)}
+            }
+            fn flush(&mut self)->std::io::Result<()> {
+                if self.flush_fails {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(())}
+            }
+        }
+        for operation in ["open","edit","save"] {
+            for case in ["failed","partial","flush","lost","expired","into_message"] {
+                let (mut app,mut harness)=flip_cancel_app(&format!("flip-operation-reply-{operation}-{case}"),true);
+                let extra=if operation == "edit" {json!({"action":"left_pattern","text":"new input"})} else {json!({})};
+                let message=flip_operation_message(&mut app,operation,extra);
+                let before=app.windows.flip_view_identity();
+                let snapshot=app.controller.snapshot().clone();
+                let source=app.controller.project_path().unwrap().to_owned();
+                let bytes=std::fs::read(&source).unwrap();
+                let reply=request_panel_discard(&mut app,&message);
+                let late=match case {
+                    "failed"|"partial"|"flush"=>{
+                        assert!(reply.write_line(&mut Writer {remaining:if case == "flush" {usize::MAX} else if case == "partial" {3} else {0},
+                            flush_fails:case == "flush"}).is_err()); None
+                    },
+                    "lost"=>{drop(reply);None},
+                    "into_message"=>{let _=reply.into_message();None},
+                    _=>{let RemotePanelDiscard::Waiting {deadline,..}=&mut app.panel_discards[5] else {panic!("admission expected")};
+                        *deadline=Instant::now()-Duration::from_millis(1);Some(reply)},
+                };
+                let mut frame=eframe::Frame::_new_kittest();
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                let expected=match case {"failed"|"partial"|"flush"=>"reply_failed","expired"=>"reply_expired",_=>"reply_lost"};
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"{operation} {case}");
+                if let Some(reply)=late {reply.write_line(&mut Vec::new()).unwrap();}
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"no terminal revival: {operation} {case}");
+                assert_eq!(app.windows.flip_view_identity(),before,"{operation} {case}");
+                assert!(app.windows.has_document_draft());
+                assert_eq!(app.controller.snapshot(),&snapshot);
+                assert_eq!(std::fs::read(source).unwrap(),bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operations_native_save_after_delivered_cancel_retires_it_even_when_the_save_is_refused() {
+        use crate::editor_test_support::center_in_window;
+        use egui::accesskit::Role;
+        for case in ["core_refusal","sibling_refusal","success"] {
+            let (mut app,mut harness)=if case == "core_refusal" {
+                let (mut app,mut harness)=panel_discard_app("flip-save-cancel-core-refusal",true,false);
+                app.tools.store.set("firstrun_complete",true).unwrap();
+                app.tools.store.set("hasDoneQuickSetup",true).unwrap();
+                let mut frame=eframe::Frame::_new_kittest();
+                harness.click(Role::Button,"Tools",|ctx|app.update(ctx,&mut frame));
+                harness.click(Role::Button,"Flip Pairing",|ctx|app.update(ctx,&mut frame));
+                (app,harness)
+            } else {flip_cancel_app(&format!("flip-save-cancel-{case}"),true)};
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.text("Part 1","retained through failed native Save",|ctx|app.update(ctx,&mut frame));
+            if case == "sibling_refusal" {app.timeline_weight_draft=Some(("Other retained input".into(),0.4));}
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            let output=harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            let at=center_in_window(&output,"Flip Pairing",Role::Button,"Save");
+            let before=app.windows.flip_input_state().identity;
+            let snapshot=app.controller.snapshot().clone();
+            let source=app.controller.project_path().unwrap().to_owned();
+            let bytes=std::fs::read(&source).unwrap();
+            let message=flip_cancel_message(&app);
+            request_panel_discard(&mut app,&message).write_line(&mut Vec::new()).unwrap();
+            let press=|pressed|egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed,modifiers:egui::Modifiers::NONE};
+            harness.frame(vec![egui::Event::PointerMoved(at),press(true),press(false)],|ctx|app.update(ctx,&mut frame));
+            let expected=if case == "success" {"stale_document"} else {"stale_input"};
+            assert_eq!(app.panel_discards[4].state()["state"],expected,"{case}");
+            if case == "success" {assert!(!app.windows.flip_input_state().open);}
+            else {
+                assert!(app.windows.flip_input_state().open,"old Cancel cannot dispose failed Save inputs: {case}");
+                assert_ne!(app.windows.flip_input_state().identity,before);
+                assert_eq!(app.controller.snapshot(),&snapshot);
+            }
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(app.panel_discards[4].state()["state"],expected,"no revival: {case}");
+            assert_eq!(std::fs::read(source).unwrap(),bytes);
+        }
+    }
+
+    #[test]
+    fn flip_save_core_acknowledgement_adapter_fails_unknown_for_missing_malformed_or_inconsistent_answers() {
+        use crate::editor_windows::{FlipWriteAnswer,FLIP_CONFIG_KEY};
+        for payload in [None,Some(b"owned payload".as_slice())] {
+            let positive=json!({"succeeded":true,"result":{"key":FLIP_CONFIG_KEY,"present":payload.is_some(),
+                "bytes":payload.map_or(0,|bytes|bytes.len()),"changed":true}});
+            for changed in [false,true] {
+                let mut response=positive.clone(); response["result"]["changed"]=json!(changed);
+                assert!(matches!(flip_save_answer(&response,payload,!changed),FlipWriteAnswer::Saved {changed:actual} if actual==changed));
+            }
+            let mut bad=vec![Value::Null,json!({}),json!({"succeeded":true}),json!({"succeeded":"true"}),
+                json!({"succeeded":null}),json!({"succeeded":true,"result":null}),json!({"succeeded":true,"result":[]})];
+            for field in ["key","present","bytes","changed"] {
+                let mut missing=positive.clone(); missing["result"].as_object_mut().unwrap().remove(field);bad.push(missing);
+                let mut wrong_type=positive.clone();wrong_type["result"][field]=json!([]);bad.push(wrong_type);
+            }
+            for (field,value) in [("key",json!("other.key")),("present",json!(!payload.is_some())),
+                ("bytes",json!(payload.map_or(0,|bytes|bytes.len())+1)),("bytes",json!(-1)),("changed",json!("false"))] {
+                let mut inconsistent=positive.clone();inconsistent["result"][field]=value;bad.push(inconsistent);
+            }
+            for response in bad {
+                for unchanged in [false,true] {
+                    assert!(matches!(flip_save_answer(&response,payload,unchanged),FlipWriteAnswer::Unknown),"{response}");
+                }
+            }
+            let refused=json!({"succeeded":false,"message":"owned core refusal"});
+            assert!(matches!(flip_save_answer(&refused,payload,true),FlipWriteAnswer::Refused(message) if message=="owned core refusal"));
+            assert!(matches!(flip_save_answer(&refused,payload,false),FlipWriteAnswer::Unknown));
+            assert!(matches!(flip_save_answer(&json!({"succeeded":false}),payload,true),FlipWriteAnswer::Refused(message)
+                if message=="The document refused the write"));
+        }
+    }
+
+    #[test]
+    fn flip_operations_remote_save_guard_refusal_retires_old_inputs_and_preserves_dialogs_and_sibling_drafts() {
+        for case in ["dialog","sibling"] {
+            let (mut app,mut harness)=flip_cancel_app(&format!("flip-save-remote-guard-{case}"),true);
+            if case == "dialog" {app.unsaved=Some(unsaved_dialog());}
+            else {app.timeline_weight_draft=Some(("Unapplied sibling".into(),0.4));}
+            let mut frame=eframe::Frame::_new_kittest();
+            let snapshot=app.controller.snapshot().clone();
+            let before=app.windows.flip_input_state().identity;
+            let source=app.controller.project_path().unwrap().to_owned();
+            let bytes=std::fs::read(&source).unwrap();
+            let message=flip_operation_message(&mut app,"save",json!({}));
+            let reply=request_panel_discard(&mut app,&message);
+            reply.write_line(&mut Vec::new()).unwrap();
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            assert_eq!(app.panel_discards[5].state()["state"],"save_refused","{case}");
+            assert!(app.windows.flip_input_state().open && app.windows.has_document_draft());
+            assert_ne!(app.windows.flip_input_state().identity,before,"an executed Save attempt retires earlier captures even when refused: {case}");
+            if case == "dialog" {assert!(app.unsaved.is_some());}
+            else {assert_eq!(app.timeline_weight_draft,Some(("Unapplied sibling".into(),0.4)));}
+            assert_eq!(app.controller.snapshot(),&snapshot);
+            assert_eq!(std::fs::read(source).unwrap(),bytes);
+        }
+    }
+
+    #[test]
+    fn flip_operations_full_app_reply_gate_explicit_read_all_edit_actions_save_and_undo() {
+        use crate::editor_test_support::Harness;
+        let mut app = app("flip-operations-full-app-workflow");
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut harness = Harness::new();
+        harness.screen = egui::vec2(1800.0,1600.0);
+        let mut frame = eframe::Frame::_new_kittest();
+        let snapshot = app.controller.snapshot().clone();
+        let path = app.controller.project_path().unwrap().to_owned();
+        let source = std::fs::read(&path).unwrap();
+        let key = crate::editor_windows::FLIP_CONFIG_KEY;
+        let stored = app.controller.core_request(&json!({"op":"extdata.get","key":key}))["result"].clone();
+        let mutate = |app:&mut EditorApp, harness:&mut Harness, frame:&mut eframe::Frame, operation:&str, extra:Value, expected:&str| {
+            let message = flip_operation_message(app,operation,extra);
+            let view = app.windows.flip_view_identity();
+            let before = app.controller.snapshot().clone();
+            let reply = request_panel_discard(app,&message);
+            harness.frame(Vec::new(),|ctx|app.update(ctx,frame));
+            assert_eq!(app.panel_discards[5].state()["state"],"waiting_for_reply","{operation}");
+            assert_eq!(app.windows.flip_view_identity(),view,"no action before actual reply delivery: {operation}");
+            assert_eq!(app.controller.snapshot(),&before);
+            let mut bytes=Vec::new(); reply.write_line(&mut bytes).unwrap();
+            let response:Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["id"],message["id"]);
+            assert_eq!(response["result"]["isError"],false,"{response}");
+            assert_eq!(response["result"]["structuredContent"]["flipPairingOperation"]["state"],"admitted");
+            let attempt=response["result"]["structuredContent"]["flipPairingOperation"]["attempt"].clone();
+            harness.frame(Vec::new(),|ctx|app.update(ctx,frame));
+            assert_eq!(app.panel_discards[5].state()["state"],expected,"{operation}");
+            assert_eq!(app.panel_discards[5].state()["attempt"],attempt);
+        };
+        assert!(!app.windows.flip_input_state().open);
+        mutate(&mut app,&mut harness,&mut frame,"open",json!({}),"opened");
+        for extra in [json!({"action":"filter","text":"Face"}),json!({"action":"pick","uuid":2}),
+            json!({"action":"add"}),json!({"action":"filter","text":""}),json!({"action":"pick","uuid":1}),
+            json!({"action":"assign","row":0,"slot":2}),json!({"action":"remove","row":0}),
+            json!({"action":"pick","uuid":2}),json!({"action":"left_pattern","text":"Face"}),
+            json!({"action":"right_pattern","text":"Root"}),json!({"action":"filter","text":"no matches"}),
+            json!({"action":"pair"})] {
+            mutate(&mut app,&mut harness,&mut frame,"edit",extra,"applied");
+            assert_eq!(app.controller.snapshot(),&snapshot,"retained edits do not commit Session data");
+        }
+        let before_read=app.windows.flip_view_identity();
+        let message=flip_operation_message(&mut app,"read",json!({"offset":0,"maxBytes":16384}));
+        let reply=request_panel_discard(&mut app,&message);
+        assert_eq!(app.panel_discards[5].state()["state"],"snapshot_ready","read is produced on its original continuation");
+        let mut bytes=Vec::new(); reply.write_line(&mut bytes).unwrap();
+        let response:Value=serde_json::from_slice(&bytes).unwrap();
+        let page=&response["result"]["structuredContent"]["flipPairingContent"];
+        assert_eq!(page["asOf"]["revision"],snapshot["revision"]);
+        assert_eq!(page["asOf"]["viewIdentity"],before_read.clone().unwrap());
+        assert_eq!(page["encoding"],"base64-json-utf8");
+        assert_eq!(page["done"],true);
+        let content:Value=serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(page["base64"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(content["rows"][0]["parts"],json!([2,1]));
+        assert_eq!(content["picked"],2);
+        assert_eq!(content["controls"]["add"],false);
+        assert_eq!(app.windows.flip_view_identity(),before_read,"explicit read does not allocate input epochs");
+        assert_eq!(app.controller.snapshot(),&snapshot);
+        mutate(&mut app,&mut harness,&mut frame,"edit",json!({"action":"assign","row":0,"slot":1}),"applied");
+        mutate(&mut app,&mut harness,&mut frame,"save",json!({}),"saved");
+        assert!(!app.windows.flip_input_state().open);
+        assert_eq!(app.controller.snapshot()["revision"],snapshot["revision"].as_u64().unwrap()+1);
+        let saved=app.controller.core_request(&json!({"op":"extdata.get","key":key}));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(saved["result"]["base64"].as_str().unwrap()).unwrap(),
+            br#"[{"uuid1":2,"uuid2":1}]"#);
+        assert_eq!(std::fs::read(&path).unwrap(),source);
+        assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"],true);
+        assert_eq!(app.controller.core_request(&json!({"op":"extdata.get","key":key}))["result"],stored);
+        assert_eq!(std::fs::read(path).unwrap(),source);
+    }
+
+    fn flip_operation_message(app:&mut EditorApp, operation:&str, extra:Value) -> Value {
+        let state=state(app);
+        let mut arguments=json!({"expectedRevision":state["document"]["revision"],
+            "expectedViewIdentity":state["flipPairingView"]["identity"]});
+        arguments.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        json!({"jsonrpc":"2.0","id":format!("flip-{operation}"),"method":"tools/call",
+            "params":{"name":format!("editor_flip_pairing_{operation}"),"arguments":arguments}})
+    }
+
+    #[test]
+    fn flip_operations_actual_process_stdin_stdout_workflow_and_native_sibling_clear() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        use std::io::{BufRead,BufReader,Write};
+        const MODE: &str="SOUL2D_FLIP_STDIO_TEST_PROCESS";
+        const CLEARED: &str="SOUL2D_TEST_NATIVE_SIBLING_CLEARED";
+        if std::env::var(MODE).as_deref()==Ok("owned-child-v1") {
+            let mut app=app("flip-real-process-stdio");
+            app.tools.store.set("firstrun_complete",true).unwrap();
+            app.tools.store.set("hasDoneQuickSetup",true).unwrap();
+            app.tools.store.set("Outline.visible",true).unwrap();
+            let mut harness=Harness::new();harness.screen=egui::vec2(1800.0,1600.0);
+            let mut frame=eframe::Frame::_new_kittest();
+            let source=app.controller.project_path().unwrap().to_owned();
+            let source_bytes=std::fs::read(&source).unwrap();
+            let snapshot=app.controller.snapshot().clone();
+            app.parameters.edit=Some(ParameterEditDraft::new(10,"Blink".into(),AxesDraft::read(&snapshot["model"]["param"][0])));
+            harness.click_in_window("Edit parameter",Role::TextInput,"Name",|ctx|app.update(ctx,&mut frame));
+            let select=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+            harness.frame(vec![select(true),egui::Event::Text("Private process sibling".into()),select(false)],|ctx|app.update(ctx,&mut frame));
+            assert!(app.parameters.has_draft());
+            app.host_rx=Some(editor_stdio::spawn_stdin(&harness.ctx));
+            let deadline=Instant::now()+Duration::from_secs(30);
+            let mut cleared=false;
+            while harness.close_requests==0 {
+                assert!(Instant::now()<deadline,"owned stdio process did not complete");
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                if !cleared {
+                    assert!(app.parameters.has_draft());
+                    assert_eq!(app.parameters.edit.as_ref().unwrap().name,"Private process sibling");
+                    assert_eq!(app.controller.snapshot(),&snapshot);
+                    if app.panel_discards[5].state()["state"]=="save_refused" {
+                        let view=app.windows.flip_view_identity();
+                        harness.click_in_window("Edit parameter",Role::Button,"Close window",|ctx|app.update(ctx,&mut frame));
+                        assert!(app.parameters.edit.is_none() && !app.parameters.has_draft());
+                        assert_eq!(app.windows.flip_view_identity(),view);
+                        cleared=true;
+                        eprintln!("{CLEARED}");
+                    }
+                }
+                assert_eq!(std::fs::read(&source).unwrap(),source_bytes);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(cleared && !app.windows.flip_input_state().open);
+            assert!(!app.parameters.has_draft());
+            assert!(app.stdin_closed && app.host_rx.is_none());
+            return;
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {let _=self.0.kill();let _=self.0.wait();}
+        }
+        let mut child=OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","editor_ui::editor_state_tests::flip_operations_actual_process_stdin_stdout_workflow_and_native_sibling_clear",
+                "--nocapture","--test-threads=1","--format=terse"])
+            .env(MODE,"owned-child-v1").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()).spawn().unwrap());
+        let mut input=child.0.stdin.take().unwrap();
+        let output=child.0.stdout.take().unwrap();
+        let errors=child.0.stderr.take().unwrap();
+        let (cleared_send,cleared_receive)=sync_channel(1);
+        let errors=std::thread::spawn(move || {
+            let mut output=String::new();
+            for line in BufReader::new(errors).lines() {
+                let line=line.unwrap();
+                if line==CLEARED {cleared_send.send(()).unwrap();}
+                else {eprintln!("owned stdio child stderr: {line}");output.push_str(&line);output.push('\n');}
+            }
+            output
+        });
+        let (sender,receive)=std::sync::mpsc::channel();
+        let output=std::thread::spawn(move || {
+            let mut reader=BufReader::new(output);let mut harness_output=String::new();
+            loop {
+                let mut line=String::new();if reader.read_line(&mut line).unwrap()==0 {break;}
+                if let Ok(reply)=serde_json::from_str::<Value>(&line) {
+                    if reply["jsonrpc"]=="2.0" {assert!(line.ends_with('\n'));sender.send(reply).unwrap();continue;}
+                }
+                eprint!("owned stdio child: {line}");
+                harness_output.push_str(&line);
+            }
+            harness_output
+        });
+        let mut counter=0;
+        let mut rpc=|method:&str,params:Value| {
+            counter+=1;let id=format!("owned-process-stdio-{counter}");
+            let request=json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+            writeln!(input,"{request}").unwrap();input.flush().unwrap();
+            let reply=receive.recv_timeout(Duration::from_secs(10)).expect("response over actual child stdout");
+            assert_eq!(reply["id"],id);assert!(reply.get("error").is_none(),"{reply}");
+            assert_ne!(reply["result"]["isError"],true,"{reply}");reply["result"].clone()
+        };
+        let state=rpc("resources/read",json!({"uri":STATE}));
+        let state:Value=serde_json::from_str(state["contents"][0]["text"].as_str().unwrap()).unwrap();
+        let source=PathBuf::from(state["document"]["path"].as_str().unwrap());
+        let source_bytes=std::fs::read(&source).unwrap();
+        let key=crate::editor_windows::FLIP_CONFIG_KEY;
+        let stored=rpc("tools/call",json!({"name":"extdata_get","arguments":{"key":key}}));
+        {
+            let mut perform=|operation:&str,extra:Value,expected:&str| {
+                let state=rpc("resources/read",json!({"uri":STATE}));
+                let state:Value=serde_json::from_str(state["contents"][0]["text"].as_str().unwrap()).unwrap();
+                let mut arguments=json!({"expectedRevision":state["document"]["revision"],"expectedViewIdentity":state["flipPairingView"]["identity"]});
+                arguments.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                let result=rpc("tools/call",json!({"name":format!("editor_flip_pairing_{operation}"),"arguments":arguments}));
+                let deadline=Instant::now()+Duration::from_secs(5);
+                loop {
+                    let state=rpc("resources/read",json!({"uri":STATE}));
+                    let state:Value=serde_json::from_str(state["contents"][0]["text"].as_str().unwrap()).unwrap();
+                    if state["flipPairingOperation"]["state"]==expected {break;}
+                    assert_eq!(state["flipPairingOperation"]["state"],"waiting_for_reply","{operation}: {state}");
+                    assert!(Instant::now()<deadline);
+                }
+                if operation=="save" && expected=="save_refused" {
+                    cleared_receive.recv_timeout(Duration::from_secs(5)).expect("native sibling close completed before another Save");
+                }
+                assert_eq!(std::fs::read(&source).unwrap(),source_bytes);
+                result
+            };
+            perform("open",json!({}),"opened");
+            perform("edit",json!({"action":"left_pattern","text":"Face"}),"applied");
+            perform("edit",json!({"action":"right_pattern","text":"Root"}),"applied");
+            perform("edit",json!({"action":"pair"}),"applied");
+            let page=perform("read",json!({"offset":0,"maxBytes":16384}),"snapshot_ready");
+            let content:Value=serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(
+                page["structuredContent"]["flipPairingContent"]["base64"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(content["rows"][0]["parts"],json!([2,1]));
+            perform("save",json!({}),"save_refused");
+            perform("save",json!({}),"saved");
+        }
+        let saved=rpc("tools/call",json!({"name":"extdata_get","arguments":{"key":key}}));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(saved["structuredContent"]["base64"].as_str().unwrap()).unwrap(),br#"[{"uuid1":2,"uuid2":1}]"#);
+        rpc("tools/call",json!({"name":"undo","arguments":{}}));
+        assert_eq!(rpc("tools/call",json!({"name":"extdata_get","arguments":{"key":key}}))["structuredContent"],stored["structuredContent"]);
+        rpc("tools/call",json!({"name":"redo","arguments":{}}));
+        let saved_path=source.with_file_name("owned-process-stdio-roundtrip.inx");
+        rpc("tools/call",json!({"name":"save","arguments":{"path":saved_path}}));
+        rpc("tools/call",json!({"name":"open","arguments":{"path":saved_path}}));
+        assert_eq!(rpc("tools/call",json!({"name":"extdata_get","arguments":{"key":key}}))["structuredContent"],saved["structuredContent"]);
+        assert_eq!(std::fs::read(source).unwrap(),source_bytes);
+        drop(rpc);drop(input);
+        let deadline=Instant::now()+Duration::from_secs(10);
+        let status=loop {
+            if let Some(status)=child.0.try_wait().unwrap() {break status;}
+            assert!(Instant::now()<deadline,"child did not close after real stdin EOF");std::thread::sleep(Duration::from_millis(1));
+        };
+        let output=output.join().unwrap();let errors=errors.join().unwrap();
+        assert!(status.success(),"{status}\n{errors}\n{output}");
+        assert!(output.contains("1 passed; 0 failed"),"{output}");
+    }
+
+    #[test]
+    fn flip_operations_complete_client_http_persistent_stdio_and_owned_acp_workflows_with_file_reopen() {
+        use crate::editor_test_support::{find,Harness};
+        use egui::accesskit::Role;
+        use std::io::{BufRead,BufReader,Write};
+        use std::net::{Shutdown,TcpListener,TcpStream};
+        for transport in ["http","stdio","acp"] {
+            let mut app=app(&format!("flip-operations-transport-{transport}"));
+            app.tools.store.set("firstrun_complete",true).unwrap();
+            app.tools.store.set("hasDoneQuickSetup",true).unwrap();
+            app.tools.store.set("Outline.visible",true).unwrap();
+            let mut harness=Harness::new(); harness.screen=egui::vec2(1800.0,1600.0);
+            let mut review_harness=Harness::new();
+            let mut frame=eframe::Frame::_new_kittest();
+            let source=app.controller.project_path().unwrap().to_owned();
+            let source_bytes=std::fs::read(&source).unwrap();
+            let key=crate::editor_windows::FLIP_CONFIG_KEY;
+            let stored=app.controller.core_request(&json!({"op":"extdata.get","key":key}))["result"].clone();
+            let snapshot=app.controller.snapshot().clone();
+            app.parameters.edit=Some(ParameterEditDraft::new(10,"Blink".into(),AxesDraft::read(&snapshot["model"]["param"][0])));
+            harness.click_in_window("Edit parameter",Role::TextInput,"Name",|ctx|app.update(ctx,&mut frame));
+            let select=|pressed|egui::Event::Key {key:egui::Key::A,physical_key:None,pressed,repeat:false,modifiers:egui::Modifiers::COMMAND};
+            harness.frame(vec![select(true),egui::Event::Text("Private sibling draft".into()),select(false)],|ctx|app.update(ctx,&mut frame));
+            assert!(app.parameters.has_draft());
+            assert_eq!(app.parameters.edit.as_ref().unwrap().name,"Private sibling draft");
+            assert_eq!(app.controller.snapshot(),&snapshot);
+            let mut peer=None;
+            let mut token="owned-flip-workflow-token".to_owned();
+            let mut address=None;
+            let mut stdio_client=None;
+            let mut stdio_worker=None;
+            if transport == "http" {
+                let server=McpServer::start(&McpSettings {enabled:true,host:"127.0.0.1".into(),port:0,auth:true},Some(token.clone())).unwrap();
+                address=Some(server.url().strip_prefix("http://").unwrap().trim_end_matches("/mcp").to_owned());
+                app.mcp_server=Some(server);
+            } else if transport == "acp" {
+                let (owned,owned_token)=draft_peer(&mut app); peer=Some(owned); token=owned_token;
+            } else {
+                let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+                let client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                client.set_nodelay(true).unwrap();
+                let (server,_)=listener.accept().unwrap(); server.set_nodelay(true).unwrap();
+                let (sender,receiver)=sync_channel(1); app.host_rx=Some(receiver);
+                let reader=BufReader::new(server.try_clone().unwrap());
+                stdio_worker=Some(std::thread::spawn(move ||editor_stdio::serve_lines(reader,server,&sender,&egui::Context::default())));
+                stdio_client=Some(client);
+            }
+            let mut counter=0;
+            let mut rpc=|app:&mut EditorApp,harness:&mut Harness,frame:&mut eframe::Frame,method:&str,params:Value,needs_approval:bool| {
+                counter+=1;
+                let id=format!("flip-workflow-{counter}");
+                let message=json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+                let worker=if let Some(client)=&stdio_client {
+                    let mut stream=client.try_clone().unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let id=id.clone();
+                    std::thread::spawn(move || {
+                        writeln!(stream,"{message}").unwrap(); stream.flush().unwrap();
+                        let mut line=String::new(); BufReader::new(stream).read_line(&mut line).unwrap();
+                        assert!(line.ends_with('\n'));
+                        let reply:Value=serde_json::from_str(&line).unwrap();
+                        assert_eq!(reply["id"],id); assert_eq!(reply["jsonrpc"],"2.0");
+                        assert!(reply.get("error").is_none(),"{reply}"); reply["result"].clone()
+                    })
+                } else {
+                    let stream=if transport == "acp" {draft_http(app,&token,&message)} else {
+                        let mut stream=TcpStream::connect(address.as_ref().unwrap()).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let body=message.to_string();
+                        write!(stream,"POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                        stream
+                    };
+                    let id=id.clone(); std::thread::spawn(move ||lifecycle_http_result(stream,&id))
+                };
+                let deadline=Instant::now()+Duration::from_secs(5);
+                let mut allowed=false;
+                while !worker.is_finished() || app.panel_discards[5].pending() {
+                    assert!(Instant::now()<deadline,"{transport} {method} {params}");
+                    harness.frame(Vec::new(),|ctx|app.update(ctx,frame));
+                    if transport == "acp" && needs_approval && !allowed {
+                        let path=app.tools.store_path.clone();
+                        let review=review_harness.frame(Vec::new(),|ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+                        if find(&review,Role::Button,"Allow once").is_some() {
+                            review_harness.click(Role::Button,"Allow once",|ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+                            allowed=true;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                assert_eq!(allowed,transport == "acp" && needs_approval,"original human choice: {transport} {params}");
+                let result=worker.join().unwrap();
+                assert_ne!(result["isError"],true,"{transport}: {result}");
+                result
+            };
+            for (operation,extra,expected) in [("open",json!({}),"opened"),
+                ("edit",json!({"action":"left_pattern","text":"Face"}),"applied"),
+                ("edit",json!({"action":"right_pattern","text":"Root"}),"applied"),
+                ("edit",json!({"action":"pair"}),"applied"),
+                ("read",json!({"offset":0,"maxBytes":16384}),"snapshot_ready"),
+                ("save",json!({}),"save_refused")] {
+                let result=rpc(&mut app,&mut harness,&mut frame,"resources/read",json!({"uri":STATE}),false);
+                let state:Value=serde_json::from_str(result["contents"][0]["text"].as_str().unwrap()).unwrap();
+                let mut arguments=json!({"expectedRevision":state["document"]["revision"],"expectedViewIdentity":state["flipPairingView"]["identity"]});
+                arguments.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                let result=rpc(&mut app,&mut harness,&mut frame,"tools/call",
+                    json!({"name":format!("editor_flip_pairing_{operation}"),"arguments":arguments}),true);
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"{transport}: {operation}");
+                if operation == "read" {
+                    let page=&result["structuredContent"]["flipPairingContent"];
+                    let content:Value=serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(page["base64"].as_str().unwrap()).unwrap()).unwrap();
+                    assert_eq!(content["rows"][0]["parts"],json!([2,1]));
+                } else {assert_eq!(result["structuredContent"]["flipPairingOperation"]["state"],"admitted");}
+                assert!(app.parameters.has_draft(),"Flip {operation} preserves sibling inputs: {transport}");
+                assert_eq!(app.parameters.edit.as_ref().unwrap().name,"Private sibling draft");
+                assert_eq!(app.controller.snapshot(),&snapshot,"the sibling blocks Flip Save: {transport}");
+                assert_eq!(std::fs::read(&source).unwrap(),source_bytes,"Flip operations do not write the source: {transport}");
+            }
+            let retained_before_clear=app.windows.flip_view_identity();
+            harness.click_in_window("Edit parameter",Role::Button,"Close window",|ctx|app.update(ctx,&mut frame));
+            assert!(app.parameters.edit.is_none() && !app.parameters.has_draft(),"native close clears only the sibling: {transport}");
+            assert_eq!(app.windows.flip_view_identity(),retained_before_clear);
+            assert_eq!(app.controller.snapshot(),&snapshot);
+            let state=rpc(&mut app,&mut harness,&mut frame,"resources/read",json!({"uri":STATE}),false);
+            let state:Value=serde_json::from_str(state["contents"][0]["text"].as_str().unwrap()).unwrap();
+            let result=rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"editor_flip_pairing_save",
+                "arguments":{"expectedRevision":state["document"]["revision"],"expectedViewIdentity":state["flipPairingView"]["identity"]}}),true);
+            assert_eq!(result["structuredContent"]["flipPairingOperation"]["state"],"admitted");
+            assert_eq!(app.panel_discards[5].state()["state"],"saved","a new action succeeds after native sibling close: {transport}");
+            assert!(!app.windows.flip_input_state().open);
+            let saved=rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"extdata_get","arguments":{"key":key}}),false);
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(saved["structuredContent"]["base64"].as_str().unwrap()).unwrap(),br#"[{"uuid1":2,"uuid2":1}]"#);
+            rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"undo","arguments":{}}),false);
+            let undone=rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"extdata_get","arguments":{"key":key}}),false);
+            assert_eq!(undone["structuredContent"],stored,"one Undo restores pre-Save bytes: {transport}");
+            rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"redo","arguments":{}}),false);
+            let saved_path=source.with_file_name(format!("flip-roundtrip-{transport}.inx"));
+            rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"save","arguments":{"path":saved_path}}),true);
+            assert!(saved_path.exists());
+            rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"open","arguments":{"path":saved_path}}),true);
+            let reopened=rpc(&mut app,&mut harness,&mut frame,"tools/call",json!({"name":"extdata_get","arguments":{"key":key}}),false);
+            assert_eq!(reopened["structuredContent"],saved["structuredContent"],"owned file Save/reopen: {transport}");
+            assert_eq!(std::fs::read(source).unwrap(),source_bytes);
+            drop(rpc);
+            if let Some(client)=stdio_client.take() {client.shutdown(Shutdown::Write).unwrap();}
+            if let Some(worker)=stdio_worker.take() {
+                let deadline=Instant::now()+Duration::from_secs(5);
+                while !worker.is_finished() {assert!(Instant::now()<deadline); harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame)); std::thread::yield_now();}
+                worker.join().unwrap();
+            }
+            if let Some(mut peer)=peer {peer.finish(&mut app);}
+            app.mcp_server=None;
+        }
+    }
+
+    #[test]
+    fn flip_operations_and_cancel_exclude_each_other_while_reviewing_or_waiting_without_consuming_other_attempts() {
+        for operation in ["open", "read", "edit", "save"] {
+            for cancel_first in [false, true] {
+                let (mut app, mut harness) = flip_cancel_app(&format!("flip-operation-review-overlap-{operation}-{cancel_first}"), true);
+                let mut frame = eframe::Frame::_new_kittest();
+                let (mut peer, token) = draft_peer(&mut app);
+                let extra = match operation {
+                    "read" => json!({"offset":0,"maxBytes":1}),
+                    "edit" => json!({"action":"left_pattern","text":"replacement"}),
+                    _ => json!({}),
+                };
+                let operation_message = flip_operation_message(&mut app, operation, extra);
+                let cancel = flip_cancel_message(&app);
+                let (first, second, lane, other) = if cancel_first {(&cancel,&operation_message,4,5)} else {(&operation_message,&cancel,5,4)};
+                let snapshot = app.controller.snapshot().clone();
+                let view = app.windows.flip_view_identity();
+                let original = draft_http(&app,&token,first);
+                serve_panel_review(&mut app,lane);
+                assert_eq!(app.panel_discards[lane].state()["state"],"awaiting_human");
+                assert_eq!(request_panel_discard(&mut app,second).into_message().unwrap()["result"]["isError"],true);
+                assert_eq!(app.panel_discards[other].attempt(),0,"refused overlap consumes no other attempt: {operation} {cancel_first}");
+                assert_eq!(app.panel_discards[lane].attempt(),1);
+                harness.frame(Vec::new(),|ctx|app.finish_close_requests(ctx,HostDrainEffect::Eof,false));
+                assert!(!app.closing && harness.close_requests == 0);
+                app.begin_closing();
+                assert_eq!(lifecycle_http_result(original,first["id"].as_str().unwrap())["isError"],true);
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(app.panel_discards[lane].state()["state"],"editor_closing");
+                assert_eq!(app.windows.flip_view_identity(),view);
+                assert_eq!(app.controller.snapshot(),&snapshot);
+                peer.finish(&mut app);
+            }
+        }
+        for operation in ["open", "edit", "save"] {
+            for cancel_first in [false, true] {
+                let (mut app, mut harness) = flip_cancel_app(&format!("flip-operation-writer-overlap-{operation}-{cancel_first}"), false);
+                let mut frame = eframe::Frame::_new_kittest();
+                let extra = if operation == "edit" {json!({"action":"left_pattern","text":"replacement"})} else {json!({})};
+                let operation_message = flip_operation_message(&mut app,operation,extra);
+                let cancel = flip_cancel_message(&app);
+                let (first,second,lane,other) = if cancel_first {(&cancel,&operation_message,4,5)} else {(&operation_message,&cancel,5,4)};
+                let reply = request_panel_discard(&mut app,first);
+                assert_eq!(app.panel_discards[lane].state()["state"],"waiting_for_reply");
+                assert_eq!(request_panel_discard(&mut app,second).into_message().unwrap()["result"]["isError"],true);
+                assert_eq!(app.panel_discards[other].attempt(),0);
+                assert_eq!(app.panel_discards[lane].attempt(),1);
+                let view = app.windows.flip_view_identity();
+                drop(reply);
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(app.panel_discards[lane].state()["state"],"reply_lost");
+                assert_eq!(app.windows.flip_view_identity(),view);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operations_clean_pending_blocks_eof_and_quit_and_refusals_preserve_pending_quit() {
+        for operation in ["open", "edit", "save", "read"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-operation-quit-eof-{operation}"), false);
+            let mut frame = eframe::Frame::_new_kittest();
+            let extra = match operation {
+                "read" => json!({"offset":0,"maxBytes":1}),
+                "edit" => json!({"action":"left_pattern","text":"replacement"}),
+                _ => json!({}),
+            };
+            let message = flip_operation_message(&mut app,operation,extra);
+            let quit = json!({"jsonrpc":"2.0","id":"quit","method":"tools/call","params":{"name":"editor_quit","arguments":{}}});
+            let pending_quit = request_panel_discard(&mut app,&quit);
+            assert!(app.remote_quit.active());
+            assert_eq!(request_panel_discard(&mut app,&message).into_message().unwrap()["result"]["isError"],true);
+            assert!(app.remote_quit.active(),"a refused Flip operation cannot cancel Quit: {operation}");
+            assert_eq!(app.panel_discards[5].attempt(),0);
+            app.remote_quit.cancel("test_reset");
+            drop(pending_quit);
+            if operation == "read" {continue;}
+            let snapshot = app.controller.snapshot().clone();
+            let reply = request_panel_discard(&mut app,&message);
+            assert_eq!(app.panel_discards[5].state()["state"],"waiting_for_reply");
+            assert_eq!(request_panel_discard(&mut app,&quit).into_message().unwrap()["result"]["isError"],true);
+            assert!(!app.remote_quit.active());
+            harness.frame(Vec::new(),|ctx|app.finish_close_requests(ctx,HostDrainEffect::Eof,false));
+            assert!(!app.closing && harness.close_requests == 0);
+            reply.write_line(&mut Vec::new()).unwrap();
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            let expected = match operation {"open"=>"opened","edit"=>"applied",_=>"saved"};
+            assert_eq!(app.panel_discards[5].state()["state"],expected);
+            assert!(!app.closing && harness.close_requests == 0);
+            assert_eq!(app.controller.snapshot(),&snapshot);
+        }
+    }
+
+    #[test]
+    fn flip_operations_owned_acp_revocation_before_allow_never_reads_or_executes_and_cannot_revive() {
+        for operation in ["open", "read", "edit", "save"] {
+            for case in ["permission", "completed", "cancel", "disconnect", "expired", "prompt_replaced", "run_replaced"] {
+                eprintln!("owned Flip before Allow once: {operation} {case}");
+                let (mut app, mut harness) = flip_cancel_app(&format!("flip-operation-before-allow-{operation}-{case}"), true);
+                let mut frame = eframe::Frame::_new_kittest();
+                let (mut peer, mut token) = draft_peer(&mut app);
+                let extra = match operation {
+                    "read" => json!({"offset":0,"maxBytes":16384}),
+                    "edit" => json!({"action":"left_pattern","text":"proposed replacement"}),
+                    _ => json!({}),
+                };
+                let message = flip_operation_message(&mut app, operation, extra);
+                let snapshot = app.controller.snapshot().clone();
+                let view = app.windows.flip_view_identity();
+                let source = app.controller.project_path().unwrap().to_owned();
+                let bytes = std::fs::read(&source).unwrap();
+                let original = draft_http(&app, &token, &message);
+                serve_panel_review(&mut app,5);
+                assert_eq!(app.panel_discards[5].state()["state"], "awaiting_human", "{operation} {case}");
+                match case {
+                    "permission" => peer.enqueue(lifecycle_permission()),
+                    "completed" => peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}})),
+                    "expired" => app.agent.expire_host_approval_for_test(),
+                    "cancel" => assert!(matches!(app.agent.cancel(), crate::editor_agent::CancelResult::Requested {approval_reply_failed:false})),
+                    "disconnect" => {
+                        peer.frames.take();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while app.agent.state().turn_active {app.agent.pump(); assert!(Instant::now() < deadline); std::thread::yield_now();}
+                    },
+                    "prompt_replaced" => {
+                        peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}));
+                        app.agent.pump();
+                        assert!(!app.agent.state().turn_active);
+                        app.agent.set_prompt_for_test("Replacement owned Flip turn".into());
+                        app.agent.send(None);
+                    },
+                    "run_replaced" => {peer.finish(&mut app); (peer, token) = draft_peer(&mut app);},
+                    _ => unreachable!(),
+                }
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                let response = lifecycle_http_result(original, message["id"].as_str().unwrap());
+                assert_eq!(response["isError"], true, "{operation} {case}: {response}");
+                assert!(response["structuredContent"]["flipPairingContent"].is_null());
+                assert_eq!(app.panel_discards[5].state()["state"], "consent_invalid", "{operation} {case}");
+                assert_eq!(app.windows.flip_view_identity(), view);
+                assert_eq!(app.controller.snapshot(), &snapshot);
+                harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+                assert_eq!(app.panel_discards[5].state()["state"], "consent_invalid");
+                assert_eq!(app.windows.flip_view_identity(), view);
+                assert_eq!(std::fs::read(source).unwrap(), bytes);
+                if matches!(case, "prompt_replaced" | "run_replaced") {
+                    let next = draft_http(&app, &token, &message);
+                    serve_panel_review(&mut app,5);
+                    assert_eq!(app.panel_discards[5].state()["state"], "awaiting_human");
+                    assert_eq!(app.panel_discards[5].attempt(), 2);
+                    app.begin_closing();
+                    assert_eq!(lifecycle_http_result(next, message["id"].as_str().unwrap())["isError"], true);
+                }
+                peer.finish(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operations_owned_acp_revocation_after_admission_never_executes_or_revives() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for operation in ["open", "edit", "save"] {
+            for case in ["permission", "completed", "cancel", "disconnect", "expired", "prompt_replaced", "run_replaced"] {
+                let (mut app, mut harness) = flip_cancel_app(&format!("flip-operation-after-admission-{operation}-{case}"), true);
+                let mut frame = eframe::Frame::_new_kittest();
+                let (mut peer, mut token) = draft_peer(&mut app);
+                let extra = if operation == "edit" {json!({"action":"left_pattern","text":"proposed replacement"})} else {json!({})};
+                let message = flip_operation_message(&mut app, operation, extra);
+                let snapshot = app.controller.snapshot().clone();
+                let view = app.windows.flip_view_identity();
+                let source = app.controller.project_path().unwrap().to_owned();
+                let bytes = std::fs::read(&source).unwrap();
+                let original = draft_http(&app, &token, &message);
+                serve_panel_review(&mut app,5);
+                assert_eq!(app.panel_discards[5].state()["state"], "awaiting_human");
+                let path = app.tools.store_path.clone();
+                Harness::new().click(Role::Button, "Allow once", |ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+                serve_agent_requests(&mut app);
+                let response = lifecycle_http_result(original,message["id"].as_str().unwrap());
+                assert_ne!(response["isError"],true,"{operation} {case}: {response}");
+                assert_eq!(app.panel_discards[5].state()["state"],"waiting_for_reply");
+                match case {
+                    "permission" => peer.enqueue(lifecycle_permission()),
+                    "completed" => peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}})),
+                    "cancel" => assert!(matches!(app.agent.cancel(),crate::editor_agent::CancelResult::Requested {approval_reply_failed:false})),
+                    "expired" => {
+                        let RemotePanelDiscard::Waiting {deadline,..} = &mut app.panel_discards[5] else {panic!()};
+                        *deadline = Instant::now() - Duration::from_millis(1);
+                    },
+                    "disconnect" => {
+                        peer.frames.take();
+                        let deadline = Instant::now()+Duration::from_secs(5);
+                        while app.agent.state().turn_active {app.agent.pump(); assert!(Instant::now()<deadline); std::thread::yield_now();}
+                    },
+                    "prompt_replaced" => {
+                        peer.enqueue(json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}));
+                        app.agent.pump();
+                        assert!(!app.agent.state().turn_active);
+                        app.agent.set_prompt_for_test("Replacement admitted Flip turn".into());
+                        app.agent.send(None);
+                    },
+                    "run_replaced" => {peer.finish(&mut app); (peer, token) = draft_peer(&mut app);},
+                    _ => unreachable!(),
+                }
+                harness.frame(Vec::new(), |ctx|app.update(ctx,&mut frame));
+                let expected = if case == "expired" {"reply_expired"} else {"consent_invalid"};
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"{operation} {case}");
+                assert_eq!(app.windows.flip_view_identity(),view);
+                assert_eq!(app.controller.snapshot(),&snapshot);
+                harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+                assert_eq!(app.panel_discards[5].state()["state"],expected);
+                assert_eq!(app.windows.flip_view_identity(),view);
+                assert_eq!(std::fs::read(source).unwrap(),bytes);
+                if matches!(case,"expired"|"prompt_replaced"|"run_replaced") {
+                    let next=draft_http(&app,&token,&message);
+                    serve_panel_review(&mut app,5);
+                    assert_eq!(app.panel_discards[5].state()["state"],"awaiting_human");
+                    assert_eq!(app.panel_discards[5].attempt(),2);
+                    app.begin_closing();
+                    assert_eq!(lifecycle_http_result(next,message["id"].as_str().unwrap())["isError"],true);
+                }
+                peer.finish(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn flip_operations_owned_acp_requires_original_allow_for_reads_same_empty_disabled_and_invalid_private_inputs() {
+        use crate::editor_test_support::Harness;
+        use egui::accesskit::Role;
+        for case in ["open","read","same_text","empty_text","invalid_row","disabled_add","equal_patterns","empty_save",
+            "past_end","read_denied","edit_denied","save_denied","open_denied"] {
+            let (mut app,mut harness)=flip_cancel_app(&format!("flip-operations-acp-original-{case}"),false);
+            let mut frame=eframe::Frame::_new_kittest();
+            harness.text("Part 1","retained pattern",|ctx|app.update(ctx,&mut frame));
+            if case == "empty_save" {
+                harness.click_in_window("Flip Pairing",Role::Button,"Remove row 1",|ctx|app.update(ctx,&mut frame));
+            }
+            if case == "equal_patterns" {
+                harness.text("Part 2","retained pattern",|ctx|app.update(ctx,&mut frame));
+            }
+            let (operation,extra,expected)=match case {
+                "open"|"open_denied"=>("open",json!({}),"opened"),
+                "read"|"read_denied"=>("read",json!({"offset":0,"maxBytes":16384}),"snapshot_ready"),
+                "past_end"=>("read",json!({"offset":usize::MAX as u64,"maxBytes":1}),"invalid_target"),
+                "same_text"=>("edit",json!({"action":"left_pattern","text":"retained pattern"}),"applied"),
+                "empty_text"|"edit_denied"=>("edit",json!({"action":"right_pattern","text":""}),"applied"),
+                "invalid_row"=>("edit",json!({"action":"remove","row":usize::MAX as u64}),"invalid_target"),
+                "disabled_add"=>("edit",json!({"action":"add"}),"disabled"),
+                "equal_patterns"=>("edit",json!({"action":"pair"}),"applied"),
+                _=>("save",json!({}),"saved"),
+            };
+            let snapshot=app.controller.snapshot().clone();
+            let source=app.controller.project_path().unwrap().to_owned();
+            let bytes=std::fs::read(&source).unwrap();
+            let before=app.windows.flip_view_identity();
+            let (mut peer,token)=draft_peer(&mut app);
+            let message=flip_operation_message(&mut app,operation,extra);
+            let original=draft_http(&app,&token,&message);
+            let duplicate=draft_http(&app,&token,&message);
+            serve_agent_requests(&mut app);
+            assert_eq!(app.panel_discards[5].state()["state"],"awaiting_human","private semantics must not bypass review: {case}");
+            assert_eq!(app.windows.flip_view_identity(),before);
+            assert_eq!(app.controller.snapshot(),&snapshot);
+            assert_eq!(lifecycle_http_result(duplicate,message["id"].as_str().unwrap())["isError"],true,"a duplicate cannot borrow original approval: {case}");
+            let path=app.tools.store_path.clone();
+            Harness::new().click(Role::Button,if case.ends_with("_denied") {"Deny changes this turn"} else {"Allow once"},
+                |ctx|app.agent.host_approval_window(ctx,path.as_deref()));
+            serve_agent_requests(&mut app);
+            let response=lifecycle_http_result(original,message["id"].as_str().unwrap());
+            harness.frame(Vec::new(),|ctx|app.update(ctx,&mut frame));
+            if case.ends_with("_denied") {
+                assert_eq!(response["isError"],true,"{case}");
+                assert_eq!(app.panel_discards[5].state()["state"],"consent_invalid","{case}");
+                assert_eq!(app.windows.flip_view_identity(),before);
+            } else {
+                assert_eq!(response["isError"],case == "past_end","{case}: {response}");
+                assert_eq!(app.panel_discards[5].state()["state"],expected,"{case}: {response}");
+                if operation == "read" && case != "past_end" {
+                    assert_eq!(response["structuredContent"]["flipPairingOperation"]["state"],"snapshot_ready");
+                    assert!(response["structuredContent"]["flipPairingContent"]["base64"].is_string());
+                    assert_eq!(app.windows.flip_view_identity(),before);
+                    let next=draft_http(&app,&token,&message);
+                    serve_agent_requests(&mut app);
+                    assert_eq!(app.panel_discards[5].state()["state"],"awaiting_human","every page needs original approval again");
+                    app.begin_closing();
+                    assert_eq!(lifecycle_http_result(next,message["id"].as_str().unwrap())["isError"],true);
+                } else {
+                    assert!(response["structuredContent"]["flipPairingContent"].is_null(),"ambient mutation results contain no retained content");
+                }
+            }
+            if case == "empty_save" {
+                assert_eq!(app.controller.snapshot()["revision"],snapshot["revision"].as_u64().unwrap()+1);
+                assert_eq!(app.controller.core_request(&json!({"op":"extdata.get","key":crate::editor_windows::FLIP_CONFIG_KEY}))["result"]["present"],false);
+            } else {assert_eq!(app.controller.snapshot(),&snapshot,"{case}");}
+            assert_eq!(std::fs::read(source).unwrap(),bytes,"{case}");
+            peer.finish(&mut app);
+        }
+    }
+
+    #[test]
+    fn flip_content_keeps_captured_catalogue_after_actual_mcp_edits_until_native_reopen() {
+        use base64::Engine;
+        use egui::accesskit::Role;
+        let (mut app,mut harness)=flip_cancel_app("flip-captured-catalogue-mcp",true);
+        let mut frame=eframe::Frame::_new_kittest();
+        let read=|app:&mut EditorApp| {
+            let message=flip_operation_message(app,"read",json!({"offset":0,"maxBytes":16384}));
+            let response=request_panel_discard(app,&message).into_message().unwrap();
+            assert_eq!(response["result"]["isError"],false,"{response}");
+            let page=&response["result"]["structuredContent"]["flipPairingContent"];
+            assert_eq!(page["done"],true);
+            serde_json::from_slice::<Value>(&base64::engine::general_purpose::STANDARD.decode(page["base64"].as_str().unwrap()).unwrap()).unwrap()
+        };
+        let source=app.controller.project_path().unwrap().to_owned();
+        let bytes=std::fs::read(&source).unwrap();
+        let original=read(&mut app);
+        let identity=app.windows.flip_view_identity();
+        let before=app.controller.snapshot().clone();
+        assert!(app.windows.has_document_draft());
+        assert!(!refused(&mut app,"open",json!({"path":source})).is_empty());
+        assert_eq!(app.controller.snapshot(),&before);
+        assert_eq!(read(&mut app),original,"a refused replacement preserves dirty captured inputs");
+        app.timeline_weight_draft=Some(("Unrelated retained input".into(),0.4));
+        call(&mut app,"node_rename",json!({"id":2,"name":"Renamed face"}));
+        assert_eq!(read(&mut app),original,"an allowed MCP rename does not refresh captured names");
+        call(&mut app,"node_delete",json!({"nodes":[2]}));
+        let created=call(&mut app,"node_create",json!({"className":"Node","name":"Added after capture","parents":[1]}));
+        let added=created["created"][0]["uuid"].as_u64().unwrap();
+        let key=crate::editor_windows::FLIP_CONFIG_KEY;
+        let payload=base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json!([{"uuid1":1,"uuid2":added}])).unwrap());
+        call(&mut app,"extdata_set",json!({"key":key,"base64":payload}));
+        assert_eq!(app.windows.flip_view_identity(),identity);
+        assert_eq!(read(&mut app),original,"allowed Session changes do not refresh or normalize the captured catalogue and rows");
+        assert!(app.windows.has_document_draft());
+        assert_eq!(app.timeline_weight_draft,Some(("Unrelated retained input".into(),0.4)));
+        let edited=app.controller.snapshot().clone();
+        harness.click(Role::Button,"Tools",|ctx|app.update(ctx,&mut frame));
+        harness.click(Role::Button,"Flip Pairing",|ctx|app.update(ctx,&mut frame));
+        let reopened=read(&mut app);
+        assert_ne!(app.windows.flip_view_identity(),identity);
+        assert_eq!(reopened["nodes"].as_array().unwrap().iter().map(|node|node["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["Root","Added after capture"]);
+        assert_eq!(reopened["rows"][0]["parts"],json!([1,added]));
+        assert_eq!(reopened["rows"].as_array().unwrap().len(),1);
+        assert!(!app.windows.has_document_draft());
+        assert_eq!(app.timeline_weight_draft,Some(("Unrelated retained input".into(),0.4)));
+        assert_eq!(app.controller.snapshot(),&edited);
+        assert_eq!(std::fs::read(source).unwrap(),bytes);
+    }
+
+    #[test]
+    fn flip_open_native_tools_reopening_reads_current_session_synchronously_and_preserves_siblings_and_source() {
+        use crate::editor_test_support::{find, texts};
+        use egui::accesskit::Role;
+        let key = crate::editor_windows::FLIP_CONFIG_KEY;
+        for case in ["valid", "missing", "malformed"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-open-native-session-{case}"), true);
+            let mut frame = eframe::Frame::_new_kittest();
+            harness.text("Part 1", "old retained pattern", |ctx|app.update(ctx, &mut frame));
+            app.form_time_draft = Some(0.25);
+            let payload = match case {
+                "valid" => Some(br#"[{"uuid1":2,"uuid2":4294967295}]"#.as_slice()),
+                "missing" => None,
+                _ => Some(b"not JSON".as_slice()),
+            };
+            assert_eq!(app.controller.core_request(&json!({"op":"extdata.set", "key":key,
+                "base64":payload.map(|bytes|base64::engine::general_purpose::STANDARD.encode(bytes))}))["succeeded"], true);
+            let snapshot = app.controller.snapshot().clone();
+            let path = app.controller.project_path().unwrap().to_owned();
+            let source = std::fs::read(&path).unwrap();
+            let old = app.windows.flip_input_state().identity;
+            harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+            harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+            let output = harness.frame(Vec::new(), |ctx|app.update(ctx, &mut frame));
+            let inputs = app.windows.flip_input_state();
+            assert!(inputs.open && !inputs.pending_read && !inputs.dirty, "{case}");
+            assert_ne!(inputs.identity, old, "{case}");
+            assert_eq!(find(&output, Role::TextInput, "Part 1").unwrap().value(), Some(""), "{case}");
+            let labels = texts(&output);
+            match case {
+                "valid" => {assert!(labels.iter().any(|text|text == "Read from the document."));
+                    assert!(labels.iter().any(|text|text == "Face"));},
+                "missing" => assert!(labels.iter().any(|text|text == "The document has no flip pairs yet.")),
+                _ => assert!(labels.iter().any(|text|text.starts_with("The stored flip pairs were not read:"))),
+            }
+            assert_eq!(app.form_time_draft, Some(0.25), "{case}");
+            assert_eq!(app.controller.snapshot(), &snapshot, "fixed-key read is not a Session edit: {case}");
+            assert_eq!(std::fs::read(path).unwrap(), source, "{case}");
+        }
+    }
+
+    #[test]
+    fn flip_open_deliberately_held_app_requests_consume_on_stale_document_or_closing_without_installation() {
+        use crate::editor_windows::{FlipOpenOrigin, FlipOpenResult};
+        for case in ["revision", "path", "closing", "raw_close"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-open-held-app-{case}"), false);
+            let request = app.windows.begin_flip_open(app.controller.snapshot(), app.controller.project_path(),
+                FlipOpenOrigin::RemoteExact).unwrap().unwrap();
+            let owner = app.windows.flip_input_state().identity;
+            match case {
+                "revision" => assert_eq!(app.controller.core_request(&json!({"op":"node.rename", "id":2, "name":"Changed"}))["succeeded"], true),
+                "path" => {
+                    let path = app.controller.project_path().unwrap().with_file_name("changed-path.inx");
+                    assert_eq!(app.controller.core_request(&json!({"op":"save", "path":path}))["succeeded"], true);
+                },
+                "closing" => app.closing = true,
+                _ => {
+                    harness.next_input = Some(Box::new(|input|input.viewports.entry(egui::ViewportId::ROOT).or_default()
+                        .events.push(egui::ViewportEvent::Close)));
+                },
+            }
+            let snapshot = app.controller.snapshot().clone();
+            let path = app.controller.project_path().unwrap().to_owned();
+            let source = std::fs::read(&path).unwrap();
+            let mut request = Some(request);
+            let mut result = None;
+            harness.frame(Vec::new(), |ctx| {
+                if let Some(request) = request.take() {result = Some(app.open_flip_pairs(ctx, request, FlipStorageAuthority::Native));}
+            });
+            assert_eq!(result, Some(if matches!(case, "closing" | "raw_close") {FlipOpenResult::EditorClosing}
+                else {FlipOpenResult::StaleDocument}), "{case}");
+            assert!(!app.windows.flip_input_state().pending_read, "terminal outcomes consume the matching slot: {case}");
+            assert_eq!(app.windows.flip_input_state().identity, owner, "the old retained owner stays untouched: {case}");
+            assert_eq!(app.controller.snapshot(), &snapshot, "{case}");
+            assert_eq!(std::fs::read(path).unwrap(), source, "{case}");
+        }
+    }
+
+    #[test]
+    fn flip_save_native_preserves_other_authoring_drafts_instead_of_bypassing_their_guards() {
+        use egui::accesskit::Role;
+        let key = crate::editor_windows::FLIP_CONFIG_KEY;
+        for case in ["node_name", "timeline_weight", "form_time", "depth_import"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-save-foreign-draft-{case}"), true);
+            let mut frame = eframe::Frame::_new_kittest();
+            match case {
+                "node_name" => {
+                    app.controller.select_node(1).unwrap();
+                    app.controller.set_draft_name("Unapplied root name".into());
+                },
+                "timeline_weight" => app.timeline_weight_draft = Some(("Unapplied weight".into(), 0.4)),
+                "form_time" => app.form_time_draft = Some(0.25),
+                "depth_import" => app.psd_depth.open(),
+                _ => unreachable!(),
+            }
+            let snapshot = app.controller.snapshot().clone();
+            let stored = app.controller.core_request(&json!({"op":"extdata.get", "key":key}));
+            let path = app.controller.project_path().unwrap().to_owned();
+            let bytes = std::fs::read(&path).unwrap();
+            let old = app.windows.flip_input_state().identity;
+            harness.click_in_window("Flip Pairing", Role::Button, "Save", |ctx|app.update(ctx, &mut frame));
+            assert!(app.windows.flip_input_state().open && app.windows.has_document_draft(), "{case}; {}", app.notice);
+            assert_ne!(app.windows.flip_input_state().identity, old, "{case}");
+            assert!(app.notice.contains("Flip pairs were not saved"), "{case}; {}", app.notice);
+            assert_eq!(app.controller.snapshot(), &snapshot, "{case}");
+            assert_eq!(app.controller.core_request(&json!({"op":"extdata.get", "key":key})), stored, "{case}");
+            match case {
+                "node_name" => assert!(app.controller.draft_dirty()),
+                "timeline_weight" => assert_eq!(app.timeline_weight_draft, Some(("Unapplied weight".into(), 0.4))),
+                "form_time" => assert_eq!(app.form_time_draft, Some(0.25)),
+                "depth_import" => assert!(app.psd_depth.open),
+                _ => unreachable!(),
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes, "{case}");
+        }
+    }
+
+    #[test]
+    fn flip_save_native_assign_normalizes_stored_slots_and_undo_restores_original_bytes() {
+        use egui::accesskit::Role;
+        let (mut app, mut harness) = flip_cancel_app("flip-save-native-assign-normalization", false);
+        let mut frame = eframe::Frame::_new_kittest();
+        let key = crate::editor_windows::FLIP_CONFIG_KEY;
+        let stored = app.controller.core_request(&json!({"op":"extdata.get", "key":key}))["result"].clone();
+        let path = app.controller.project_path().unwrap().to_owned();
+        let source = std::fs::read(&path).unwrap();
+        harness.click_in_window("Flip Pairing", Role::Button, "Remove row 1", |ctx|app.update(ctx, &mut frame));
+        harness.click_in_window("Flip Pairing", Role::Button, "Face (Part)", |ctx|app.update(ctx, &mut frame));
+        harness.text("Part 1", "Face", |ctx|app.update(ctx, &mut frame));
+        harness.text("Part 2", "Root", |ctx|app.update(ctx, &mut frame));
+        harness.click_in_window("Flip Pairing", Role::Button, "Pair", |ctx|app.update(ctx, &mut frame));
+        harness.click_in_window("Flip Pairing", Role::Button, "Use selected node as Part 2 of row 1", |ctx|app.update(ctx, &mut frame));
+        let revision = app.controller.snapshot()["revision"].as_u64().unwrap();
+        harness.click_in_window("Flip Pairing", Role::Button, "Save", |ctx|app.update(ctx, &mut frame));
+        assert!(!app.windows.flip_input_state().open, "{}", app.notice);
+        assert_eq!(app.controller.snapshot()["revision"], revision + 1);
+        let saved = app.controller.core_request(&json!({"op":"extdata.get", "key":key}));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(saved["result"]["base64"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, br#"[{"uuid1":2,"uuid2":4294967295}]"#);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+        assert_eq!(app.controller.core_request(&json!({"op":"extdata.get", "key":key}))["result"], stored);
+        assert_eq!(std::fs::read(path).unwrap(), source);
+    }
+
+    #[test]
+    fn flip_save_native_session_changed_noop_empty_and_malformed_preserve_source_and_one_step_undo() {
+        use egui::accesskit::Role;
+        let key = crate::editor_windows::FLIP_CONFIG_KEY;
+        for case in ["changed", "noop", "empty", "malformed"] {
+            let (mut app, mut harness) = flip_cancel_app(&format!("flip-save-session-{case}"), case == "changed");
+            let mut frame = eframe::Frame::_new_kittest();
+            if case == "empty" {
+                harness.click_in_window("Flip Pairing", Role::Button, "Remove row 1", |ctx|app.update(ctx, &mut frame));
+            } else if case == "malformed" {
+                let response = app.controller.core_request(&json!({"op":"extdata.set", "key":key,
+                    "base64":base64::engine::general_purpose::STANDARD.encode(b"not JSON")}));
+                assert_eq!(response["succeeded"], true);
+                harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+                harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+            }
+            let stored = app.controller.core_request(&json!({"op":"extdata.get", "key":key}))["result"].clone();
+            let before = app.controller.snapshot().clone();
+            let path = app.controller.project_path().unwrap().to_owned();
+            let source = std::fs::read(&path).unwrap();
+            harness.click_in_window("Flip Pairing", Role::Button, "Save", |ctx|app.update(ctx, &mut frame));
+            assert!(!app.windows.flip_input_state().open, "confirmed Save releases owner: {case}; {}", app.notice);
+            let changed = case != "noop";
+            assert_eq!(app.controller.snapshot()["revision"].as_u64(), before["revision"].as_u64().map(|r|r + u64::from(changed)), "{case}");
+            let saved = app.controller.core_request(&json!({"op":"extdata.get", "key":key}))["result"].clone();
+            if case == "empty" || case == "malformed" {assert_eq!(saved["present"], false, "{case}");}
+            else {assert_eq!(saved["present"], true, "{case}");}
+            assert_eq!(saved == stored, !changed, "{case}");
+            assert_eq!(std::fs::read(&path).unwrap(), source, "Session edit does not write source: {case}");
+            if changed {
+                assert_eq!(app.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+                assert_eq!(app.controller.core_request(&json!({"op":"extdata.get", "key":key}))["result"], stored,
+                    "one undo restores exactly the pre-Save bytes, including malformed data: {case}");
+            }
+            assert_eq!(std::fs::read(path).unwrap(), source, "{case}");
+        }
+    }
+
+    #[test]
+    fn flip_save_refusal_preserves_current_inputs_siblings_and_source_and_invalidates_old_capture() {
+        use egui::accesskit::Role;
+        let (mut app, mut harness) = panel_discard_app("flip-save-refusal-preserves-input", true, false);
+        app.tools.store.set("firstrun_complete", true).unwrap();
+        app.tools.store.set("hasDoneQuickSetup", true).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        harness.click(Role::Button, "Tools", |ctx|app.update(ctx, &mut frame));
+        harness.click(Role::Button, "Flip Pairing", |ctx|app.update(ctx, &mut frame));
+        harness.text("Part 1", "owned unsaved pattern", |ctx|app.update(ctx, &mut frame));
+        let before = app.controller.snapshot().clone();
+        let source = app.controller.project_path().unwrap().to_owned();
+        let bytes = std::fs::read(&source).unwrap();
+        let sibling = app.forms.input_snapshot(app.controller.snapshot());
+        let identity = app.windows.flip_input_state().identity;
+        let output = harness.click_in_window("Flip Pairing", Role::Button, "Save", |ctx|app.update(ctx, &mut frame));
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert!(app.notice.contains("Flip pairs were not saved"), "{}", app.notice);
+        assert!(app.windows.flip_input_state().open, "failed native Save must retain the unapplied owner");
+        assert_ne!(app.windows.flip_input_state().identity, identity, "Save activity invalidates earlier captures");
+        assert_eq!(app.forms.input_snapshot(app.controller.snapshot()), sibling);
+        let pattern = crate::editor_test_support::find(&output, Role::TextInput, "Part 1").unwrap();
+        assert_eq!(pattern.value(), Some("owned unsaved pattern"));
+        harness.click_in_window("Flip Pairing", Role::Button, "Cancel", |ctx|app.update(ctx, &mut frame));
+        assert!(!app.windows.flip_input_state().open);
+        assert_eq!(app.controller.snapshot(), &before);
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+
     fn flip_cancel_message(app: &EditorApp) -> Value {
         let identity = app.windows.flip_input_state().identity.unwrap();
         json!({"jsonrpc":"2.0", "id":"flip-cancel", "method":"tools/call", "params":{
@@ -22761,6 +24214,15 @@ mod editor_state_tests {
 
     fn finish_agent_stop(app: &mut EditorApp) {
         CTX.with(|ctx| app.finish_agent_stop(ctx));
+    }
+
+    fn serve_panel_review(app: &mut EditorApp, lane: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.panel_discards[lane].state()["state"] != "awaiting_human" {
+            serve_agent_requests(app);
+            assert!(Instant::now() < deadline,"panel review did not arrive: {}",app.panel_discards[lane].state());
+            std::thread::yield_now();
+        }
     }
 
     fn serve_agent_requests(app: &mut EditorApp) {

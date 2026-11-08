@@ -25,6 +25,126 @@ pub const NODE_INSERT_CLASSES: &[&str] = &[
 pub use crate::nodes::{DropSite, ParameterUse};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipTextField { Filter, LeftPattern, RightPattern }
+
+impl FlipTextField {
+    pub fn index(self) -> usize { match self {Self::Filter=>0, Self::LeftPattern=>1, Self::RightPattern=>2} }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipSlot { Part1, Part2 }
+
+impl FlipSlot {
+    pub fn index(self) -> usize { match self {Self::Part1=>0, Self::Part2=>1} }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlipEdit {
+    ReplaceText { field: FlipTextField, text: String },
+    Pick { uuid: u32 },
+    Add,
+    Assign { row: usize, slot: FlipSlot },
+    Remove { row: usize },
+    Pair,
+}
+
+pub const FLIP_CONTENT_MAX_BYTES: usize = 16_384;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlipOperation {
+    Open,
+    Read { offset: usize, max_bytes: usize },
+    Edit(FlipEdit),
+    Save,
+}
+
+impl FlipOperation {
+    pub fn name(&self) -> &'static str {
+        match self {Self::Open=>"open", Self::Read {..}=>"read", Self::Edit(edit)=>edit.name(), Self::Save=>"save"}
+    }
+}
+
+pub struct FlipOperationRequest {
+    pub expected_revision: u64,
+    pub expected_view_identity: String,
+    pub operation: FlipOperation,
+}
+
+impl FlipOperationRequest {
+    pub fn parse(operation: &str, arguments: &Value) -> Result<Self, String> {
+        let args = arguments.as_object().ok_or("Flip arguments must be an object")?;
+        let expected_revision = args.get("expectedRevision").and_then(Value::as_u64)
+            .ok_or("expectedRevision must be an unsigned 64-bit integer")?;
+        let expected_view_identity = args.get("expectedViewIdentity").and_then(Value::as_str).filter(|text|!text.is_empty())
+            .ok_or("expectedViewIdentity must be a nonempty string")?.to_owned();
+        let index = |name: &str|args.get(name).and_then(Value::as_u64).and_then(|n|usize::try_from(n).ok())
+            .ok_or_else(||format!("{name} must be a nonnegative machine-representable integer"));
+        let mut allowed = vec!["expectedRevision", "expectedViewIdentity"];
+        let operation = match operation {
+            "open" => FlipOperation::Open,
+            "save" => FlipOperation::Save,
+            "read" => {
+                allowed.extend(["offset", "maxBytes"]);
+                let offset = index("offset")?;
+                let max_bytes = index("maxBytes")?;
+                if !(1..=FLIP_CONTENT_MAX_BYTES).contains(&max_bytes) {
+                    return Err("maxBytes must be between 1 and 16384".into());
+                }
+                FlipOperation::Read {offset, max_bytes}
+            },
+            "edit" => {
+                allowed.push("action");
+                let edit = match args.get("action").and_then(Value::as_str).ok_or("action must be a string")? {
+                    action @ ("filter" | "left_pattern" | "right_pattern") => {
+                        allowed.push("text");
+                        let text = args.get("text").and_then(Value::as_str).ok_or("text must be a string")?.to_owned();
+                        let field = match action {"filter"=>FlipTextField::Filter, "left_pattern"=>FlipTextField::LeftPattern,
+                            _=>FlipTextField::RightPattern};
+                        FlipEdit::ReplaceText {field, text}
+                    },
+                    "pick" => {
+                        allowed.push("uuid");
+                        let uuid = args.get("uuid").and_then(Value::as_u64).and_then(|n|u32::try_from(n).ok())
+                            .ok_or("uuid must be an unsigned 32-bit integer")?;
+                        FlipEdit::Pick {uuid}
+                    },
+                    "add" => FlipEdit::Add,
+                    "pair" => FlipEdit::Pair,
+                    "assign" => {
+                        allowed.extend(["row", "slot"]);
+                        let row = index("row")?;
+                        let slot = match args.get("slot").and_then(Value::as_u64) {
+                            Some(1)=>FlipSlot::Part1, Some(2)=>FlipSlot::Part2, _=>return Err("slot must be 1 or 2".into()),
+                        };
+                        FlipEdit::Assign {row, slot}
+                    },
+                    "remove" => {allowed.push("row"); FlipEdit::Remove {row:index("row")?}},
+                    _ => return Err("Unknown Flip edit action".into()),
+                };
+                FlipOperation::Edit(edit)
+            },
+            _ => return Err("Unknown Flip operation".into()),
+        };
+        if args.keys().any(|key|!allowed.contains(&key.as_str())) {
+            return Err("Unexpected argument for this Flip operation or action".into());
+        }
+        Ok(Self {expected_revision, expected_view_identity, operation})
+    }
+}
+
+impl FlipEdit {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ReplaceText {field:FlipTextField::Filter, ..}=>"filter",
+            Self::ReplaceText {field:FlipTextField::LeftPattern, ..}=>"left_pattern",
+            Self::ReplaceText {field:FlipTextField::RightPattern, ..}=>"right_pattern",
+            Self::Pick {..}=>"pick", Self::Add=>"add", Self::Assign {..}=>"assign",
+            Self::Remove {..}=>"remove", Self::Pair=>"pair",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormsInputAction {
     DiscardMain,
     ReloadForm,

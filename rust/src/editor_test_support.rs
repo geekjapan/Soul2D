@@ -73,6 +73,16 @@ impl Harness {
         self.frame(Vec::new(), &mut run)
     }
 
+    pub fn click_in_window(&mut self, window: &str, role: Role, label: &str, mut run: impl FnMut(&egui::Context)) -> Out {
+        self.frame(Vec::new(), &mut run);
+        let output = self.frame(Vec::new(), &mut run);
+        let at = center_in_window(&output,window,role,label);
+        let press = |pressed|egui::Event::PointerButton {pos:at, button:egui::PointerButton::Primary, pressed,
+            modifiers:egui::Modifiers::NONE};
+        self.frame(vec![egui::Event::PointerMoved(at), press(true), press(false)], &mut run);
+        self.frame(Vec::new(), &mut run)
+    }
+
     pub fn text(&mut self, label: &str, value: &str, mut run: impl FnMut(&egui::Context)) -> Out {
         self.click(Role::TextInput, label, &mut run);
         let key = |pressed| egui::Event::Key { key: egui::Key::A, physical_key: None, pressed, repeat: false,
@@ -80,6 +90,22 @@ impl Harness {
         self.frame(vec![key(true), egui::Event::Text(value.to_owned()), key(false)], &mut run);
         self.frame(Vec::new(), &mut run)
     }
+}
+
+pub fn center_in_window(output: &Out, window: &str, role: Role, label: &str) -> egui::Pos2 {
+    let windows: Vec<_> = output.iter().filter(|(_,node)|node.role() == Role::Window
+        && name_of(output,node).as_deref() == Some(window)).collect();
+    assert_eq!(windows.len(),1,"unique window {window:?}");
+    let mut pending=windows[0].1.children().to_vec();
+    let mut matches=Vec::new();
+    while let Some(id)=pending.pop() {
+        let (_,node)=output.iter().find(|(candidate,_)|*candidate == id).expect("reachable window child");
+        pending.extend_from_slice(node.children());
+        if node.role() == role && name_of(output,node).as_deref() == Some(label) {matches.push(node);}
+    }
+    assert_eq!(matches.len(),1,"unique {role:?} {label:?} in {window:?}");
+    let bounds=matches[0].bounds().expect("control bounds");
+    egui::pos2(((bounds.x0+bounds.x1)/2.0) as f32,((bounds.y0+bounds.y1)/2.0) as f32)
 }
 
 /// The accessible name of a node: its label, else the label of the node that labels it, else its value.
