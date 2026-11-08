@@ -231,7 +231,7 @@ static void awaitCallback(NSUInteger start, NSString *kind, NSString *owner) {
 
 static void compose(Session *target, NSString *letter, unsigned short code, NSString *expected, BOOL deliver) {
     NSUInteger start = callbacks.count;
-    key(target, @"´", @"e", 14, NSEventModifierFlagOption);
+    key(target, @"", @"e", 14, NSEventModifierFlagOption);
     awaitCallback(start, @"preedit", target.owner);
     if (deliver) {consume(); require(projection(target.owner).length != 0, @"native preedit not delivered");}
     key(target, letter, letter, code, 0);
@@ -297,7 +297,7 @@ int main(int argc, const char *argv[]) {
             Session *current = session(@"late-B", view, [mode isEqual:@"shared"] ? old : nil); [owners addObject:current];
             selectOwner(old, s, view);
             NSUInteger start = callbacks.count;
-            key(old, @"´", @"e", 14, NSEventModifierFlagOption); awaitCallback(start, @"preedit", old.owner); consume();
+            key(old, @"", @"e", 14, NSEventModifierFlagOption); awaitCallback(start, @"preedit", old.owner); consume();
             NSUInteger beforeRetirement = callbacks.count;
             selectOwner(current, old, view);
             pump(); consume();
