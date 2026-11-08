@@ -66,6 +66,17 @@ launch() {
 }
 
 shoot_x11() { import -window root "$1"; }
+
+run_ime_probe() {
+    local backend=$1 status=0
+    timeout --kill-after=5s 30s "${SOUL2D_IME_ADAPTER_PROBE:?compiled probe required}" "$backend" \
+        > "$out/ime-$backend.log" 2>&1 || status=$?
+    cat "$out/ime-$backend.log"
+    echo "ime-$backend: exit=$status scope=ACTUAL_ADAPTER_SYNTHETIC_INGRESS_NOT_PHYSICAL_IME" \
+        | tee "$out/ime-$backend.status"
+    return "$status"
+}
+
 shoot_wayland() {
     # Not on PATH in every package; weston only lets it capture because of --debug.
     local shooter
@@ -76,8 +87,30 @@ shoot_wayland() {
 }
 
 case ${2:-all} in
-x11-inner) launch x11 shoot_x11 ;;
+x11-inner) run_ime_probe x11; launch x11 shoot_x11 ;;
 all)
+    probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/soul2d-ime-probe.XXXXXX")
+    weston_pid=
+    cleanup() {
+        if [ -n "$weston_pid" ]; then
+            kill "$weston_pid" 2>/dev/null || true
+            wait "$weston_pid" 2>/dev/null || true
+        fi
+        rm -rf -- "$probe_dir"
+        [ ! -e "$probe_dir" ] && echo "ime-probe temporary executable cleanup: PASS"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    libraries=("$root"/out/rust/debug/deps/libegui_winit-*.rlib)
+    if [ "${#libraries[@]}" -ne 1 ] || [ ! -f "${libraries[0]}" ]; then
+        echo "FAIL: expected exactly one compiled egui-winit rlib" >&2
+        exit 1
+    fi
+    export SOUL2D_IME_ADAPTER_PROBE="$probe_dir/ime-adapter-probe"
+    rustc --edition=2021 --crate-name soul2d_ime_adapter_probe "$root/tools/ime-adapter-probe.rs" \
+        --extern "egui_winit=${libraries[0]}" -L "dependency=$root/out/rust/debug/deps" \
+        -o "$SOUL2D_IME_ADAPTER_PROBE"
     rm -f "$out/fixture.inx"
     build_fixture
     xvfb-run -a -s "-screen 0 1280x800x24" "$0" "$out" x11-inner
@@ -88,8 +121,9 @@ all)
     weston --backend=headless --renderer=pixman --width=1280 --height=800 --socket=soul2d-launch --debug \
         > "$out/weston.log" 2>&1 &
     weston_pid=$!
-    trap 'kill "$weston_pid" 2>/dev/null || true' EXIT
     for _ in $(seq 20); do [ -S "$XDG_RUNTIME_DIR/soul2d-launch" ] && break; sleep 0.5; done
+    env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c \
+        "$(declare -f run_ime_probe); out=\$1; run_ime_probe wayland" _ "$out"
     env -u DISPLAY WAYLAND_DISPLAY=soul2d-launch bash -c "$(declare -f painted launch shoot_wayland); out='$out' editor='$editor' launch wayland shoot_wayland"
     echo "PASS: the editor opened and drew the model on X11 and Wayland; evidence in $out"
     ;;
