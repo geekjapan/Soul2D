@@ -1,0 +1,38 @@
+name: macOS input context prototype
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-input-context-prototype-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-context:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify exact source and ARM64 environment
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          git rev-parse HEAD
+          sw_vers
+          xcrun --sdk macosx clang --version
+          shasum -a 256 tools/macos-ime-context-probe.m tools/verify-macos-ime-context.py
+      - name: Observe native client ownership and queued admission
+        run: python3 tools/verify-macos-ime-context.py
+      - name: Preserve raw native observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-input-context
+          path: out/macos-ime-context/
+          if-no-files-found: error
+          retention-days: 3
