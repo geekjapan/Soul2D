@@ -75,15 +75,18 @@ def main():
             with (output / 'compile.log').open('wb') as log:
                 receipt['compile'] = run_owned(['xcrun', '--sdk', 'macosx', 'clang', '-fobjc-arc',
                     '-Wall', '-Wextra', '-Werror', '-mmacosx-version-min=15.0', str(source),
-                    '-framework', 'Cocoa', '-o', str(executable)], log, subprocess.STDOUT, 90)
+                    '-framework', 'Cocoa', '-framework', 'CoreGraphics', '-o', str(executable)], log, subprocess.STDOUT, 90)
             if receipt['compile'] != {'returncode': 0, 'timedOut': False, 'ownedGroupAbsent': True}:
                 raise RuntimeError('native fixture compilation did not complete cleanly')
             receipt['executableSha256'] = hashlib.sha256(executable.read_bytes()).hexdigest()
-            for mode in ['shared', 'distinct']:
+            for mode in ['qualify', 'shared', 'distinct']:
                 with (output / (mode + '.jsonl')).open('wb') as log, (output / (mode + '.stderr')).open('wb') as errors:
                     receipt['variants'][mode] = run_owned([str(executable), mode], log, errors, 30)
+                if mode == 'qualify' and receipt['variants'][mode] != {'returncode': 0, 'timedOut': False, 'ownedGroupAbsent': True}:
+                    receipt['ownershipCases'] = 'NOT_RUN_UNQUALIFIED_STIMULUS'
+                    break
             complete = {'returncode': 0, 'timedOut': False, 'ownedGroupAbsent': True}
-            if all(value == complete for value in receipt['variants'].values()):
+            if set(receipt['variants']) == {'qualify', 'shared', 'distinct'} and all(value == complete for value in receipt['variants'].values()):
                 receipt['status'] = 'BOTH_VARIANTS_COMPLETED_NOT_PRODUCT_ACCEPTANCE'
                 status = 0
     except (KeyboardInterrupt, Exception) as error:

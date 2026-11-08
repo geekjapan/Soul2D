@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@ static NSMutableDictionary<NSString *, NSString *> *committed;
 static NSMutableDictionary<NSString *, NSString *> *preedit;
 static NSUInteger consumed;
 static BOOL finished;
+static CGEventSourceRef keyboardSource;
 
 static NSString *pointer(id object) {
     return [NSString stringWithFormat:@"%p", (__bridge void *)object];
@@ -205,19 +207,48 @@ static BOOL ownerTextSince(NSUInteger start, Session *owner) {
     return NO;
 }
 
+static BOOL submitKey(Session *target, CGKeyCode code, BOOL down, CGEventFlags flags) {
+    CGEventRef backing = CGEventCreateKeyboardEvent(keyboardSource, code, down);
+    require(backing != NULL, @"owned Quartz key construction failed");
+    @try {
+        CGEventSetFlags(backing, flags);
+        NSEvent *event = [NSEvent eventWithCGEvent:backing];
+        require(event != nil, @"Quartz to AppKit event conversion failed");
+        BOOL textEvent = event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp;
+        UniCharCount count = 0;
+        UniChar text[32];
+        if (textEvent) CGEventKeyboardGetUnicodeString(backing, 32, &count, text);
+        require(count <= 32, @"unexpected oversized generated key text");
+        emit(@{@"event":@"native_key_enter", @"requested_owner":target.owner, @"keycode":@(event.keyCode),
+            @"type":@(event.type), @"flags":@(event.modifierFlags), @"window":@(event.windowNumber),
+            @"characters":textEvent ? (event.characters ?: @"") : @"NOT_KEY_TEXT_EVENT",
+            @"unmodified":textEvent ? (event.charactersIgnoringModifiers ?: @"") : @"NOT_KEY_TEXT_EVENT",
+            @"unicode_payload":[NSString stringWithCharacters:text length:count],
+            @"source_state_id":@(CGEventGetIntegerValueField(backing, kCGEventSourceStateID)),
+            @"has_backing_event":@(event.CGEvent != NULL), @"posted":@NO});
+        BOOL handled = [target.context handleEvent:event];
+        emit(@{@"event":@"native_key_return", @"handled":@(handled),
+            @"current_context":pointer(NSTextInputContext.currentInputContext),
+            @"current_client":pointer(NSTextInputContext.currentInputContext.client)});
+        return handled;
+    } @finally {
+        CFRelease(backing);
+    }
+}
+
 static BOOL key(Session *target, NSString *characters, NSString *unmodified, unsigned short code, NSEventModifierFlags flags) {
+    require(flags == 0 || flags == NSEventModifierFlagOption, @"unsupported stimulus modifier");
     invocation = ++nextInvocation;
     api = @"handleEvent";
     emit(@{@"event":@"key_enter", @"requested_owner":target.owner, @"context":pointer(target.context),
-        @"characters":characters, @"keycode":@(code), @"flags":@(flags)});
-    NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags
-        timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:target.client.view.window.windowNumber
-        context:nil characters:characters charactersIgnoringModifiers:unmodified isARepeat:NO keyCode:code];
-    require(event != nil, @"native key construction failed");
-    BOOL handled = [target.context handleEvent:event];
-    emit(@{@"event":@"key_return", @"handled":@(handled),
-        @"current_context":pointer(NSTextInputContext.currentInputContext),
-        @"current_client":pointer(NSTextInputContext.currentInputContext.client)});
+        @"requested_characters":characters, @"requested_unmodified":unmodified, @"keycode":@(code), @"flags":@(flags)});
+    BOOL option = flags == NSEventModifierFlagOption;
+    CGEventFlags nativeFlags = option ? kCGEventFlagMaskAlternate : 0;
+    BOOL handled = NO;
+    if (option) handled |= submitKey(target, 58, YES, nativeFlags);
+    handled |= submitKey(target, code, YES, nativeFlags);
+    handled |= submitKey(target, code, NO, nativeFlags);
+    if (option) handled |= submitKey(target, 58, NO, 0);
     invocation = 0;
     api = @"idle";
     return handled;
@@ -246,7 +277,7 @@ static void compose(Session *target, NSString *letter, unsigned short code, NSSt
 }
 
 int main(int argc, const char *argv[]) {
-    if (argc != 2 || (strcmp(argv[1], "shared") && strcmp(argv[1], "distinct"))) return 64;
+    if (argc != 2 || (strcmp(argv[1], "qualify") && strcmp(argv[1], "shared") && strcmp(argv[1], "distinct"))) return 64;
     if (!getenv("GITHUB_ACTIONS") || strcmp(getenv("GITHUB_ACTIONS"), "true") ||
         !getenv("RUNNER_OS") || strcmp(getenv("RUNNER_OS"), "macOS")) {
         fputs("CI-only native fixture; local GUI execution is disabled\n", stderr);
@@ -263,6 +294,8 @@ int main(int argc, const char *argv[]) {
             [NSApplication sharedApplication];
             require([NSApp setActivationPolicy:NSApplicationActivationPolicyRegular], @"cannot set owned app activation policy");
             [NSApp finishLaunching];
+            keyboardSource = CGEventSourceCreate(kCGEventSourceStatePrivate);
+            require(keyboardSource != NULL, @"owned private keyboard source creation failed");
             window = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 640, 360)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
             window.releasedWhenClosed = NO;
@@ -282,6 +315,14 @@ int main(int argc, const char *argv[]) {
             stage = @"queue_old_native_callbacks"; selectOwner(a, nil, view);
             emit(@{@"event":@"selected_input_source", @"identifier":a.context.selectedKeyboardInputSource ?: @"UNKNOWN"});
             compose(a, @"a", 0, @"á", NO);
+            if ([mode isEqual:@"qualify"]) {
+                consume();
+                require([projection(a.owner) isEqual:@"á"], @"qualified native commit differs");
+                emit(@{@"event":@"stimulus_qualified", @"result":@"NATIVE_NONEMPTY_PREEDIT_AND_COMPOSED_COMMIT",
+                    @"scope":@"SINGLE_OWNER_STIMULUS_ONLY_NOT_OWNERSHIP_OR_PRODUCT_ACCEPTANCE"});
+                finished = YES;
+                return 0;
+            }
             NSUInteger beforeFirstRetirement = callbacks.count;
             stage = @"retire_then_release_application_queue"; selectOwner(b, a, view); consume();
             if (ownerTextSince(beforeFirstRetirement, b)) @throw [NSException exceptionWithName:@"CandidateRefuted"
@@ -356,10 +397,12 @@ int main(int argc, const char *argv[]) {
                 owner.client.marked = @""; [owner.context discardMarkedText]; [owner.context deactivate];
             }
             [window orderOut:nil]; [window close];
+            if (keyboardSource) {CFRelease(keyboardSource); keyboardSource = NULL;}
             emit(@{@"event":@"owned_window_closed", @"experiment_complete":@(finished),
                 @"window_created":@(window != nil), @"visible_after_close":@(window.isVisible),
                 @"owner_sessions_retained_through_cleanup":@(owners.count),
                 @"clients_retained_to_process_exit":@(clientsRetainedToProcessExit.count),
+                @"owned_keyboard_source_released":@(keyboardSource == NULL),
                 @"unique_contexts_closed":@(closedContexts.count), @"callbacks_observed":@(callbacks.count),
                 @"callbacks_consumed_before_cleanup":@(consumed)});
         }
