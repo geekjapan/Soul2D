@@ -197,3 +197,100 @@ fn successful_response_drains_delayed_input_before_returning() {
     assert!(result.unwrap().is_ok());
     assert_eq!(bytes, b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
 }
+
+#[cfg(windows)]
+mod portability_probes {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum SendPrimitive {
+        NonblockingVectored,
+        NonblockingChunked,
+        BlockingTimeout,
+    }
+
+    fn send_before(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant, primitive: SendPrimitive) -> io::Result<()> {
+        let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "Windows primitive probe timed out");
+        let mut longest = Duration::ZERO;
+        let outcome = (|| {
+            stream.set_nonblocking(!matches!(primitive, SendPrimitive::BlockingTimeout))?;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { return Err(timed_out()); }
+                if bytes.is_empty() { break; }
+                if matches!(primitive, SendPrimitive::BlockingTimeout) {
+                    stream.set_write_timeout(Some(left))?;
+                }
+                let start = Instant::now();
+                let written = match primitive {
+                    SendPrimitive::NonblockingVectored => stream.write_vectored(&[io::IoSlice::new(bytes)]),
+                    SendPrimitive::NonblockingChunked => stream.write(&bytes[..bytes.len().min(16 * 1024)]),
+                    SendPrimitive::BlockingTimeout => stream.write(bytes),
+                };
+                longest = longest.max(start.elapsed());
+                match written {
+                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "Windows primitive probe stopped")),
+                    Ok(count) => bytes = &bytes[count..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() { return Err(timed_out()); }
+                        thread::sleep(left.min(Duration::from_millis(1)));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            stream.flush()?;
+            if Instant::now() >= deadline { return Err(timed_out()); }
+            Ok(())
+        })();
+        let restored = stream.set_nonblocking(false);
+        eprintln!("WINDOWS_PRIMITIVE_PROBE primitive={primitive:?} longest_send={longest:?} result={outcome:?} restored={restored:?}");
+        outcome.and(restored)?;
+        if Instant::now() >= deadline { return Err(timed_out()); }
+        Ok(())
+    }
+
+    fn run(primitive: SendPrimitive) {
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let budget = Duration::from_secs(2);
+        let (mut server, client) = streams();
+        let buffers = (small_buffer(&server, true), small_buffer(&client, false));
+        let (stop, reader) = burst_reader(client);
+        let start = Instant::now();
+        let result = send_before(&mut server, &payload, start + budget, primitive);
+        let _ = stop.send(());
+        drop(server);
+        let elapsed = start.elapsed();
+        let received = reader.join().unwrap();
+        let paced = (result, elapsed, received, start + budget);
+
+        let (mut server, client) = streams();
+        let _ = (small_buffer(&server, true), small_buffer(&client, false));
+        let (ready, started) = sync_channel(0);
+        let peer = thread::spawn(move || {
+            ready.send(()).unwrap();
+            thread::sleep(Duration::from_secs(5));
+            drop(client);
+        });
+        started.recv().unwrap();
+        let start = Instant::now();
+        let result = send_before(&mut server, &payload, start + budget, primitive);
+        drop(server);
+        let elapsed = start.elapsed();
+        peer.join().unwrap();
+        eprintln!("WINDOWS_PRIMITIVE_PROBE stalled primitive={primitive:?} elapsed={elapsed:?} result={result:?}");
+        assert_partial(&paced.0, paced.1, &paced.2, &payload, paced.3, buffers);
+        assert_eq!(result.as_ref().err().map(io::Error::kind), Some(io::ErrorKind::TimedOut));
+        assert!(elapsed < Duration::from_secs(4), "stalled elapsed={elapsed:?}");
+    }
+
+    #[test]
+    fn windows_vectored_primitive_deadline_probe() { run(SendPrimitive::NonblockingVectored); }
+
+    #[test]
+    fn windows_chunked_primitive_deadline_probe() { run(SendPrimitive::NonblockingChunked); }
+
+    #[test]
+    fn windows_blocking_timeout_primitive_deadline_probe() { run(SendPrimitive::BlockingTimeout); }
+}
