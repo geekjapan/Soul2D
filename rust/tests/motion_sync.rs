@@ -224,6 +224,13 @@ fn request_fields_are_validated_without_a_worker() {
 mod analyzer {
     use super::*;
     use std::process::Command;
+    use std::sync::Mutex;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn stub_pid(dir: &Path, name: &str) -> Option<String> {
         fs::read_to_string(dir.join(format!("pid-{name}.txt"))).ok().map(|pid| pid.trim().to_owned())
@@ -264,6 +271,7 @@ mod analyzer {
 
     #[test]
     fn bake_keys_the_fixture_cues_and_survives_save() {
+        let _serial = serial();
         let dir = temp_dir("bake");
         let wav = wav(&dir, "voice.wav");
         let (mut session, job) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -303,6 +311,7 @@ mod analyzer {
 
     #[test]
     fn a_partial_range_and_extend_behave_atomically() {
+        let _serial = serial();
         let dir = temp_dir("range");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -333,6 +342,7 @@ mod analyzer {
 
     #[test]
     fn a_changed_source_or_track_refuses_the_bake() {
+        let _serial = serial();
         let dir = temp_dir("stale");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -347,6 +357,7 @@ mod analyzer {
 
     #[test]
     fn muted_hidden_and_locked_tracks_refuse() {
+        let _serial = serial();
         let dir = temp_dir("tracks");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -375,6 +386,7 @@ mod analyzer {
 
     #[test]
     fn frame_ranges_and_extend_are_validated() {
+        let _serial = serial();
         let dir = temp_dir("ranges");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -396,6 +408,7 @@ mod analyzer {
 
     #[test]
     fn baking_preserves_keys_outside_the_range_and_other_lanes() {
+        let _serial = serial();
         let dir = temp_dir("keep");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -417,6 +430,7 @@ mod analyzer {
 
     #[test]
     fn jobs_survive_open_and_the_settled_cap_evicts_oldest() {
+        let _serial = serial();
         let dir = temp_dir("jobs");
         let wav = wav(&dir, "voice.wav");
         let (mut session, file) = open_session(&dir, &wav);
@@ -472,6 +486,7 @@ mod analyzer {
 
     #[test]
     fn mappings_are_validated_before_any_write() {
+        let _serial = serial();
         let dir = temp_dir("mappings");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -521,6 +536,7 @@ mod analyzer {
 
     #[test]
     fn incompatible_clips_and_lanes_refuse_cleanly() {
+        let _serial = serial();
         let dir = temp_dir("conflicts");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = ready_session(&dir, &wav, "fake-rhubarb");
@@ -557,6 +573,7 @@ mod analyzer {
 
     #[test]
     fn a_refused_bake_leaves_the_live_preview_untouched() {
+        let _serial = serial();
         let dir = temp_dir("preview");
         let wav = wav(&dir, "voice.wav");
         let (mut a, _) = ready_session(&dir, &wav, "fake-a");
@@ -575,6 +592,7 @@ mod analyzer {
 
     #[test]
     fn a_staged_write_failure_leaves_the_live_preview_untouched() {
+        let _serial = serial();
         let dir = temp_dir("staged");
         let wav = wav(&dir, "voice.wav");
         let (mut a, _) = ready_session(&dir, &wav, "fake-a");
@@ -594,6 +612,7 @@ mod analyzer {
 
     #[test]
     fn analyzer_failures_and_terminal_states_are_reported() {
+        let _serial = serial();
         let dir = temp_dir("failing");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
@@ -637,6 +656,7 @@ mod analyzer {
 
     #[test]
     fn the_private_input_directory_and_files_are_owner_only() {
+        let _serial = serial();
         let dir = temp_dir("modes");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
@@ -652,6 +672,7 @@ mod analyzer {
 
     #[test]
     fn a_second_start_is_refused_and_cancel_reaps_the_child() {
+        let _serial = serial();
         let dir = temp_dir("cancel");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
@@ -679,6 +700,7 @@ mod analyzer {
 
     #[test]
     fn readiness_reports_a_terminal_spawn_error_instead_of_a_pid_timeout() {
+        let _serial = serial();
         let dir = temp_dir("readiness-spawn-error");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
@@ -691,6 +713,7 @@ mod analyzer {
 
     #[test]
     fn readiness_reports_a_pid_write_failure_instead_of_a_pid_timeout() {
+        let _serial = serial();
         let dir = temp_dir("readiness-pid-write-error");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
@@ -704,6 +727,7 @@ mod analyzer {
 
     #[test]
     fn dropping_the_session_reaps_the_child() {
+        let _serial = serial();
         let dir = temp_dir("drop");
         let wav = wav(&dir, "voice.wav");
         let pid;
@@ -718,6 +742,7 @@ mod analyzer {
 
     #[test]
     fn an_overlong_analysis_times_out() {
+        let _serial = serial();
         let dir = temp_dir("timeout");
         let wav = wav(&dir, "voice.wav");
         let (mut session, _) = open_session(&dir, &wav);
