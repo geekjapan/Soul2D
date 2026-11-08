@@ -93,6 +93,7 @@ enum Command {
     OldPreedit,
     TailPreedit,
     TailCommit,
+    QueueTail,
     FreshPreedit,
     FreshCommit,
     SiblingPreedit,
@@ -110,15 +111,33 @@ impl Command {
             Self::FreshCommit => ("fresh-search-commit", true),
             Self::SiblingPreedit => ("sibling-preedit", false),
             Self::SiblingCommit => ("sibling-commit", true),
-            Self::Stop => panic!("Stop has no input"),
+            Self::QueueTail | Self::Stop => panic!("control command has no input"),
         }
     }
 }
 
+const INPUTS: [Command; 7] = [
+    Command::OldPreedit,
+    Command::TailPreedit,
+    Command::TailCommit,
+    Command::FreshPreedit,
+    Command::FreshCommit,
+    Command::SiblingPreedit,
+    Command::SiblingCommit,
+];
+
 #[derive(Debug)]
 enum Notice {
     Ready,
-    State { active: bool, generation: u32 },
+    State {
+        active: bool,
+        generation: u32,
+    },
+    TailSubmitted {
+        first: u32,
+        last: u32,
+        generation: u32,
+    },
 }
 
 struct Engine {
@@ -315,36 +334,63 @@ fn run_engine(runtime: &Path, commands: Receiver<Command>, notices: Sender<Notic
         if command == Command::Stop {
             break;
         }
-        queue.roundtrip(&mut state).unwrap();
-        assert!(
-            state.active,
-            "input sent without an applied active IM state"
-        );
-        if command == Command::OldPreedit {
-            original = Some((state.generation, state.deactivations));
-        }
-        if matches!(
-            command,
-            Command::OldPreedit | Command::TailPreedit | Command::TailCommit
-        ) {
-            assert_eq!(
-                original,
-                Some((state.generation, state.deactivations)),
-                "original composition was natively reset; hypothesis changed"
-            );
-        }
-        let (text, commit) = command.input();
-        submitted = submitted.checked_add(1).unwrap();
-        println!("native_submission sequence={submitted} command={command:?} im_done_count={} generation={} text={text:?}", state.serial, state.generation);
-        if commit {
-            input.commit_string(text.to_owned());
-            input.set_preedit_string(String::new(), 0, 0);
+        let first = submitted.checked_add(1).unwrap();
+        let inputs = if command == Command::QueueTail {
+            &INPUTS[1..3]
         } else {
-            let cursor = i32::try_from(text.len()).unwrap();
-            input.set_preedit_string(text.to_owned(), cursor, cursor);
+            std::slice::from_ref(&command)
+        };
+        for &payload in inputs {
+            assert_eq!(
+                INPUTS.get(submitted as usize),
+                Some(&payload),
+                "protocol submission order changed"
+            );
+            queue.roundtrip(&mut state).unwrap();
+            assert!(
+                state.active,
+                "input sent without an applied active IM state"
+            );
+            if payload == Command::OldPreedit {
+                original = Some((state.generation, state.deactivations));
+            }
+            if matches!(
+                payload,
+                Command::OldPreedit | Command::TailPreedit | Command::TailCommit
+            ) {
+                assert_eq!(
+                    original,
+                    Some((state.generation, state.deactivations)),
+                    "original composition was natively reset before submission"
+                );
+            }
+            let (text, commit) = payload.input();
+            submitted = submitted.checked_add(1).unwrap();
+            println!("native_submission sequence={submitted} command={payload:?} im_done_count={} generation={} text={text:?}", state.serial, state.generation);
+            if commit {
+                input.commit_string(text.to_owned());
+                input.set_preedit_string(String::new(), 0, 0);
+            } else {
+                let cursor = i32::try_from(text.len()).unwrap();
+                input.set_preedit_string(text.to_owned(), cursor, cursor);
+            }
+            input.commit(state.serial);
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+            println!("native_submission_server_processed sequence={submitted}");
         }
-        input.commit(state.serial);
-        connection.flush().unwrap();
+        if command == Command::QueueTail {
+            let generation = original.expect("original composition required").0;
+            println!("native_tail_server_processed first={first} last={submitted} original_generation={generation}");
+            state
+                .notices
+                .send(Notice::TailSubmitted {
+                    first,
+                    last: submitted,
+                    generation,
+                })
+                .unwrap();
+        }
     }
     input.destroy();
     keyboard.destroy();
@@ -357,10 +403,10 @@ fn run_engine(runtime: &Path, commands: Receiver<Command>, notices: Sender<Notic
 enum Phase {
     Initial,
     OldPreedit,
-    Reopen,
-    Reopened,
+    PrepareRetirement,
     TailPreedit,
     TailCommit,
+    FreshReady,
     FreshPreedit,
     FreshCommit,
     FocusSibling,
@@ -375,17 +421,25 @@ struct Probe {
     sibling: String,
     reopened: bool,
     autofocus: bool,
-    reopened_frame: u64,
     sibling_focus_frame: Option<u64>,
     raw: Vec<egui::ImeEvent>,
     commands: Sender<Command>,
     notices: Receiver<Notice>,
     active: bool,
+    generation: u32,
+    retired_generation: u32,
+    received: usize,
     started: Instant,
     completed: Option<Sender<()>>,
 }
 
 impl Probe {
+    fn observe_state(&mut self, active: bool, generation: u32) {
+        self.active = active;
+        self.generation = generation;
+        println!("native_app_im_state active={active} generation={generation}");
+    }
+
     fn send(&mut self, command: Command, phase: Phase) {
         println!(
             "native_phase from={:?} to={phase:?} command={command:?} search={:?} sibling={:?}",
@@ -400,6 +454,37 @@ impl eframe::App for Probe {
     fn raw_input_hook(&mut self, _: &egui::Context, input: &mut egui::RawInput) {
         for event in &input.events {
             if let egui::Event::Ime(event) = event {
+                let payload = match event {
+                    egui::ImeEvent::Preedit(text) if !text.is_empty() => {
+                        Some((text.as_str(), false))
+                    }
+                    egui::ImeEvent::Commit(text) if !text.is_empty() => Some((text.as_str(), true)),
+                    _ => None,
+                };
+                if let Some(payload) = payload {
+                    let expected = INPUTS
+                        .get(self.received)
+                        .expect("unexpected additional native payload");
+                    assert_eq!(
+                        payload,
+                        expected.input(),
+                        "unexpected or duplicate native payload"
+                    );
+                    if *expected == Command::TailPreedit {
+                        assert_eq!(
+                            self.phase,
+                            Phase::TailPreedit,
+                            "tail entered app outside retirement receipt phase"
+                        );
+                    }
+                    if *expected == Command::TailCommit {
+                        assert!(
+                            matches!(self.phase, Phase::TailPreedit | Phase::TailCommit),
+                            "tail commit outside retirement receipt phase"
+                        );
+                    }
+                    self.received += 1;
+                }
                 println!("native_egui_ingress phase={:?} event={event:?}", self.phase);
                 self.raw.push(event.clone());
             }
@@ -414,20 +499,57 @@ impl eframe::App for Probe {
         loop {
             match self.notices.try_recv() {
                 Ok(Notice::State { active, generation }) => {
-                    self.active = active;
-                    println!("native_app_im_state active={active} generation={generation}");
+                    self.observe_state(active, generation);
                 }
                 Ok(Notice::Ready) => panic!("duplicate readiness"),
+                Ok(Notice::TailSubmitted { .. }) => panic!("tail notice without held retirement"),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => panic!("native IM worker disconnected"),
             }
         }
-        if self.phase == Phase::Reopen {
+        let retiring = self.phase == Phase::PrepareRetirement;
+        if retiring {
+            let generation = self.generation;
+            assert!(self.active && generation > 0);
+            self.retired_generation = generation;
+            println!(
+                "native_dispatch_hold begin frame={} original_generation={generation}",
+                ctx.cumulative_frame_nr()
+            );
+            self.commands.send(Command::QueueTail).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "tail server processing incomplete; no retirement conclusion"
+                );
+                match self
+                    .notices
+                    .recv_timeout(remaining)
+                    .expect("tail server processing notice missing")
+                {
+                    Notice::State { active, generation } => self.observe_state(active, generation),
+                    Notice::TailSubmitted {
+                        first,
+                        last,
+                        generation: submitted_generation,
+                    } => {
+                        assert_eq!((first, last, submitted_generation), (2, 3, generation));
+                        println!("native_dispatch_hold released first={first} last={last} original_generation={submitted_generation}");
+                        break;
+                    }
+                    Notice::Ready => panic!("duplicate readiness during retirement"),
+                }
+            }
+            assert!(!self.raw.iter().any(|event| matches!(event,
+                egui::ImeEvent::Preedit(text) if text == Command::TailPreedit.input().0)
+                || matches!(event, egui::ImeEvent::Commit(text) if text == Command::TailCommit.input().0)),
+                "old tail entered app before retirement");
             self.reopened = true;
             self.search.clear();
             self.autofocus = true;
-            self.reopened_frame = ctx.cumulative_frame_nr();
-            self.phase = Phase::Reopened;
+            self.phase = Phase::TailPreedit;
         }
         let search_id = egui::Id::new(("native-ime-search", self.reopened));
         let sibling_id = egui::Id::new("native-ime-sibling");
@@ -447,51 +569,74 @@ impl eframe::App for Probe {
         });
         let focused = ctx.memory(|memory| memory.focused());
         let native_focus = ctx.input(|input| input.focused);
+        if retiring {
+            assert!(
+                self.search.is_empty() && native_focus && focused == Some(search_id),
+                "replacement must start empty with normal autofocus"
+            );
+            assert!(
+                ctx.output(|output| output.ime.is_none()),
+                "ordinary replacement IME output gap changed"
+            );
+            println!(
+                "native_reopened frame={} owner={search_id:?} focused=true value=empty ime_output=false original_generation={}",
+                ctx.cumulative_frame_nr(), self.retired_generation
+            );
+        }
         let raw = std::mem::take(&mut self.raw);
         if !raw.is_empty() {
             println!("native_frame frame={} phase={:?} search_owner={search_id:?} focused={focused:?} viewport_focused={native_focus} search={:?} sibling={:?}", ctx.cumulative_frame_nr(), self.phase, self.search, self.sibling);
         }
-        let observed = |command: Command| {
+        let position = |command: Command| {
             let (text, commit) = command.input();
-            let count = raw
+            let positions: Vec<_> = raw
                 .iter()
-                .filter(|event| match event {
+                .enumerate()
+                .filter(|(_, event)| match event {
                     egui::ImeEvent::Preedit(value) => !commit && value == text,
                     egui::ImeEvent::Commit(value) => commit && value == text,
                     _ => false,
                 })
-                .count();
-            assert!(count <= 1, "duplicate native payload");
-            count == 1
+                .map(|(index, _)| index)
+                .collect();
+            assert!(positions.len() <= 1, "duplicate native payload");
+            positions.first().copied()
         };
+        let observed = |command| position(command).is_some();
         match self.phase {
             Phase::Initial if native_focus && focused == Some(search_id) && self.active => {
                 self.send(Command::OldPreedit, Phase::OldPreedit)
             }
             Phase::OldPreedit if observed(Command::OldPreedit) => {
                 assert_eq!(self.search, Command::OldPreedit.input().0);
-                self.phase = Phase::Reopen;
+                self.phase = Phase::PrepareRetirement;
             }
-            Phase::Reopened
-                if ctx.cumulative_frame_nr() > self.reopened_frame
-                    && native_focus
-                    && focused == Some(search_id)
-                    && self.active =>
-            {
+            Phase::TailPreedit => {
+                let preedit = position(Command::TailPreedit);
+                let commit = position(Command::TailCommit);
                 assert!(
-                    self.search.is_empty(),
-                    "replacement must start empty with normal autofocus"
+                    preedit.is_some() || commit.is_none(),
+                    "queued commit preceded preedit"
                 );
-                println!("native_reopened owner={search_id:?} focused=true value=empty");
-                self.send(Command::TailPreedit, Phase::TailPreedit);
+                if let Some(preedit) = preedit {
+                    assert!(native_focus && focused == Some(search_id));
+                    if let Some(commit) = commit {
+                        assert!(preedit < commit, "queued native payload order changed");
+                        assert_eq!(self.search, Command::TailCommit.input().0);
+                        self.phase = Phase::FreshReady;
+                    } else {
+                        assert_eq!(self.search, Command::TailPreedit.input().0);
+                        self.phase = Phase::TailCommit;
+                    }
+                }
             }
-            Phase::TailPreedit if observed(Command::TailPreedit) => {
-                assert_eq!(self.search, Command::TailPreedit.input().0);
-                self.send(Command::TailCommit, Phase::TailCommit);
-            }
-            Phase::TailCommit if observed(Command::TailCommit) => {
-                assert_eq!(self.search, Command::TailCommit.input().0);
-                self.send(Command::FreshPreedit, Phase::FreshPreedit);
+            Phase::TailCommit => {
+                assert!(!observed(Command::TailPreedit), "duplicate queued preedit");
+                if observed(Command::TailCommit) {
+                    assert!(native_focus && focused == Some(search_id));
+                    assert_eq!(self.search, Command::TailCommit.input().0);
+                    self.phase = Phase::FreshReady;
+                }
             }
             Phase::FreshPreedit if observed(Command::FreshPreedit) => {
                 assert_eq!(
@@ -540,11 +685,20 @@ impl eframe::App for Probe {
                     )
                 );
                 self.phase = Phase::Complete;
+                assert_eq!(self.received, INPUTS.len());
                 println!("scope=LOCKED_NATIVE_EFRAME_DIAGNOSTIC\noutcome=BUG_OBSERVED\nretired_nonempty_tail=OBSERVED\nfresh_search=OBSERVED\nsibling=OBSERVED\nphysical_ime=NOT_RUN\nsoul2d_field_acceptance=NOT_RUN\nnative_reset_boundary=NOT_ESTABLISHED");
                 self.completed.take().unwrap().send(()).unwrap();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             _ => {}
+        }
+        if self.phase == Phase::FreshReady
+            && native_focus
+            && focused == Some(search_id)
+            && self.active
+            && self.generation > self.retired_generation
+        {
+            self.send(Command::FreshPreedit, Phase::FreshPreedit);
         }
         ctx.request_repaint_after(Duration::from_millis(10));
     }
@@ -599,12 +753,14 @@ fn main() {
                 sibling: String::new(),
                 reopened: false,
                 autofocus: true,
-                reopened_frame: 0,
                 sibling_focus_frame: None,
                 raw: Vec::new(),
                 commands: app_commands,
                 notices,
                 active: false,
+                generation: 0,
+                retired_generation: 0,
+                received: 0,
                 started: Instant::now(),
                 completed: Some(completed),
             }))
