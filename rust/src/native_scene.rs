@@ -1858,6 +1858,13 @@ mod tests {
         let (half, _) = rendered_vertices(&glued_scene(json!([0.5, 0.5, 0.0, 1.0]), intensity(0.5)));
         assert_eq!(half, [json!([10.0, 9.0, 40.0, 8.0, 8.0, 40.0]), json!([14.0, 11.0, 40.0, 16.0, 8.0, 40.0])]);
 
+        let (extrapolated, warnings) = rendered_vertices(&glued_scene(json!([0.5, 0.5, 0.0, 1.0]), intensity(2.0)));
+        assert_eq!(extrapolated, [
+            json!([16.0, 12.0, 40.0, 8.0, 8.0, 40.0]),
+            json!([8.0, 8.0, 40.0, -8.0, 8.0, 40.0]),
+        ]);
+        assert!(!warnings.iter().any(|warning| warning == GLUE_SKIPPED));
+
         // A pair that binds a vertex the mesh no longer has is left out; the other pair still applies.
         let mut stale = glued_scene(json!([0.5, 0.5, 0.0, 1.0]), intensity(1.0));
         stale.source["sources"].as_array_mut().unwrap().last_mut().unwrap()["data"]["bindVertexUids"] =
