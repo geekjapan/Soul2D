@@ -2,6 +2,7 @@
 import argparse
 import ctypes
 import ctypes.util
+import hashlib
 import importlib.util
 import json
 import os
@@ -104,6 +105,47 @@ def probe(editor, example, out):
                 time.sleep(.1)
             else:
                 raise AssertionError('production editor never appeared in the owned display')
+            anchor = b''.join(pixels[(y * 1600 + 8) * 3:(y * 1600 + 230) * 3] for y in range(448, 468))
+            result['expanderAnchor'] = dict(rect=[8, 448, 230, 468], sha256=hashlib.sha256(anchor).hexdigest(),
+                                           observedFrom='4e695978632ccf063daba1eded309754a67b7cb2/13655707389/production-00.png')
+            assert result['expanderAnchor']['sha256'] == 'd83d13a25f8fd266f2e8d7b08a6b9b3ebc1851f65f11bfe82a6700ba4926be63', 'production expander image changed'
+            xtest.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+            xtest.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+            xtest.XTestFakeMotionEvent.restype = xtest.XTestFakeButtonEvent.restype = ctypes.c_int
+            x11.XSync.argtypes, x11.XSync.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_int
+            connection = x11.XOpenDisplay(display.encode())
+            assert connection, 'could not reconnect to owned Xvfb'
+            result['inputEvents'] = []
+            try:
+                for stage in range(5):
+                    x, y, button, count = (100, 458, 1, 1) if stage == 0 else (350, 200, 5, 3)
+                    result['inputInjection'] = 'ATTEMPTED'
+                    assert xtest.XTestFakeMotionEvent(connection, -1, x, y, 0)
+                    for _ in range(count):
+                        try:
+                            assert xtest.XTestFakeButtonEvent(connection, button, 1, 0)
+                        finally:
+                            assert xtest.XTestFakeButtonEvent(connection, button, 0, 0)
+                        x11.XSync(connection, 0)
+                        result['inputEvents'].append(dict(stage=stage, x=x, y=y, button=button, pressAndRelease=True))
+                        time.sleep(.1)
+                    result['inputInjection'] = 'OS_EVENTS_SENT'
+                    deadline = time.monotonic() + 10
+                    for _ in range(30):
+                        current = peer_module.state(peer)
+                        if current['live2dFormInputs']['owners']['sourceSettings']['observation'] == 'current':
+                            break
+                        time.sleep(.1)
+                    else:
+                        raise AssertionError('OS input did not open production Forms')
+                    assert all(not owner['dirty'] for owner in current['live2dFormInputs']['owners'].values())
+                    assert peer_module.document(peer) == original, 'Forms inspection changed the document'
+                    _, screenshot = native.capture(run, f'forms-stage-{stage}', deadline)
+                    result.setdefault('formsScreenshots', []).append(screenshot)
+                    (run / f'forms-state-{stage}.json').write_text(json.dumps(current, indent=2) + '\n')
+                result['formsPanel'] = 'OPENED_WITH_OS_INPUT'
+            finally:
+                x11.XCloseDisplay(connection)
             reply = peer.op('editor_quit')
             result['quit'] = reply
             assert reply['quit']['state'] == 'accepted' and reply['quit']['policy'] == 'close_after_reply_flush_and_final_safety_check'
@@ -136,11 +178,11 @@ def probe(editor, example, out):
             raise
         finally:
             (run / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
-            print(f"{result['status']}: {run}; Forms editing and OS input remain NOT_RUN")
+            print(f"{result['status']}: {run}; Forms editing remains NOT_RUN; input={result['inputInjection']}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Throwaway hosted-Xvfb capture probe; not Forms editing acceptance.')
+    parser = argparse.ArgumentParser(description='Throwaway hosted-Xvfb Forms inspection; not Forms editing acceptance.')
     parser.add_argument('--editor', required=True, type=Path)
     parser.add_argument('--example', required=True, type=Path)
     parser.add_argument('--out', required=True, type=Path)
