@@ -3345,13 +3345,16 @@ flip-pair partners. The clipboard is used up.",
              axis for one parameter (parameterGuid). key lies in the parameter's range and is not a key yet. Each new \
              form takes the vertices and opacity interpolated linearly between its neighbours on the axis (or those \
              of the end form) and is written as a copy of a form the file stores. Sources with blend shapes or extended \
-             interpolation forms are refused. One undo step; needs the current expectedRevision.",
+             interpolation forms are refused. Every axis of the source grid must use LINEAR ordinary and extended \
+             interpolation, even when no generated forms are stored. One undo step; needs the current expectedRevision.",
             schema(&[("sourceGuid", string_schema()), ("parameterGuid", string_schema()), ("key", json!({"type":"number"})),
                 ("expectedRevision", json!({"type":"integer","minimum":0}))],
                 &["sourceGuid","parameterGuid","key","expectedRevision"])),
         tool("live2d_keyform_delete", "Delete one key, and the forms on it, from the axis of one ArtMesh or warp \
              deformer of the active CMO3 (sourceGuid) for one parameter (parameterGuid). The last key of an axis \
-             stays. One undo step; needs the current expectedRevision.",
+             stays. Sources with blend shapes or generated extended interpolation forms are refused. Every axis of \
+             the source grid must use LINEAR ordinary and extended interpolation, even when no generated forms are \
+             stored. One undo step; needs the current expectedRevision.",
             schema(&[("sourceGuid", string_schema()), ("parameterGuid", string_schema()), ("key", json!({"type":"number"})),
                 ("expectedRevision", json!({"type":"integer","minimum":0}))],
                 &["sourceGuid","parameterGuid","key","expectedRevision"])),

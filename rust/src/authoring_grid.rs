@@ -40,6 +40,11 @@ fn target<'a>(model: &'a Value, request: &Value) -> Result<Target<'a>, String> {
     }
     let axes = source["grid"]["axes"].as_array().ok_or("the source has no keyform grid")?;
     let axis = axes.iter().position(|axis| axis["parameterGuid"] == parameter).ok_or("the source is not keyed on that parameter")?;
+    if axes.iter().any(|axis| axis["interpolation"].as_str() != Some("LINEAR")
+        || axis["extendedInterpolation"].as_str() != Some("LINEAR"))
+    {
+        return Err("authoring keyform interpolation is unsupported".into());
+    }
     let keys = axes[axis]["keys"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
     let mut cells = Vec::new();
     for cell in source["grid"]["cells"].as_array().into_iter().flatten() {
@@ -508,6 +513,39 @@ pub(crate) mod tests {
 
     fn request(key: f64) -> Value {
         json!({"sourceGuid": "mesh-guid", "parameterGuid": "parameter-guid", "key": key})
+    }
+
+    #[test]
+    fn other_axis_modes_are_refused_before_creating_forms() {
+        let container = test_container(&keyed_xml());
+        let mut linear = authoring_scene::read(&container).unwrap();
+        let mut parameter = linear["parameters"][0].clone();
+        parameter["guid"] = json!("other-parameter-guid");
+        parameter["id"] = json!("ParamOther");
+        linear["parameters"].as_array_mut().unwrap().push(parameter);
+        let mut axis = linear["sources"][0]["grid"]["axes"][0].clone();
+        axis["parameterGuid"] = json!("other-parameter-guid");
+        axis["parameterId"] = json!("ParamOther");
+        axis["bindingRef"] = json!("other-binding");
+        axis["keys"] = json!([0.0]);
+        linear["sources"][0]["grid"]["axes"].as_array_mut().unwrap().push(axis);
+        for cell in linear["sources"][0]["grid"]["cells"].as_array_mut().unwrap() {
+            cell["indices"].as_array_mut().unwrap().push(json!(0));
+        }
+        assert!(add_key(&linear, &request(0.0), &mut || Ok("new-guid".into())).is_ok());
+        assert!(delete_key(&linear, &request(-1.0)).is_ok());
+        for (field, mode) in [("interpolation", "CUBIC"), ("extendedInterpolation", "ELLIPSE")] {
+            let mut model = linear.clone();
+            model["sources"][0]["grid"]["axes"][1][field] = json!(mode);
+            let mut generated = 0;
+            let added = add_key(&model, &request(0.0), &mut || {
+                generated += 1;
+                Ok("new-guid".into())
+            });
+            assert!(added.is_err(), "the unselected axis has {field}={mode}");
+            assert_eq!(generated, 0, "refuse before creating a new form identity");
+            assert!(delete_key(&model, &request(-1.0)).unwrap_err().contains("interpolation"));
+        }
     }
 
     #[test]

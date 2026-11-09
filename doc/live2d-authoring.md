@@ -1417,6 +1417,14 @@ with the current `expectedRevision`:
 No object can be created from nothing: every new object is a copy of one the
 file already holds.
 
+`live2d_keyform_add` and `live2d_keyform_delete` change keys on an existing
+ArtMesh or Warp parameter axis. Every axis of that source's grid must use
+LINEAR ordinary and extended interpolation, even when no generated forms are
+stored. Blend shapes and stored generated interpolation forms are refused.
+An unsupported mode on another axis of the same source also prevents the edit.
+Each successful edit is one Undo step and requires the current `expectedRevision`.
+These operations do not implement extended interpolation or rebuild its forms.
+
 In **Live2D objects**, Name, ID, Parent Part, Rotation destination and parameter
 range are retained input groups. Each Apply commits its group through the
 existing Session operation. A successful Apply, including a no-op, keeps the

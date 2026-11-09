@@ -681,6 +681,50 @@ fn native_delete_composes_with_an_unsaved_copy_and_reparent() {
 }
 
 #[test]
+fn native_keyform_edits_reject_nonlinear_axes_without_generated_forms() {
+    let directory = temp_dir();
+    let source = directory.join("nonlinear.cmo3");
+    let mut accepted = Vec::new();
+    for (field, mode) in [
+        ("interpolationType", "CUBIC"),
+        ("extendedInterpolationType", "ELLIPSE"),
+        ("extendedInterpolationType", "SNS_CURVE"),
+        ("interpolationType", "FUTURE"),
+        ("extendedInterpolationType", "FUTURE"),
+    ] {
+        let xml = native_morph_artmesh_xml("", "").replace(
+            &format!("xs.n='{field}' v='LINEAR'"), &format!("xs.n='{field}' v='{mode}'"));
+        let bytes = authoring_bytes(&xml);
+        fs::write(&source, &bytes).unwrap();
+        for (op, key) in [("live2d.keyform.add", 0.0), ("live2d.keyform.delete", -1.0)] {
+            let mut session = Session::new();
+            let opened = result(&request(&mut session, json!({"op":"open","path":source}))).clone();
+            assert!(opened["model"]["sources"][0]["extendedInterpolations"].as_array().unwrap().is_empty());
+            let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+            let refused = request(&mut session, json!({"op":op,"sourceGuid":"mesh-guid",
+                "parameterGuid":"parameter-guid","key":key,"expectedRevision":opened["revision"]}));
+            if refused["status"] != "error" {
+                accepted.push(format!("{op} {field}={mode}"));
+                continue;
+            }
+            assert!(refused["message"].as_str().unwrap().contains("interpolation"), "{refused}");
+            session.handle_mcp(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap();
+            let tool = if op == "live2d.keyform.add" { "live2d_keyform_add" } else { "live2d_keyform_delete" };
+            let reply = session.handle_mcp(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"sourceGuid":"mesh-guid","parameterGuid":"parameter-guid",
+                    "key":key,"expectedRevision":opened["revision"]}}})).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply["result"]["content"].as_array().unwrap().iter()
+                .any(|item| item["text"].as_str().is_some_and(|text| text.contains("interpolation"))), "{reply}");
+            assert_eq!(session.snapshot(), opened, "{op} changes no document or revision");
+            assert_eq!(result(&request(&mut session, json!({"op":"history.summary"}))), &history);
+            assert_eq!(fs::read(&source).unwrap(), bytes);
+        }
+    }
+    assert!(accepted.is_empty(), "unsupported edits accepted without generated forms: {accepted:?}");
+}
+
+#[test]
 fn native_keys_are_added_and_deleted_saved_reopened_and_undone() {
     let directory = temp_dir();
     let source = directory.join("source.cmo3");
