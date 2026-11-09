@@ -76,6 +76,9 @@ jobs:
           python tools/check-project-artifacts.py
           python -I tools/verify-editor-texture-cache.py --self-test
           python -I tools/verify-editor-native-preview.py --self-test
+      - name: Verify IME lifecycle failure and recovery model
+        if: runner.os != 'Windows'
+        run: python3 tools/macos-ime-async/verify_lifecycle_local.py
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --manifest-path rust/Cargo.toml
       - name: Build shared core, CLI, editor and test targets
