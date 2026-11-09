@@ -1,0 +1,55 @@
+name: macOS delayed IME response experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-delayed-ime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-async:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify exact source and ARM64 environment
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          test "${RUNNER_ENVIRONMENT}" = github-hosted
+          git rev-parse HEAD
+          sw_vers
+          xcrun --sdk macosx clang --version
+          shasum -a 256 tools/macos-ime-async/*.m tools/macos-ime-async/*.py
+      - name: Verify lifecycle failure and recovery model
+        run: python3 tools/macos-ime-async/verify_lifecycle_local.py
+      - name: Run owned input method and native client
+        timeout-minutes: 5
+        run: python3 tools/macos-ime-async/lifecycle.py run
+      - name: Reconcile owned input-source state
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          journal="out/macos-ime-async-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}/journal.json"
+          if test -f "$journal"; then
+            python3 tools/macos-ime-async/lifecycle.py cleanup
+          else
+            echo 'NOT_RUN: lifecycle journal was not created'
+          fi
+      - name: Preserve raw observations and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-delayed-ime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/macos-ime-async-r${{ github.run_id }}-a${{ github.run_attempt }}/**
+            !out/macos-ime-async-r${{ github.run_id }}-a${{ github.run_attempt }}/tis-helper
+          if-no-files-found: error
+          retention-days: 3
