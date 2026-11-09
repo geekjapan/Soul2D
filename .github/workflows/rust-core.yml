@@ -68,7 +68,7 @@ jobs:
             fi
           done
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston sway imagemagick ffmpeg lsof libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev xvfb xauth weston sway imagemagick ffmpeg lsof libgl1-mesa-dri libegl1 libwayland-egl1 libxkbcommon-x11-0 libgl1 libx11-xcb1 libxcursor1 libxi6 libxrandr2 libxtst6
       - name: Check documentation and package metadata
         run: |
           python tools/verify-doc-twins.py
@@ -189,6 +189,25 @@ jobs:
             ${{ runner.temp }}/editor-native-preview/**/*.jsonl
             ${{ runner.temp }}/editor-native-preview/**/*.log
             ${{ runner.temp }}/editor-native-preview/**/*.png
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Probe native Forms display and XTest prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a -s '-screen 0 1600x1000x24' \
+            python -I tools/probe-editor-forms.py \
+            --editor ./out/rust/debug/soul2d-editor --example ./out/rust/debug/examples/four-color-cmo3 \
+            --out "$RUNNER_TEMP/editor-forms-probe"
+      - name: Upload native Forms probe evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-forms-probe
+          path: |
+            ${{ runner.temp }}/editor-forms-probe/**/*.json
+            ${{ runner.temp }}/editor-forms-probe/**/*.jsonl
+            ${{ runner.temp }}/editor-forms-probe/**/*.log
+            ${{ runner.temp }}/editor-forms-probe/**/*.png
           if-no-files-found: warn
           retention-days: 3
       - name: Launch the editor on X11 and Wayland
