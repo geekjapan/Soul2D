@@ -203,9 +203,27 @@ pub(crate) fn add_can3_animations(
     let mut skipped = Vec::new();
     let mut clips = Vec::new();
     let mut part_guids = BTreeSet::new();
+    let mut known_can3_tracks = Vec::new();
     for clip in scenes {
         let guid = clip["guid"].as_str().ok_or("animation scene has no GUID")?;
         let name = clip["name"].as_str().filter(|name| !name.is_empty()).unwrap_or(guid);
+        for (field, feature) in [
+            ("imageTracks", "CAN3.imageTracks"),
+            ("soundTracks", "CAN3.soundTracks"),
+            ("guideTracks", "CAN3.guideTracks"),
+        ] {
+            for track in clip[field].as_array().into_iter().flatten() {
+                known_can3_tracks.push(json!({
+                    "feature": feature,
+                    "direction": "CMO3+CAN3 -> INX",
+                    "owner": {
+                        "sceneGuid": guid, "sceneName": clip["name"],
+                        "trackGuid": track["guid"], "trackName": track["name"],
+                        "resourceGuid": track["resourceGuid"],
+                    },
+                }));
+            }
+        }
         let frames = clip["durationFrames"].as_i64().ok_or("animation durationFrames must be an integer")?;
         let fps = clip["fps"].as_f64().filter(|fps| *fps > 0.0).ok_or("animation FPS must be positive")?;
         let drives_model = clip["tracks"]
@@ -280,7 +298,10 @@ pub(crate) fn add_can3_animations(
         "partOpacityParameters": part_parameters.len(),
         "partOpacityLanes": part_lanes,
         "skippedScenes": skipped,
-        "notConverted": {"partOpacityLanes": part_not_converted, "curvesOfUnknownParameters": unknown_parameters},
+        "notConverted": {
+            "partOpacityLanes": part_not_converted, "curvesOfUnknownParameters": unknown_parameters,
+            "knownCan3Tracks": known_can3_tracks,
+        },
         "bezierHandles": "baked into frame-exact Linear keyframes",
     }))
 }

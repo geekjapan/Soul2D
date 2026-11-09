@@ -107,6 +107,17 @@ warp coordinates was unproven. `live2d.convert.inx {path?}` (`rust/src/native_co
   Between keys the INX draw order interpolates linearly where the CMO3 rounds
   to whole draw orders, so ties between meshes can resolve differently
   mid-key.
+- Linked CAN3 Image, Sound, and Guide tracks are omitted. Each projected track
+  appears in `animations.notConverted.knownCan3Tracks`, including empty curves
+  and tracks in skipped scenes, independently of the selected model resource.
+  Each row has `feature` (`CAN3.imageTracks`, `CAN3.soundTracks`, or
+  `CAN3.guideTracks`), `direction` (`CMO3+CAN3 -> INX`), and `owner` with
+  `sceneGuid`, `sceneName`, `trackGuid`, `trackName`, and `resourceGuid`.
+  Rows follow scene order, then Image, Sound, Guide, then projected family order.
+  This does not reconstruct the original interleaving across track families.
+  The array is empty when none of these projected tracks exists. It inventories
+  only these known families, not unknown XML, form animation, controllers, or
+  events. Linked assets are not loaded. Existing loss counters remain unchanged.
 - The answer is the loss report; a conversion is never reported without it.
 
 Measured on 2026-10-20 on the four local samples (`scene.geometry` of the INX

@@ -4505,6 +4505,7 @@ fn a_cmo3_converts_to_an_inx_whose_single_parameter_poses_match() {
     let report = result(&request(&mut session, json!({"op":"live2d.convert.inx","path":animated,"animation":can3}))).clone();
     assert_eq!(report["animations"]["scenes"], json!(1), "{report}");
     assert_eq!(report["animations"]["lanes"], json!(1), "{report}");
+    assert_eq!(report["animations"]["notConverted"]["knownCan3Tracks"], json!([]), "{report}");
     let opened_animated = result(&request(&mut session, json!({"op":"open","path":animated}))).clone();
     let animation = &opened_animated["model"]["animations"]["Scene"];
     assert_eq!(animation["length"], json!(120), "{animation}");
@@ -4618,6 +4619,79 @@ fn flat_numbers(value: &Value) -> Vec<f64> {
         Value::Array(items) => items.iter().flat_map(flat_numbers).collect(),
         other => vec![other.as_f64().expect("a vertex coordinate")],
     }
+}
+
+#[test]
+fn linked_can3_conversion_reports_known_omitted_tracks_without_changing_sources() {
+    let directory = temp_dir();
+    let source = directory.join("source.cmo3");
+    let source_bytes = native_morph_artmesh_bytes();
+    fs::write(&source, &source_bytes).unwrap();
+    let xml = can3_guide_track_xml(2).replace(
+        r#"<CMvEffect_Live2DPartsVisible xs.n="partsVisibleEffect" xs.ref="parts-effect"/>"#, "");
+    let other_resource = xml.replace(r#"<carray_list xs.n="_resourceRefList" count="4">"#,
+        r#"<carray_list xs.n="_resourceRefList" count="5"><ResourceEntry><CResource_Linked_Model xs.n="resourceRef"><CGuid xs.n="guid" uuid="other-resource"/><s xs.n="name">Other</s><s xs.n="srcFile">other.cmo3</s></CResource_Linked_Model></ResourceEntry>"#);
+    let expected: Vec<Value> = [
+        ("CAN3.imageTracks", "image-track-guid", "Background", "image-resource"),
+        ("CAN3.soundTracks", "sound-guid-0", "Sound 0", "sound-resource-guid"),
+        ("CAN3.guideTracks", "guide-guid-0", "Guide 0", "guide-resource"),
+        ("CAN3.guideTracks", "guide-guid-1", "Guide 1", "guide-resource"),
+    ].into_iter().map(|(feature, track, name, resource)| json!({
+        "feature":feature,"direction":"CMO3+CAN3 -> INX",
+        "owner":{"sceneGuid":"scene-guid","sceneName":"Scene","trackGuid":track,
+            "trackName":name,"resourceGuid":resource},
+    })).collect();
+    for (case, animation, resource, scenes) in [
+        ("converted", xml.clone(), "res-guid", 1),
+        ("empty-scene", xml.replace(r#"<i xs.n="duration">120</i></CMovieInfo>"#,
+            r#"<i xs.n="duration">0</i></CMovieInfo>"#), "res-guid", 0),
+        ("other-model", other_resource, "other-resource", 0),
+    ] {
+        let can3 = directory.join(format!("{case}.can3"));
+        let animation_bytes = authoring_bytes(&animation);
+        fs::write(&can3, &animation_bytes).unwrap();
+        let mut session = Session::new();
+        result(&request(&mut session, json!({"op":"open","path":source})));
+        let before = session.snapshot();
+        let history = result(&request(&mut session, json!({"op":"history.summary"}))).clone();
+        let report = result(&request(&mut session, json!({"op":"live2d.convert.inx",
+            "animation":can3,"resourceGuid":resource}))).clone();
+        assert_eq!(report["animations"]["notConverted"]["knownCan3Tracks"], json!(expected), "{case}: {report}");
+        assert_eq!(report["animations"]["scenes"], scenes, "{case}: {report}");
+        assert_eq!(report["animations"]["notConverted"]["partOpacityLanes"], 0);
+        assert_eq!(report["animations"]["notConverted"]["curvesOfUnknownParameters"], json!({}));
+        assert_eq!(report["animations"]["skippedScenes"].as_array().unwrap().len(), 1 - scenes as usize);
+
+        session.handle_mcp(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap();
+        let reply = session.handle_mcp(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"live2d_convert_inx","arguments":{"animation":can3,"resourceGuid":resource}}})).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let structured = &reply["result"]["structuredContent"];
+        assert_eq!(structured, &report);
+        assert_eq!(serde_json::from_str::<Value>(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap(), report);
+
+        let exported = directory.join(format!("{case}.inx"));
+        let saved = result(&request(&mut session, json!({"op":"live2d.convert.inx","path":exported,
+            "animation":can3,"resourceGuid":resource}))).clone();
+        assert_eq!(saved["animations"], report["animations"]);
+        let mut reopened = Session::new();
+        let opened = result(&request(&mut reopened, json!({"op":"open","path":exported}))).clone();
+        assert_eq!(opened["model"]["animations"].as_object().unwrap().len(), scenes as usize);
+        if scenes == 1 {
+            let sampled = result(&request(&mut reopened, json!({"op":"animation.sample","name":"Scene","frame":0}))).clone();
+            assert!(sampled["values"].is_object(), "{sampled}");
+        }
+        let exported_bytes = fs::read(&exported).unwrap();
+        let refused = request(&mut session, json!({"op":"live2d.convert.inx","path":exported,
+            "animation":can3,"resourceGuid":resource}));
+        assert_eq!(refused["succeeded"], false, "{refused}");
+        assert_eq!(fs::read(&exported).unwrap(), exported_bytes);
+        assert_eq!(session.snapshot(), before);
+        assert_eq!(result(&request(&mut session, json!({"op":"history.summary"}))), &history);
+        assert_eq!(fs::read(&can3).unwrap(), animation_bytes);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    }
+    fs::remove_dir_all(directory).unwrap();
 }
 
 fn native_morph_artmesh_bytes() -> Vec<u8> {
