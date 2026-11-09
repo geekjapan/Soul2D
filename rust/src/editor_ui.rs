@@ -18953,7 +18953,9 @@ mod editor_state_tests {
     fn lifecycle_http_result(mut stream: std::net::TcpStream, id: &str) -> Value {
         use std::io::Read;
         let mut reply = String::new();
-        stream.read_to_string(&mut reply).unwrap();
+        stream.read_to_string(&mut reply).unwrap_or_else(|error| {
+            panic!("HTTP reply {id} failed after {} bytes: {error}", reply.len())
+        });
         let (headers, body) = reply.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
         let length = headers.lines().find_map(|line| line.split_once(':')
@@ -23381,6 +23383,15 @@ mod editor_state_tests {
 
     fn finish_agent_draft(app: &mut EditorApp) { CTX.with(|ctx| app.finish_agent_draft(ctx)); }
 
+    fn serve_agent_draft_review(app: &mut EditorApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(app)["codingAgentDraftEdit"]["state"] != "awaiting_human" {
+            serve_agent_requests(app);
+            assert!(Instant::now() < deadline, "draft review did not arrive: {}", state(app)["codingAgentDraftEdit"]);
+            std::thread::yield_now();
+        }
+    }
+
     fn draft_peer(app: &mut EditorApp) -> (LifecyclePeer, String) {
         let endpoint = crate::editor_agent::McpEndpoint::bind().unwrap();
         let token = endpoint.token_for_test().to_owned();
@@ -23511,9 +23522,11 @@ mod editor_state_tests {
             let mut app = app(&format!("coding-agent-draft-review-{case}"));
             let (mut peer, token) = draft_peer(&mut app);
             app.agent.set_prompt_for_test("human text".into());
-            let request = draft_message(&app, "private review proposal");
+            let id = format!("draft-edit-{case}");
+            let mut request = draft_message(&app, "private review proposal");
+            request["id"] = json!(id);
             let original = draft_http(&app, &token, &request);
-            serve_agent_requests(&mut app);
+            serve_agent_draft_review(&mut app);
             match case {
                 "denied" => {
                     let path = app.tools.store_path.clone();
@@ -23523,7 +23536,7 @@ mod editor_state_tests {
                 _ => { app.agent.set_prompt_for_test("temporary native edit".into()); app.agent.set_prompt_for_test("human text".into()); }
             }
             finish_agent_draft(&mut app); serve_agent_requests(&mut app); finish_agent_draft(&mut app);
-            assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], true);
+            assert_eq!(lifecycle_http_result(original, &id)["isError"], true);
             assert_eq!(app.agent.prompt_text_for_test(), "human text");
             assert!(!app.agent.retains_draft_review_text_for_test());
             if case == "denied" {
@@ -23535,6 +23548,28 @@ mod editor_state_tests {
             }
             peer.finish(&mut app);
         }
+    }
+
+    #[test]
+    fn coding_agent_draft_expiry_requires_an_observed_review_after_an_empty_poll() {
+        let mut app = app("coding-agent-draft-delayed-review");
+        let (mut peer, token) = draft_peer(&mut app);
+        app.agent.set_prompt_for_test("human text".into());
+        serve_agent_requests(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "idle");
+        let original = draft_http(&app, &token, &draft_message(&app, "private review proposal"));
+        finish_agent_draft(&mut app);
+        assert_eq!(state(&mut app)["codingAgentDraftEdit"]["state"], "idle");
+        serve_agent_draft_review(&mut app);
+        assert!(app.agent.retains_draft_review_text_for_test());
+        app.agent.expire_host_approval_for_test();
+        finish_agent_draft(&mut app);
+        serve_agent_requests(&mut app);
+        finish_agent_draft(&mut app);
+        assert_eq!(lifecycle_http_result(original, "draft-edit")["isError"], true);
+        assert_eq!(app.agent.prompt_text_for_test(), "human text");
+        assert!(!app.agent.retains_draft_review_text_for_test());
+        peer.finish(&mut app);
     }
 
     #[test]
