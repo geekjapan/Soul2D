@@ -133,6 +133,20 @@ six candidates from the alpha2 manual, with implementation and evidence gaps.
 The compatibility baseline remains 5.3.04. No successor runtime or source-schema
 compatibility is established by this documentation review.
 
+### Successor API review on 2026-11-09
+
+The official release history still lists 5.3.04 on 2026-09-03 and 5.3.05 beta1
+on 2026-10-13. The alpha notice still states the download and use end date above.
+These observations do not advance the compatibility baseline.
+
+[The successor API reference](cubism-successor-api.md) records all 36 added
+method/event headings in the alpha1 developer manual, dated 2026-07-14 and
+labelled API 1.1.0. The alpha2 user manual links to that same developer document;
+the link does not establish a separately revised alpha2 API inventory.
+The reference distinguishes related native tools from missing transaction,
+permission, creation, and editing behavior. All successor vendor workflows,
+source-schema acceptance, and matching runtime behavior remain untested.
+
 ## Primary sources
 
 - [S1: Pro/Free feature comparison](https://www.live2d.com/cubism/comparison/)

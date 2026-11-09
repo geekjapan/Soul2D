@@ -43,6 +43,7 @@ and are marked (ja).
 - [The `.moc3` layout Soul2D reads](moc3-layout.md).
 - Cubism research: [Cubism 5.3 Pro reference research](cubism-53-research.md),
   [operation ledger](cubism-feature-ledger.md), [external application API](cubism-external-api.md),
+  [successor API editing inventory](cubism-successor-api.md),
   [vendor comparison contract](vendor-comparison-contract.md).
 - 3D conversion: [conventions](3d-conversion-conventions.md), [loss map](3d-conversion-loss-map.md),
   [rig import](3d-rig-import.md), [mesh import prototype](3d-mesh-import-prototype.md),
