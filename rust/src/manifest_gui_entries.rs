@@ -398,6 +398,14 @@ pub const GUI_ENTRIES: &[(&str, &[&str])] = &[
         "CAN3 Outline > scene > track > Delete track > Confirm track deletion",
         "Live2D panels",
     ]),
+    ("live2d_artpath_point_add", &[
+        "Live2D panels",
+        "Live2D source forms > Control point > Insert copy before / Append copy / Delete point",
+    ]),
+    ("live2d_artpath_point_delete", &[
+        "Live2D panels",
+        "Live2D source forms > Control point > Insert copy before / Append copy / Delete point",
+    ]),
     ("live2d_artpath_point_set", &[
         "Live2D panels",
         "Live2D source forms > Control point > Point index > Apply point",

@@ -29,3 +29,16 @@ pub(crate) fn with_artpath(base: &str) -> String {
             <CArtPathBrush><CArtPathBrushGuid xs.n='guid' uuid='brush-b'/><CArtPathBrushId xs.n='id' idstr='BrushB'/></CArtPathBrush>\
             </carray_list></CArtPathBrushSetting></CModelSource>")
 }
+
+pub(crate) fn two_forms(mut xml: String) -> String {
+    let start = xml.find("<CArtPathForm>").unwrap();
+    let end = start + xml[start..].find("</CArtPathForm>").unwrap() + "</CArtPathForm>".len();
+    let other = xml[start..end].replace("<s xs.n='coordName'>Canvas</s>",
+        "<s xs.n='coordName'>DeformerLocal</s>")
+        .replace("<f xs.n='x'>1</f>", "<f xs.n='x'>11</f>")
+        .replace("<f xs.n='x'>5</f>", "<f xs.n='x'>15</f>")
+        .replace("<f xs.n='width'>3</f>", "<f xs.n='width'>7</f>");
+    xml.insert_str(end, &other);
+    xml.replace("<carray_list xs.n='keyforms' count='1'><CArtPathForm>",
+        "<carray_list xs.n='keyforms' count='2'><CArtPathForm>")
+}

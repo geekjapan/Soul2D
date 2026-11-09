@@ -539,6 +539,25 @@ enum MainDraft {
     Loaded(MainEdit),
 }
 
+#[derive(Clone, Copy)]
+enum PointTopology {
+    Add(usize),
+    Delete(usize),
+}
+
+struct CapturedTopology {
+    owner: FormKey,
+    selected_index: usize,
+    revision: u64,
+    main_epoch: InputEpoch,
+    edit: PointTopology,
+}
+
+enum MainAction {
+    Apply,
+    Topology(CapturedTopology),
+}
+
 impl Default for MainDraft {
     fn default() -> Self { Self::Unloaded(MainChoice::Vertex(0)) }
 }
@@ -1145,7 +1164,7 @@ impl FormEditor {
         let vertex_form = form["data"].get("positions").is_some();
         self.prepare_main(form, revision);
         let mut changed = false;
-        let mut apply_main = false;
+        let mut pending_main = None;
         if vertex_form || artpath {
             let artmesh = selected.is_some_and(|s| s["data"]["type"] == "ArtMesh");
             let previous = self.main.choice();
@@ -1215,7 +1234,7 @@ impl FormEditor {
                     MainValues::ArtPathPoint { .. } => "Apply point",
                 };
                 if ui.add_enabled(self.main.is_dirty() && !self.conflict, egui::Button::new(label)).clicked() {
-                    apply_main = true;
+                    pending_main = Some(MainAction::Apply);
                 }
             } else if let MainDraft::Unavailable { message, .. } = &self.main {
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
@@ -1225,12 +1244,25 @@ impl FormEditor {
                 self.error.clear();
                 self.status.clear();
             }
+            if let MainChoice::ArtPathPoint(index) = self.main.choice() {
+                let count = form["data"]["points"].as_array().map_or(0, Vec::len);
+                ui.label("Affects every keyform. Insert and append copy each keyform's own neighbouring point.");
+                ui.horizontal(|ui| {
+                    for (label, edit) in [("Insert copy before", PointTopology::Add(index)),
+                        ("Append copy", PointTopology::Add(count)), ("Delete point", PointTopology::Delete(index))] {
+                        let action = self.capture_topology(edit, revision);
+                        if ui.add_enabled(action.is_some(), egui::Button::new(label)).clicked() {
+                            pending_main = action;
+                        }
+                    }
+                });
+            }
             if self.main.is_dirty() {
                 ui.label("Apply or discard this edit before changing its mode or index.");
             }
             if ui.add_enabled(self.native_input_available(FormsInputAction::DiscardMain, &snapshot), egui::Button::new("Discard main edit")).clicked() {
                 self.perform_native_input_action(FormsInputAction::DiscardMain, &snapshot);
-                apply_main = false;
+                pending_main = None;
             }
         }
         self.notices(ui);
@@ -1242,11 +1274,10 @@ impl FormEditor {
         }
         if ui.add_enabled(self.native_input_available(FormsInputAction::ReloadForm, &snapshot), egui::Button::new("Reload form")).clicked() {
             self.perform_native_input_action(FormsInputAction::ReloadForm, &snapshot);
-            apply_main = false;
+            pending_main = None;
         }
-        // Finish consuming this snapshot before a main edit advances the revision.
-        if apply_main {
-            changed |= self.apply(controller);
+        if let Some(action) = pending_main {
+            changed |= self.commit_main(controller, action);
         }
         changed
     }
@@ -1360,6 +1391,66 @@ impl FormEditor {
                 false
             }
         }
+    }
+
+    fn capture_topology(&self, edit: PointTopology, snapshot_revision: u64) -> Option<MainAction> {
+        if self.conflict || self.main.is_dirty()
+            || (self.stored.loaded && self.stored.is_dirty() && self.stored.revision != snapshot_revision) {
+            return None;
+        }
+        let MainDraft::Loaded(main) = &self.main else { return None };
+        let MainValues::ArtPathPoint { index, .. } = &main.values else { return None };
+        if main.key != self.form_key() || main.revision != snapshot_revision { return None; }
+        Some(MainAction::Topology(CapturedTopology {
+            owner: main.key.clone(), selected_index: *index, revision: main.revision,
+            main_epoch: self.main_epoch?, edit,
+        }))
+    }
+
+    fn commit_main(&mut self, controller: &mut EditorController, action: MainAction) -> bool {
+        let MainAction::Topology(clicked) = action else { return self.apply(controller) };
+        if self.conflict || self.main.is_dirty() || self.main_epoch != Some(clicked.main_epoch)
+            || self.form_key() != clicked.owner
+            || !matches!(&self.main, MainDraft::Loaded(main) if main.key == clicked.owner
+                && matches!(main.values, MainValues::ArtPathPoint { index, .. } if index == clicked.selected_index)) {
+            return false;
+        }
+        let (op, index) = match clicked.edit {
+            PointTopology::Add(index) => ("live2d.artpath.point.add", index),
+            PointTopology::Delete(index) => ("live2d.artpath.point.delete", index),
+        };
+        let request = json!({"op":op,"sourceGuid":clicked.owner.source,"index":index,
+            "expectedRevision":clicked.revision});
+        if let Err(message) = send(controller, Ok(request)) {
+            self.conflict |= message.contains("revision conflict");
+            self.error = message;
+            self.status.clear();
+            return false;
+        }
+        let snapshot = controller.snapshot().clone();
+        let revision = snapshot["revision"].as_u64().unwrap_or(0);
+        if self.stored.loaded { self.stored.revision = revision; }
+        self.conflict = false;
+        let form = snapshot["model"]["sources"].as_array().into_iter().flatten()
+            .find(|source| source["guid"].as_str() == Some(clicked.owner.source.as_str()))
+            .and_then(|source| editable_forms(source).into_iter()
+                .find(|form| same_form(form, &clicked.owner.form, &clicked.owner.coordinate)));
+        if let Some((form, count)) = form.and_then(|form| form["data"]["points"].as_array()
+            .filter(|points| !points.is_empty()).map(|points| (form, points.len()))) {
+            let selected = match clicked.edit {
+                PointTopology::Add(index) => index,
+                PointTopology::Delete(index) => index.min(count - 1),
+            };
+            self.replace_main(MainDraft::Unloaded(MainChoice::ArtPathPoint(selected)));
+            self.load_draft(form, revision);
+            self.status = "ArtPath points updated".into();
+        } else {
+            let message = "Updated ArtPath point is unavailable".to_owned();
+            self.error = message.clone();
+            self.replace_main(MainDraft::Unavailable { choice:MainChoice::ArtPathPoint(index), message });
+            self.status.clear();
+        }
+        true
     }
 
     fn apply(&mut self, controller: &mut EditorController) -> bool {
@@ -2489,6 +2580,232 @@ mod tests {
         let before = rig.controller.snapshot().clone();
         rig.draw();
         assert_eq!(rig.controller.snapshot(), &before, "drawing controls changes no document state");
+    }
+
+    #[test]
+    fn artpath_topology_controls_insert_append_delete_all_forms_with_history_and_reopen() {
+        let xml = crate::editor_test_support::two_form_artpath_cmo3_xml();
+        for coordinate in ["Canvas", "DeformerLocal"] {
+            let name = format!("forms-topology-{coordinate}");
+            let mut rig = Rig::artpath(&name, &xml);
+            let source = rig.controller.project_path().unwrap().to_owned();
+            let original = std::fs::read(&source).unwrap();
+            rig.draw(); rig.choose("Form", &format!("path-form ({coordinate})"));
+            rig.click(Role::RadioButton, "Control point");
+            let before = rig.controller.snapshot().clone();
+            let mut inserted = String::new();
+            let mut appended = String::new();
+            for (step, label, origins, selected) in [
+                (0, "Insert copy before", vec![0, 0, 1], 0),
+                (1, "Append copy", vec![0, 0, 1, 1], 3),
+                (2, "Delete point", vec![0, 0, 1], 2),
+                (3, "Delete point", vec![0, 1], 0),
+            ] {
+                if step == 3 { rig.choose("Point index", &format!("0: {inserted}")); }
+                let previous = rig.controller.snapshot().clone();
+                rig.click(Role::Button, label);
+                assert!(rig.editor.error.is_empty(), "{coordinate}: {}", rig.editor.error);
+                let model = &rig.controller.snapshot()["model"];
+                let path = model["sources"].as_array().unwrap().iter().find(|s| s["guid"] == "path-guid").unwrap();
+                let points = path["forms"][0]["data"]["points"].as_array().unwrap();
+                if step == 0 { inserted = points[0]["guid"].as_str().unwrap().to_owned(); }
+                if step == 1 { appended = points[3]["guid"].as_str().unwrap().to_owned(); }
+                assert!(!inserted.is_empty() && inserted != "point-a" && inserted != "point-b");
+                if step >= 1 { assert!(!appended.is_empty() && appended != inserted && appended != "point-a" && appended != "point-b"); }
+                let guids: Vec<&str> = match step {
+                    0 | 2 => vec![&inserted, "point-a", "point-b"],
+                    1 => vec![&inserted, "point-a", "point-b", &appended],
+                    _ => vec!["point-a", "point-b"],
+                };
+                let mut expected = before["model"].clone();
+                let path = expected["sources"].as_array_mut().unwrap().iter_mut().find(|s| s["guid"] == "path-guid").unwrap();
+                for form in path["forms"].as_array_mut().unwrap() {
+                    let original_points = form["data"]["points"].as_array().unwrap().clone();
+                    form["data"]["points"] = json!(origins.iter().zip(&guids).map(|(at, guid)| {
+                        let mut point = original_points[*at].clone(); point["guid"] = json!(guid); point
+                    }).collect::<Vec<_>>());
+                }
+                assert_eq!(model, &expected, "each form copies its own values at step {step}");
+                assert_eq!(rig.editor.main.choice(), MainChoice::ArtPathPoint(selected));
+                assert_eq!(rig.editor.last_point, selected);
+                assert_eq!(rig.revision(), previous["revision"].as_u64().unwrap() + 1);
+                assert_eq!(rig.controller.snapshot()["history"]["count"].as_u64().unwrap(),
+                    previous["history"]["count"].as_u64().unwrap() + 1);
+                assert!(!rig.editor.has_draft() && !rig.editor.conflict);
+                rig.controller.core_request(&json!({"op":"undo"}));
+                assert_eq!(rig.controller.snapshot()["model"], previous["model"]);
+                rig.controller.core_request(&json!({"op":"redo"}));
+                assert_eq!(rig.controller.snapshot()["model"], expected);
+                rig.draw();
+                let saved = temp_dir(&format!("{name}-step-{step}")).join("saved.cmo3");
+                let response = rig.controller.core_request(&json!({"op":"save","path":saved,"mark_saved":false}));
+                assert_eq!(response["succeeded"], true, "{response}");
+                let mut reopened = EditorController::new();
+                assert_eq!(reopened.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+                assert_eq!(reopened.snapshot()["model"], expected, "retained topology at step {step}");
+                let original_caff = soul2d_core::caff::CaffDocument::parse(&original).unwrap();
+                let saved_caff = soul2d_core::caff::CaffDocument::parse(&std::fs::read(saved).unwrap()).unwrap();
+                for entry in original_caff.entries().iter().filter(|entry| entry.alias != "main_xml") {
+                    assert_eq!(saved_caff.entry_data(&entry.name), original_caff.entry_data(&entry.name));
+                }
+            }
+            assert_eq!(rig.controller.snapshot()["model"], before["model"]);
+            let saved = temp_dir(&format!("{name}-saved")).join("saved.cmo3");
+            assert_eq!(rig.controller.core_request(&json!({"op":"save","path":saved}))["succeeded"], true);
+            let mut reopened = EditorController::new();
+            assert_eq!(reopened.core_request(&json!({"op":"open","path":saved}))["succeeded"], true);
+            assert_eq!(reopened.snapshot()["model"], before["model"]);
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            let written = soul2d_core::caff::CaffDocument::parse(&std::fs::read(saved).unwrap()).unwrap();
+            assert_eq!(String::from_utf8(written.main_xml()).unwrap(), xml);
+        }
+    }
+
+    #[test]
+    fn artpath_topology_preserves_raw_sibling_drafts_and_epochs_in_the_click_and_next_frame() {
+        for label in ["Insert copy before", "Append copy", "Delete point"] {
+            let mut rig = Rig::artpath(&format!("forms-topology-siblings-{label}"),
+                &crate::editor_test_support::two_form_artpath_cmo3_xml());
+            rig.draw(); rig.click(Role::RadioButton, "Control point");
+            rig.number_text("Draw order", "pending-form");
+            rig.number_text("Division count", "pending-source");
+            let originals = (rig.editor.stored.form_original.clone(), rig.editor.stored.source_original.clone());
+            let epochs = (rig.editor.form_epoch, rig.editor.source_epoch);
+            let revision = rig.revision();
+            let mut observed = false;
+            rig.click_observing(label, |editor, controller| {
+                if controller.snapshot()["revision"].as_u64().unwrap() == revision + 1 {
+                    observed = true;
+                    assert!(!editor.conflict && !editor.main.is_dirty());
+                    assert_eq!(editor.main.revision(), Some(revision + 1));
+                    assert_eq!(editor.stored.revision, revision + 1);
+                    assert_eq!((editor.form_epoch, editor.source_epoch), epochs);
+                    assert!(editor.stored.form_original == originals.0 && editor.stored.source_original == originals.1);
+                    assert!(editor.stored.form.values().is_err() && editor.stored.source.values().is_err());
+                }
+            });
+            assert!(observed);
+            let output = rig.draw();
+            assert!(texts(&output).iter().any(|text| text == "pending-form"));
+            assert!(texts(&output).iter().any(|text| text == "pending-source"));
+            assert_eq!((rig.editor.form_epoch, rig.editor.source_epoch), epochs);
+            assert!(rig.editor.stored.form_original == originals.0 && rig.editor.stored.source_original == originals.1);
+            assert!(!rig.editor.conflict);
+        }
+    }
+
+    #[test]
+    fn artpath_topology_disables_dirty_unavailable_and_stale_sibling_inputs() {
+        for raw in ["4.25", "-"] {
+            let mut rig = Rig::artpath(&format!("forms-topology-dirty-{raw}"), &crate::editor_test_support::artpath_cmo3_xml());
+            rig.draw(); rig.click(Role::RadioButton, "Control point"); rig.text("Point width", raw);
+            let before = rig.controller.snapshot().clone();
+            let output = rig.draw();
+            for label in ["Insert copy before", "Append copy", "Delete point"] {
+                assert!(crate::editor_test_support::find(&output, Role::Button, label).unwrap().is_disabled());
+                rig.click(Role::Button, label);
+                assert_eq!(rig.controller.snapshot(), &before);
+                assert_eq!(rig.point_input().width, raw);
+            }
+            assert!(rig.editor.capture_topology(PointTopology::Add(0), rig.revision()).is_none());
+        }
+        let mut rig = Rig::artpath("forms-topology-stale-sibling", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton, "Control point"); rig.number_text("Draw order", "pending-form");
+        let response = rig.controller.core_request(&json!({"op":"live2d.source.set","guid":"path-guid",
+            "closed":true,"expectedRevision":rig.revision()}));
+        assert_eq!(response["succeeded"], true);
+        let before = rig.controller.snapshot().clone();
+        let output = rig.frame(Vec::new());
+        for label in ["Insert copy before", "Append copy", "Delete point"] {
+            assert!(crate::editor_test_support::find(&output, Role::Button, label).unwrap().is_disabled(),
+                "stale sibling admission must be disabled in the first frame: {label}");
+            rig.click(Role::Button, label);
+        }
+        assert!(rig.editor.conflict && rig.editor.stored.form.values().is_err());
+        assert_eq!(rig.controller.snapshot(), &before);
+        let mut malformed = before["model"]["sources"].as_array().unwrap().iter()
+            .find(|source| source["guid"] == "path-guid").unwrap()["forms"][0].clone();
+        malformed["data"]["points"][0]["width"] = Value::Null;
+        rig.editor.conflict = false;
+        rig.editor.replace_main(MainDraft::Unloaded(MainChoice::ArtPathPoint(0)));
+        rig.editor.load_draft(&malformed, rig.revision());
+        assert!(matches!(rig.editor.main, MainDraft::Unavailable { .. }));
+        assert!(rig.editor.capture_topology(PointTopology::Add(0), rig.revision()).is_none());
+    }
+
+    #[test]
+    fn artpath_topology_frozen_click_refuses_rebased_revision_and_replaced_epoch() {
+        let mut rig = Rig::artpath("forms-topology-frozen", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton, "Control point");
+        rig.number_text("Draw order", "pending-form"); rig.click(Role::CheckBox, "Closed");
+        let action = rig.editor.capture_topology(PointTopology::Add(0), rig.revision()).unwrap();
+        let epoch = rig.editor.main_epoch;
+        assert!(rig.editor.apply_stored(&mut rig.controller, Half::Source, "ArtPath"));
+        assert_eq!(rig.editor.main_epoch, epoch);
+        let before = rig.controller.snapshot().clone();
+        assert!(!rig.editor.commit_main(&mut rig.controller, action));
+        assert!(rig.editor.error.contains("revision conflict"), "{}", rig.editor.error);
+        assert_eq!(rig.controller.snapshot(), &before);
+        assert!(rig.editor.stored.form.values().is_err());
+        assert_eq!(rig.editor.main.choice(), MainChoice::ArtPathPoint(0));
+
+        let mut rig = Rig::artpath("forms-topology-epoch", &crate::editor_test_support::artpath_cmo3_xml());
+        rig.draw(); rig.click(Role::RadioButton, "Control point");
+        let action = rig.editor.capture_topology(PointTopology::Add(0), rig.revision()).unwrap();
+        let epoch = rig.editor.main_epoch;
+        rig.editor.choose_main(MainChoice::ArtPathPoint(1)).unwrap(); rig.draw();
+        rig.editor.choose_main(MainChoice::ArtPathPoint(0)).unwrap(); rig.draw();
+        assert_ne!(rig.editor.main_epoch, epoch);
+        let before = rig.controller.snapshot().clone();
+        assert!(!rig.editor.commit_main(&mut rig.controller, action));
+        assert_eq!(rig.controller.snapshot(), &before);
+        assert_eq!(rig.editor.main.choice(), MainChoice::ArtPathPoint(0));
+    }
+
+    #[test]
+    fn artpath_topology_backend_refusals_keep_redo_selection_and_sibling_inputs() {
+        for case in ["last", "reference", "uneven"] {
+            let mut xml = crate::editor_test_support::artpath_cmo3_xml();
+            let (label, message) = match case {
+                "reference" => {
+                    assert!(xml.contains("</root>"));
+                    xml = xml.replace("</root>", "<Opaque xs.id='point-user' uuid='point-a'>keep</Opaque></root>");
+                    ("Delete point", "named from elsewhere")
+                }
+                "uneven" => {
+                    xml = crate::editor_test_support::two_form_artpath_cmo3_xml();
+                    let second = xml.find("</CArtPathForm>").unwrap() + "</CArtPathForm>".len();
+                    let start = second + xml[second..].find("<CArtPathPoint>").unwrap();
+                    let end = start + xml[start..].find("</CArtPathPoint>").unwrap() + "</CArtPathPoint>".len();
+                    xml.replace_range(start..end, "");
+                    let tail = xml[second..].replacen("<carray_list xs.n='positions' count='2'>",
+                        "<carray_list xs.n='positions' count='1'>", 1);
+                    xml.replace_range(second.., &tail);
+                    ("Insert copy before", "different numbers of points")
+                }
+                _ => ("Delete point", "last control point"),
+            };
+            let mut rig = Rig::artpath(&format!("forms-topology-refusal-{case}"), &xml);
+            let source = rig.controller.project_path().unwrap().to_owned();
+            let original = std::fs::read(&source).unwrap();
+            rig.draw(); rig.click(Role::RadioButton, "Control point");
+            if case == "last" { rig.click(Role::Button, "Delete point"); }
+            rig.text("Point width", "4.25"); rig.click(Role::Button, "Apply point");
+            assert_eq!(rig.controller.core_request(&json!({"op":"undo"}))["succeeded"], true);
+            rig.draw(); rig.number_text("Draw order", "pending-form"); rig.number_text("Division count", "pending-source");
+            let before = rig.controller.snapshot().clone();
+            assert_eq!(before["canRedo"], true);
+            let selection = rig.editor.main.choice();
+            let epochs = (rig.editor.main_epoch, rig.editor.form_epoch, rig.editor.source_epoch);
+            rig.click(Role::Button, label);
+            assert!(rig.editor.error.contains(message), "{case}: {}", rig.editor.error);
+            assert_eq!(rig.controller.snapshot(), &before);
+            assert_eq!(rig.editor.main.choice(), selection);
+            assert_eq!((rig.editor.main_epoch, rig.editor.form_epoch, rig.editor.source_epoch), epochs);
+            assert!(rig.editor.stored.form.values().is_err() && rig.editor.stored.source.values().is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert_eq!(rig.controller.core_request(&json!({"op":"redo"}))["succeeded"], true);
+        }
     }
 
     #[test]

@@ -174,6 +174,10 @@ pub(crate) fn artpath_cmo3_xml() -> String {
     artpath_fixture::with_artpath(CMO3_XML)
 }
 
+pub(crate) fn two_form_artpath_cmo3_xml() -> String {
+    artpath_fixture::two_forms(artpath_cmo3_xml())
+}
+
 /// `cmo3_bytes` with the ArtMesh keyed at -1 and 1 on `ParamTest`.
 pub fn keyed_cmo3_bytes() -> Vec<u8> {
     let xml = CMO3_XML

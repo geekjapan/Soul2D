@@ -15393,6 +15393,10 @@
     {
       "description": "Insert a control point at index (0 to the number of points) into every keyform of one ArtPath of the active CMO3 (stroke editing). The new point starts as a copy of the point it goes before (the last point when appended), and the values given here replace that copy's in every form: position, startVelocity and endVelocity as [x,y], width (0 or more), opacity (0..1), color ([r,g,b] or [r,g,b,a] in 0..1) and corner. Every value is optional. No midpoint is computed. An ArtPath whose forms hold different numbers of points is refused. ArtPaths are read and edited, not drawn. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels",
+        "Live2D source forms > Control point > Insert copy before / Append copy / Delete point"
+      ],
       "headless_ok": true,
       "id": "live2d_artpath_point_add",
       "inputSchema": {
@@ -15466,6 +15470,10 @@
     {
       "description": "Delete control point index from every keyform of one ArtPath of the active CMO3. The last point of an ArtPath stays, a point the file names from elsewhere is refused, and so is an ArtPath whose forms hold different numbers of points. One undo step; needs the current expectedRevision.",
       "effect": "document-edit",
+      "guiEntry": [
+        "Live2D panels",
+        "Live2D source forms > Control point > Insert copy before / Append copy / Delete point"
+      ],
       "headless_ok": true,
       "id": "live2d_artpath_point_delete",
       "inputSchema": {

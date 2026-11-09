@@ -1579,8 +1579,19 @@ advances their revision guards; an external change instead requires Reload.
 (**Reload forms** in the reachable no-form branch) replaces all applicable drafts
 after successful reconstruction, or resets that no-form panel. Neither action
 edits the document.
-Pending point input blocks Save, document replacement and Quit. Point creation,
-brush creation and stroke rendering remain separate work, as do physical native
+**Insert copy before**, **Append copy** and **Delete point** change the same
+point index in every keyform of the selected ArtPath. Insertion copies each
+keyform's own neighbouring point; append copies its last point. No point-value
+overrides are sent. A clean, available control-point draft is required. Apply
+or discard pending point input first; form/source settings drafts stay intact,
+including invalid numeric text. The controls capture the loaded revision and
+selection, and reject a stale click without retrying at a newer revision.
+Each successful operation selects the new point or a surviving point after
+deletion, and adds one Undo step. The last point, inconsistent form point counts
+and externally referenced points retain the backend's atomic refusal.
+
+Pending point input blocks Save, document replacement and Quit. Creating a new
+ArtPath or brush and stroke rendering remain separate work, as do physical native
 input and vendor acceptance.
 
 The metadata phase's focused panel checks pass 17 tests, including actual egui choices, numeric

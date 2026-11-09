@@ -199,10 +199,11 @@ fn artpath_point_editor_tool_over_http_preserves_refusals_history_resources_and_
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 0, 0, 255])))
         .write_to(&mut png, image::ImageFormat::Png).unwrap();
-    let xml = artpath_fixture::with_artpath(&authoring_fixture::native_artmesh_xml("<f xs.n='opacity'>1</f>"));
+    let xml = artpath_fixture::two_forms(artpath_fixture::with_artpath(
+        &authoring_fixture::native_artmesh_xml("<f xs.n='opacity'>1</f>")));
     let original = authoring_fixture::authoring_bytes_with_pngs(&xml, &[png.into_inner()]);
     std::fs::write(&source, &original).unwrap();
-    let (port, server) = start(None, 15);
+    let (port, server) = start(None, 26);
     let rpc = |method: &str, params: Value| {
         let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
         let response = raw(port, &post(&body));
@@ -235,6 +236,23 @@ fn artpath_point_editor_tool_over_http_preserves_refusals_history_resources_and_
     point["position"] = json!([-2.5,2.0]); point["width"] = json!(6.25);
     point["color"] = json!([0.25,0.5,0.75,1.0]); point["corner"] = json!(true);
     assert_eq!(changed["model"], expected);
+    let added = call("live2d_artpath_point_add", json!({"sourceGuid":"path-guid","index":1,
+        "expectedRevision":changed["revision"]}));
+    let path = added["model"]["sources"].as_array().unwrap().iter().find(|s| s["guid"] == "path-guid").unwrap();
+    let guid = path["forms"][0]["data"]["points"][1]["guid"].as_str().unwrap();
+    assert!(!guid.is_empty() && guid != "point-a" && guid != "point-b");
+    let mut expected_added = expected.clone();
+    for form in expected_added["sources"].as_array_mut().unwrap().iter_mut()
+        .find(|s| s["guid"] == "path-guid").unwrap()["forms"].as_array_mut().unwrap() {
+        let points = form["data"]["points"].as_array_mut().unwrap();
+        let mut copied = points[1].clone(); copied["guid"] = json!(guid);
+        points.insert(1, copied);
+    }
+    assert_eq!(added["model"], expected_added, "each form copies its own stored point");
+    assert_eq!(snapshot()["model"], expected_added);
+    let deleted = call("live2d_artpath_point_delete", json!({"sourceGuid":"path-guid","index":1,
+        "expectedRevision":added["revision"]}));
+    assert_eq!(deleted["model"], expected);
     let before_refusal = snapshot();
     for (width, revision) in [(json!(-1),before_refusal["revision"].clone()), (json!(5),baseline["revision"].clone())] {
         let refused = rpc("tools/call", json!({"name":"live2d_artpath_point_set", "arguments":{
@@ -243,8 +261,15 @@ fn artpath_point_editor_tool_over_http_preserves_refusals_history_resources_and_
         assert_eq!(refused["result"]["isError"],true);
         assert_eq!(snapshot(),before_refusal);
     }
-    call("undo",json!({})); assert_eq!(snapshot()["model"],baseline["model"]);
-    call("redo",json!({}));
+    for name in ["live2d_artpath_point_add", "live2d_artpath_point_delete"] {
+        let refused = rpc("tools/call", json!({"name":name,"arguments":{
+            "sourceGuid":"path-guid","index":0,"expectedRevision":baseline["revision"]}}));
+        assert_eq!(refused["result"]["isError"], true);
+        assert_eq!(snapshot(), before_refusal);
+    }
+    for _ in 0..3 { call("undo",json!({})); }
+    assert_eq!(snapshot()["model"],baseline["model"]);
+    for _ in 0..3 { call("redo",json!({})); }
     let saved = directory.join("saved.cmo3");
     call("save",json!({"path":saved})); call("open",json!({"path":saved}));
     assert_eq!(snapshot()["model"],expected);
