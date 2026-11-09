@@ -37,9 +37,12 @@ CMO = load('forms_container_oracle', 'tools/verify-cmo-source.py')
 DONOR_SHA = 'c439042a960aa05fb009d92e90c469e668ac604fed4e260792f4a58fec72a4c3'
 STATE = 'resource://soul2d/editor/state'
 ANCHORS = (
-    (44, 200, 16, 0, '85673234f5663f08aafc56d2ff69f8a7f5d1cf6ff612b77545271518b01ef624'),
-    (44, 100, 16, 42, '447b0f622cba787cd88cd567c86eb439dcf90399b446ccea87a7aa90a134215e'),
-    (44, 100, 16, 84, '56aaef1447e82dde20602aa8bdcc9c0320f56b12aed7593b5a56e49b96824534'),
+    (26, 130, 16, 22, ('67f58c56ab0ee91f1fdf47a56642a641d2edd5877e5bc4547123cc24c3c000d7',
+                       '7b5f130b52a78594d7e25fb82f629d9c44025bdb3f513f91eb16cd5f8a6735a1')),
+    (44, 100, 16, 63, ('1381d6e3f86e0ef6a83933e671a45c8ad72b857798273c576c33397adaffd7df',
+                      'cc02942f10c51779d10d0e0327d266ea6d440a5459a6c947dec469c196feb66c')),
+    (44, 100, 16, 84, ('56aaef1447e82dde20602aa8bdcc9c0320f56b12aed7593b5a56e49b96824534',
+                      'de72cffcf64f4eb870238527bba2751a869b35efe7611270546324f4dc01e76c')),
 )
 
 
@@ -93,9 +96,9 @@ def crop(rgb, width, rect):
 def source_top(rgb, width=1600, height=1000, anchors=ANCHORS):
     assert len(rgb) == width * height * 3
     tops = []
-    for x0, x1, rows, offset, digest in anchors:
+    for x0, x1, rows, offset, digests in anchors:
         matches = [y for y in range(height - rows + 1)
-                   if hashlib.sha256(crop(rgb, width, (x0, y, x1, y + rows))).hexdigest() == digest]
+                   if hashlib.sha256(crop(rgb, width, (x0, y, x1, y + rows))).hexdigest() in digests]
         assert len(matches) <= 1, 'ambiguous production text anchor'
         if not matches:
             return None
@@ -446,8 +449,9 @@ def verify(editor, example, out):
         fixture = prepare_fixture(example, run)
         path_plan = driver.path_plan(fixture.saved)
         result['fixtureHashes'] = dict(original=NATIVE.FIXTURE_SHA, donor=DONOR_SHA)
+        calibration = json.loads((ROOT / 'tools/fixtures/editor-forms/manifest.json').read_text())
         result['anchorProvenance'] = dict(expander='4e695978632ccf063daba1eded309754a67b7cb2/artifact13655707389',
-                                         sourceText='c54ed6a73c229d37bb51bfecca2d905896445be4/artifact13656189261')
+                                         sourceText=f"{calibration['sourceCommit']}/artifact{calibration['artifactId']}")
 
         def screenshot(name):
             driver.move(800, 500)
@@ -618,7 +622,7 @@ def self_test():
 
     image = bytearray(3 * 6 * 3)
     image[(4 * 3 + 1) * 3:(4 * 3 + 2) * 3] = b'\x12\x34\x56'
-    specs = ((1, 2, 1, 0, hashlib.sha256(b'\x12\x34\x56').hexdigest()),)
+    specs = ((1, 2, 1, 0, (hashlib.sha256(b'\x12\x34\x56').hexdigest(),)),)
     assert source_top(bytes(image), 3, 6, specs) == 4
     assert source_top(bytes(54), 3, 6, specs) is None
     image[(2 * 3 + 1) * 3:(2 * 3 + 2) * 3] = b'\x12\x34\x56'
