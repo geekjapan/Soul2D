@@ -1,0 +1,59 @@
+{
+  "sourceCommit": "9c7249e597f5cdc9909bbab6bd950cd14bd8e890",
+  "artifactId": 13659546764,
+  "artifactZipSha256": "057b6048a85df95a671b82a1af7a2d76741e5f2d1af971267a73c036dc4edde3",
+  "scope": "Unmodified RGB samples from actual Linux native Forms screenshots; mask checkbox draft only, no Apply/save acceptance. Cropping preserves pixel values.",
+  "cases": [
+    {
+      "file": "unchecked.rgb.zlib",
+      "sourceImage": "008-source-anchor.png",
+      "sourcePngSha256": "135b8a5d275887151f05f864bc154038b8f4daf7c930e6ae4b7e3b004ea481cf",
+      "crop": [
+        0,
+        427,
+        250,
+        547
+      ],
+      "width": 250,
+      "height": 120,
+      "sourceTop": 10,
+      "rgbSha256": "417a180cb394ab0f5f1b0ca444259c88b77fe68419caf5a7fa5764847b6d848b",
+      "compressedSha256": "b14df935d3ef1849b4334b01d7a5f86e436cdc742266d2b7bbcb62bc58152c9c",
+      "compressedBytes": 4213
+    },
+    {
+      "file": "checked.rgb.zlib",
+      "sourceImage": "009-source-anchor.png",
+      "sourcePngSha256": "9a860afd5b0a042c1ca285b3fcb170fffc19e071376ef9f1f9b7392569386cf8",
+      "crop": [
+        0,
+        427,
+        250,
+        547
+      ],
+      "width": 250,
+      "height": 120,
+      "sourceTop": 10,
+      "rgbSha256": "cd04d216eb950762f29f4cf7aa2e8a3d941765d488b28aa665580b8a212113f2",
+      "compressedSha256": "17fdd373dad6ab82e9a274743de7834e3a028dcf729d1fd0bc65f7c7bbf36977",
+      "compressedBytes": 4788
+    },
+    {
+      "file": "checked-scrolled.rgb.zlib",
+      "sourceImage": "021-source-anchor.png",
+      "sourcePngSha256": "62522e4174c4b71d0927763ee496dac76d87089d1c8ca8f94791ab3a37225973",
+      "crop": [
+        0,
+        388,
+        250,
+        508
+      ],
+      "width": 250,
+      "height": 120,
+      "sourceTop": 10,
+      "rgbSha256": "3a4b66fcb1244b94745729fe33035cb7046d62dd26b26abdba525f64116d97f4",
+      "compressedSha256": "a22e35ef520ca76e20059961f66234f7171582ea81e9064ec5b0ddcb5fc31353",
+      "compressedBytes": 4287
+    }
+  ]
+}

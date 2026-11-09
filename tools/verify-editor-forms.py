@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import traceback
+import zlib
 from typing import NamedTuple
 from xml.parsers import expat
 
@@ -433,7 +434,7 @@ def verify(editor, example, out):
     driver = None
     try:
         driver = OwnedXTest(run, result)
-        sources = set((ROOT / 'rust/src').rglob('*.rs')) | {
+        sources = set((ROOT / 'rust/src').rglob('*.rs')) | set((ROOT / 'tools/fixtures/editor-forms').iterdir()) | {
             Path(__file__).resolve(), ROOT / '.github/workflows/rust-core.yml', ROOT / 'rust/Cargo.toml',
             ROOT / 'rust/Cargo.lock', ROOT / 'rust/examples/four-color-cmo3.rs',
             ROOT / 'rust/tests/common/authoring_fixture.rs', ROOT / 'tools/verify-editor-native-preview.py',
@@ -605,6 +606,15 @@ def self_test():
                            ('resources/read', {'uri': 'resource://other'}), ('initialize', {'extra': True})]:
         peer = ObservationPeer(None, None)
         refuses(lambda: peer.rpc(method, params))
+
+    recorded = ROOT / 'tools/fixtures/editor-forms'
+    for case in json.loads((recorded / 'manifest.json').read_text())['cases']:
+        compressed = (recorded / case['file']).read_bytes()
+        assert hashlib.sha256(compressed).hexdigest() == case['compressedSha256']
+        rgb = zlib.decompress(compressed)
+        assert hashlib.sha256(rgb).hexdigest() == case['rgbSha256']
+        actual = source_top(rgb, case['width'], case['height'])
+        assert actual == case['sourceTop'], f"recorded source anchor mismatch for {case['file']}: expected {case['sourceTop']}, got {actual}"
 
     image = bytearray(3 * 6 * 3)
     image[(4 * 3 + 1) * 3:(4 * 3 + 2) * 3] = b'\x12\x34\x56'
