@@ -76,6 +76,7 @@ jobs:
           python tools/check-project-artifacts.py
           python -I tools/verify-editor-texture-cache.py --self-test
           python -I tools/verify-editor-native-preview.py --self-test
+          python -I tools/verify-editor-forms.py --self-test
       - name: Verify IME lifecycle failure and recovery model
         if: runner.os != 'Windows'
         run: python3 tools/macos-ime-async/verify_lifecycle_local.py
@@ -191,23 +192,19 @@ jobs:
             ${{ runner.temp }}/editor-native-preview/**/*.png
           if-no-files-found: warn
           retention-days: 3
-      - name: Probe native Forms display and XTest prerequisites
+      - name: Verify native Forms Apply and persisted reopen in a production X11 window
         if: runner.os == 'Linux'
         run: |
           xvfb-run -a -s '-screen 0 1600x1000x24' \
-            python -I tools/probe-editor-forms.py \
+            python -I tools/verify-editor-forms.py \
             --editor ./out/rust/debug/soul2d-editor --example ./out/rust/debug/examples/four-color-cmo3 \
-            --out "$RUNNER_TEMP/editor-forms-probe"
-      - name: Upload native Forms probe evidence
+            --out "$RUNNER_TEMP/editor-forms"
+      - name: Upload native Forms editing evidence
         if: ${{ always() && runner.os == 'Linux' }}
         uses: actions/upload-artifact@v4
         with:
-          name: editor-forms-probe
-          path: |
-            ${{ runner.temp }}/editor-forms-probe/**/*.json
-            ${{ runner.temp }}/editor-forms-probe/**/*.jsonl
-            ${{ runner.temp }}/editor-forms-probe/**/*.log
-            ${{ runner.temp }}/editor-forms-probe/**/*.png
+          name: editor-forms
+          path: ${{ runner.temp }}/editor-forms
           if-no-files-found: warn
           retention-days: 3
       - name: Launch the editor on X11 and Wayland
